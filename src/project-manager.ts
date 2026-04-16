@@ -313,10 +313,10 @@ export class ProjectManager {
         this.dashLog.push({ type: "brain-thinking", text: `Branch isolation skipped for ${projectName}: ${err}` })
       }
 
-      // Restore archived memory if available (from a previous session with this agent name)
+      // Restore archived memory if available (matched by agent name + directory hash)
       try {
-        if (await hasAgentArchive(agentName)) {
-          await restoreAgentMemory(agentName)
+        if (await hasAgentArchive(agentName, resolvedDir)) {
+          await restoreAgentMemory(agentName, resolvedDir)
           this.dashLog.push({ type: "brain-thinking", text: `Restored archived memory for ${agentName}` })
         }
       } catch {}
@@ -495,7 +495,7 @@ export class ProjectManager {
     if (!project) throw new Error(`Unknown project: ${projectId}`)
 
     // Archive agent memory before removing (non-fatal)
-    await archiveAgentMemory(project.agentName, project.directive).catch(err => {
+    await archiveAgentMemory(project.agentName, project.directive, project.directory).catch(err => {
       console.error(`[project-manager] Failed to archive memory for ${project.agentName}: ${err}`)
     })
 

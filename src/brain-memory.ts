@@ -1,5 +1,6 @@
 import { resolve } from "path"
 import { mkdirSync } from "fs"
+import { createHash } from "crypto"
 import { readJsonFile, writeJsonFile } from "./file-utils"
 import { readFileOrNull } from "./file-utils"
 
@@ -23,6 +24,9 @@ export type BrainMemoryStore = {
 
 export type AgentMemoryArchive = {
   agentName: string
+  /** SHA-256 hash of the resolved directory path — prevents cross-project memory leaks */
+  directoryHash: string
+  directory?: string
   archivedAt: number
   behavioralNotes: string[]
   projectNotes: string[]
@@ -48,8 +52,17 @@ function ensureArchiveDir(): void {
   try { mkdirSync(getArchiveDir(), { recursive: true }) } catch {}
 }
 
-function archivePath(agentName: string): string {
+/** Hash a directory path to a short hex string for use in filenames */
+function hashDirectory(directory: string): string {
+  return createHash("sha256").update(resolve(directory)).digest("hex").slice(0, 12)
+}
+
+function archivePath(agentName: string, directory?: string): string {
   const safe = agentName.replace(/[^a-zA-Z0-9_-]/g, "_")
+  if (directory) {
+    return resolve(getArchiveDir(), `${safe}-${hashDirectory(directory)}.json`)
+  }
+  // Legacy path (no directory) — used for backward compat lookup
   return resolve(getArchiveDir(), `${safe}.json`)
 }
 
@@ -310,11 +323,15 @@ function mergeAllEntries(store: BrainMemoryStore): BrainMemoryEntry[] {
 export async function archiveAgentMemory(
   agentName: string,
   lastDirective?: string,
+  directory?: string,
 ): Promise<void> {
   return withWriteLock(async () => {
     const store = await loadBrainMemory()
+    const dirHash = directory ? hashDirectory(directory) : ""
     const archive: AgentMemoryArchive = {
       agentName,
+      directoryHash: dirHash,
+      directory,
       archivedAt: Date.now(),
       behavioralNotes: store.behavioralNotes?.[agentName] ?? [],
       projectNotes: store.projectNotes[agentName] ?? [],
@@ -324,7 +341,7 @@ export async function archiveAgentMemory(
     // Only write archive if there's something to save
     if (archive.behavioralNotes.length || archive.projectNotes.length || archive.sessionSummaries.length) {
       ensureArchiveDir()
-      await writeJsonFile(archivePath(agentName), archive)
+      await writeJsonFile(archivePath(agentName, directory), archive)
     }
     // Remove agent data from active store
     const { [agentName]: _bn, ...restBehavioral } = store.behavioralNotes ?? {}
@@ -340,27 +357,39 @@ export async function archiveAgentMemory(
   })
 }
 
-/** Load an agent's archive. Returns null if none exists. */
-export async function loadAgentArchive(agentName: string): Promise<AgentMemoryArchive | null> {
-  const content = await readFileOrNull(archivePath(agentName))
-  if (!content) return null
-  try {
-    const archive = JSON.parse(content) as AgentMemoryArchive
-    if (!archive.agentName || !Array.isArray(archive.behavioralNotes)) return null
-    return archive
-  } catch {
-    return null
+/** Load an agent's archive. Returns null if none exists or directory doesn't match. */
+export async function loadAgentArchive(agentName: string, directory?: string): Promise<AgentMemoryArchive | null> {
+  // Try directory-specific path first, then fall back to legacy (no-hash) path
+  const paths = directory
+    ? [archivePath(agentName, directory), archivePath(agentName)]
+    : [archivePath(agentName)]
+  for (const path of paths) {
+    const content = await readFileOrNull(path)
+    if (!content) continue
+    try {
+      const archive = JSON.parse(content) as AgentMemoryArchive
+      if (!archive.agentName || !Array.isArray(archive.behavioralNotes)) continue
+      // If both the archive and the request have directory info, verify they match
+      if (directory && archive.directoryHash) {
+        const expected = hashDirectory(directory)
+        if (archive.directoryHash !== expected) continue // wrong project — skip
+      }
+      return archive
+    } catch {
+      continue
+    }
   }
+  return null
 }
 
-/** Check if an agent has an archived memory file */
-export async function hasAgentArchive(agentName: string): Promise<boolean> {
-  return (await loadAgentArchive(agentName)) !== null
+/** Check if an agent has an archived memory file matching the given directory */
+export async function hasAgentArchive(agentName: string, directory?: string): Promise<boolean> {
+  return (await loadAgentArchive(agentName, directory)) !== null
 }
 
 /** Restore an agent's archived memory back into the active store and delete the archive file */
-export async function restoreAgentMemory(agentName: string): Promise<boolean> {
-  const archive = await loadAgentArchive(agentName)
+export async function restoreAgentMemory(agentName: string, directory?: string): Promise<boolean> {
+  const archive = await loadAgentArchive(agentName, directory)
   if (!archive) return false
   return withWriteLock(async () => {
     const store = await loadBrainMemory()
@@ -380,8 +409,10 @@ export async function restoreAgentMemory(agentName: string): Promise<boolean> {
       },
     }
     await saveBrainMemory(result)
-    // Delete the archive file after successful restore
-    try { const { unlinkSync } = await import("fs"); unlinkSync(archivePath(agentName)) } catch {}
+    // Delete the archive file after successful restore — try both hashed and legacy paths
+    const { unlinkSync } = await import("fs")
+    try { unlinkSync(archivePath(agentName, directory)) } catch {}
+    try { unlinkSync(archivePath(agentName)) } catch {}
     return true
   })
 }

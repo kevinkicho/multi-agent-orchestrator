@@ -119,6 +119,25 @@ export async function agentReplyPermission(
   if (res.error) throw new Error(`Failed to reply to permission on ${agent.config.name}`)
 }
 
+/** Auto-answer a question from the agent (select first option or provide text) */
+export async function agentAnswerQuestion(
+  agent: AgentState,
+  requestID: string,
+  answers: string[][],
+) {
+  const res = await agent.client.question.reply({ requestID, answers })
+  if (res.error) throw new Error(`Failed to answer question on ${agent.config.name}`)
+}
+
+/** Reject a question from the agent (dismiss it so it stops blocking) */
+export async function agentRejectQuestion(
+  agent: AgentState,
+  requestID: string,
+) {
+  const res = await agent.client.question.reject({ requestID })
+  if (res.error) throw new Error(`Failed to reject question on ${agent.config.name}`)
+}
+
 /** Abort the current session run on the agent */
 export async function agentAbort(agent: AgentState): Promise<void> {
   if (!agent.sessionID) return

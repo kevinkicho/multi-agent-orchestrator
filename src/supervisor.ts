@@ -238,6 +238,17 @@ type SupervisorCommand =
   | { type: "cycle_done"; summary: string }
   | { type: "stop"; summary: string }
 
+// Commands that are recognized as starting a new command (not continuation of PROMPT)
+const COMMAND_PREFIXES = [
+  "PROMPT ", "WAIT", "MESSAGES", "REVIEW", "RESTART", "ABORT",
+  "NOTE_BEHAVIOR ", "NOTE ", "DIRECTIVE ", "NOTIFY ", "INTENT ",
+  "CYCLE_DONE", "STOP",
+]
+
+function isCommandLine(trimmed: string): boolean {
+  return COMMAND_PREFIXES.some(p => trimmed === p.trim() || trimmed.startsWith(p))
+}
+
 function parseSupervisorCommands(response: string): SupervisorCommand[] {
   const commands: SupervisorCommand[] = []
 
@@ -246,31 +257,45 @@ function parseSupervisorCommands(response: string): SupervisorCommand[] {
     ? codeBlockMatch[1]!.split("\n")
     : response.split("\n")
 
+  // Track the last PROMPT command so continuation lines can be appended
+  let lastPrompt: { type: "prompt"; message: string } | null = null
+
   for (const line of lines) {
     const trimmed = line.trim()
     if (!trimmed) continue
 
     if (trimmed.startsWith("PROMPT ")) {
-      commands.push({ type: "prompt", message: trimmed.slice(7) })
+      lastPrompt = { type: "prompt", message: trimmed.slice(7) }
+      commands.push(lastPrompt)
     } else if (trimmed === "WAIT") {
+      lastPrompt = null
       commands.push({ type: "wait" })
     } else if (trimmed === "MESSAGES") {
+      lastPrompt = null
       commands.push({ type: "messages" })
     } else if (trimmed === "REVIEW") {
+      lastPrompt = null
       commands.push({ type: "review" })
     } else if (trimmed === "RESTART") {
+      lastPrompt = null
       commands.push({ type: "restart" })
     } else if (trimmed === "ABORT") {
+      lastPrompt = null
       commands.push({ type: "abort" })
     } else if (trimmed.startsWith("NOTE_BEHAVIOR ")) {
+      lastPrompt = null
       commands.push({ type: "note_behavior", text: trimmed.slice(14) })
     } else if (trimmed.startsWith("NOTE ")) {
+      lastPrompt = null
       commands.push({ type: "note", text: trimmed.slice(5) })
     } else if (trimmed.startsWith("DIRECTIVE ")) {
+      lastPrompt = null
       commands.push({ type: "directive", text: trimmed.slice(10) })
     } else if (trimmed.startsWith("NOTIFY ")) {
+      lastPrompt = null
       commands.push({ type: "notify", message: trimmed.slice(7) })
     } else if (trimmed.startsWith("INTENT ")) {
+      lastPrompt = null
       // INTENT <description> [files: file1, file2, ...]
       const rest = trimmed.slice(7)
       const filesMatch = rest.match(/\[files?:\s*([^\]]+)\]/)
@@ -280,9 +305,14 @@ function parseSupervisorCommands(response: string): SupervisorCommand[] {
       const description = rest.replace(/\[files?:\s*[^\]]+\]/, "").trim()
       commands.push({ type: "intent", description, files })
     } else if (trimmed.startsWith("CYCLE_DONE")) {
+      lastPrompt = null
       commands.push({ type: "cycle_done", summary: trimmed.slice(10).trim() || "Cycle completed." })
     } else if (trimmed.startsWith("STOP")) {
+      lastPrompt = null
       commands.push({ type: "stop", summary: trimmed.slice(4).trim() || "Supervisor stopped." })
+    } else if (lastPrompt) {
+      // Continuation line for a multi-line PROMPT — append to the last PROMPT message
+      lastPrompt.message += "\n" + trimmed
     }
   }
 

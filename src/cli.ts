@@ -298,13 +298,8 @@ async function main() {
         }
         console.log(`${C.green}--- end ${agentName} ---${C.reset}`)
         console.log("")
-
-        // Forward full response to dashboard
-        dashLog.push({
-          type: "agent-response",
-          agent: agentName,
-          text: response,
-        })
+        // Note: NOT pushing agent-response here — the supervisor's WAIT handler
+        // already pushes it to dashboardLog, so pushing here would cause duplicates.
       }
     },
 

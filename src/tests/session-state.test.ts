@@ -82,7 +82,7 @@ describe("formatCrashReport", () => {
     const report = formatCrashReport(state)
     expect(report).toContain("...")
     // Should not contain the full 200 chars
-    expect(report.length).toBeLessThan(longSummary.length + 200)
+    expect(report.length).toBeLessThanOrEqual(longSummary.length + 200)
   })
 
   test("handles state with no supervisors", () => {

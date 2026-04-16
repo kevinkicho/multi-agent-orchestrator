@@ -315,6 +315,82 @@ describe("listArchives", () => {
 })
 
 // ---------------------------------------------------------------------------
+// Directory-hash isolation
+// ---------------------------------------------------------------------------
+
+describe("directory-hash isolation", () => {
+  test("archives with directory include directoryHash", async () => {
+    const store = await loadBrainMemory()
+    await addProjectNote(store, "api", "note for work-api")
+    await archiveAgentMemory("api", "build it", "/work/api")
+
+    const archive = await loadAgentArchive("api", "/work/api")
+    expect(archive).not.toBeNull()
+    expect(archive!.directoryHash).toBeTruthy()
+    expect(archive!.directory).toBe("/work/api")
+  })
+
+  test("same agent name, different directories get separate archives", async () => {
+    const store = await loadBrainMemory()
+    await addProjectNote(store, "api", "note for work-api")
+    await archiveAgentMemory("api", "directive A", "/work/api")
+
+    // Re-create the agent for a different directory
+    const store2 = await loadBrainMemory()
+    await addProjectNote(store2, "api", "note for projects-api")
+    await archiveAgentMemory("api", "directive B", "/projects/api")
+
+    // Both archives should exist independently
+    const archiveA = await loadAgentArchive("api", "/work/api")
+    const archiveB = await loadAgentArchive("api", "/projects/api")
+    expect(archiveA).not.toBeNull()
+    expect(archiveB).not.toBeNull()
+    expect(archiveA!.projectNotes).toEqual(["note for work-api"])
+    expect(archiveB!.projectNotes).toEqual(["note for projects-api"])
+    expect(archiveA!.lastDirective).toBe("directive A")
+    expect(archiveB!.lastDirective).toBe("directive B")
+  })
+
+  test("restore with wrong directory returns false", async () => {
+    const store = await loadBrainMemory()
+    await addProjectNote(store, "api", "secret note")
+    await archiveAgentMemory("api", "build", "/work/api")
+
+    // Try to restore with a different directory — should fail
+    const ok = await restoreAgentMemory("api", "/other/api")
+    expect(ok).toBe(false)
+
+    // Original archive should still exist
+    expect(await hasAgentArchive("api", "/work/api")).toBe(true)
+  })
+
+  test("restore with correct directory succeeds", async () => {
+    const store = await loadBrainMemory()
+    await addProjectNote(store, "api", "my note")
+    await archiveAgentMemory("api", "build", "/work/api")
+
+    const ok = await restoreAgentMemory("api", "/work/api")
+    expect(ok).toBe(true)
+
+    const active = await loadBrainMemory()
+    expect(active.projectNotes["api"]).toEqual(["my note"])
+  })
+
+  test("legacy archives (no hash) are still restored when no directory given", async () => {
+    const store = await loadBrainMemory()
+    await addProjectNote(store, "old-agent", "legacy note")
+    // Archive without directory (legacy behavior)
+    await archiveAgentMemory("old-agent", "old directive")
+
+    const ok = await restoreAgentMemory("old-agent")
+    expect(ok).toBe(true)
+
+    const active = await loadBrainMemory()
+    expect(active.projectNotes["old-agent"]).toEqual(["legacy note"])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // formatMemoryForPrompt with per-agent entries
 // ---------------------------------------------------------------------------
 

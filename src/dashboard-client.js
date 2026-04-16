@@ -231,6 +231,25 @@ function makeHeader(text, maxLen) {
   return firstLine.slice(0, maxLen) + '...'
 }
 
+// Expandable entry — shows truncated preview, click to see full text
+// Used for any long log entry (supervisor thinking, brain thinking, etc.)
+var EXPAND_THRESHOLD = 120
+
+function addExpandableEntry(logEl, className, text) {
+  if (text.length <= EXPAND_THRESHOLD) {
+    addLogEntry(logEl, className, escapeHtml(text))
+    return
+  }
+  var preview = text.slice(0, EXPAND_THRESHOLD).replace(/\n/g, ' ') + '...'
+  var wrapper = document.createElement('div')
+  wrapper.className = 'log-entry expandable ' + className
+  wrapper.innerHTML = '<span class="timestamp">' + ts() + '</span>'
+    + '<span class="expandable-preview">' + escapeHtml(preview) + '</span>'
+    + '<pre class="expandable-full">' + escapeHtml(text) + '</pre>'
+  wrapper.addEventListener('click', function() { wrapper.classList.toggle('expanded') })
+  appendToLog(logEl, wrapper)
+}
+
 function addCollapsible(logEl, type, header, body, startOpen) {
   const wrapper = document.createElement('div')
   const cls = type === 'prompt' ? 'prompt-entry' : 'response-entry'
@@ -453,8 +472,12 @@ function handleEvent(event) {
       el.className += ' sv-meta'
     }
 
-    el.innerHTML = '<span class="sv-ts">' + ts() + '</span>' + escapeHtml(text)
-    appendToLog(logEl, el)
+    if (text.length > EXPAND_THRESHOLD) {
+      addExpandableEntry(logEl, el.className, text)
+    } else {
+      el.innerHTML = '<span class="sv-ts">' + ts() + '</span>' + escapeHtml(text)
+      appendToLog(logEl, el)
+    }
   }
 
   if (event.type === 'supervisor-alert') {
@@ -498,9 +521,7 @@ function handleEvent(event) {
   }
 
   if (event.type === 'brain-thinking') {
-    const entry = document.createElement('div')
-    entry.textContent = event.text
-    appendToLog(brainLog, entry)
+    addExpandableEntry(brainLog, '', event.text || '')
   }
 
   if (event.type === 'brain-status') {
@@ -1530,6 +1551,9 @@ function openAddProject() {
 function closeAddProject() {
   addProjectModal.classList.remove('open')
   browsePanel.classList.remove('open')
+  document.getElementById('proj-dir').value = ''
+  document.getElementById('proj-name').value = ''
+  document.getElementById('proj-directive').value = ''
 }
 
 function checkEmptyState() {
@@ -1675,6 +1699,11 @@ document.getElementById('proj-name').addEventListener('keydown', (e) => {
 // Close modal on Escape or overlay click
 addProjectModal.addEventListener('click', (e) => {
   if (e.target === addProjectModal) closeAddProject()
+})
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && addProjectModal.classList.contains('open')) {
+    closeAddProject()
+  }
 })
 
 // Command bar

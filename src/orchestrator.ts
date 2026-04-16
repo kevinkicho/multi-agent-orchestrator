@@ -10,6 +10,8 @@ import {
   agentReplyPermission,
   agentHealthCheck,
   agentAbort,
+  agentAnswerQuestion,
+  agentRejectQuestion,
 } from "./agent"
 import { subscribeToAgentEvents, type AgentEvent } from "./events"
 import { extractLastAssistantText } from "./message-utils"
@@ -224,6 +226,8 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
       }
     } else if (type === "permission.request") {
       handlePermission(name, agent, event.event.properties)
+    } else if (type === "question.asked") {
+      handleQuestion(name, agent, event.event.properties)
     }
   }
 
@@ -248,6 +252,31 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
         config.onStatusChange?.(name, `permission-${decision}d`, requestID)
       } catch (err) {
         console.error(`[${name}] Failed to handle permission:`, err)
+      }
+    }
+  }
+
+  async function handleQuestion(name: string, agent: AgentState, properties: Record<string, unknown>) {
+    const requestID = properties.id as string
+    if (!requestID) return
+    const questions = properties.questions as Array<{ question: string; options?: Array<{ label: string }> }> | undefined
+
+    // Auto-answer: pick the first option for each question, or provide "yes" as fallback
+    try {
+      const answers: string[][] = (questions ?? []).map(q => {
+        if (q.options && q.options.length > 0) return [q.options[0]!.label]
+        return ["yes"]
+      })
+      if (answers.length === 0) answers.push(["yes"])
+      await agentAnswerQuestion(agent, requestID, answers)
+      config.onStatusChange?.(name, "question-answered", `Auto-answered: ${questions?.[0]?.question?.slice(0, 80) ?? requestID}`)
+    } catch (err) {
+      // If answering fails, try rejecting so the agent unblocks
+      try {
+        await agentRejectQuestion(agent, requestID)
+        config.onStatusChange?.(name, "question-rejected", requestID)
+      } catch {
+        console.error(`[${name}] Failed to handle question:`, err)
       }
     }
   }

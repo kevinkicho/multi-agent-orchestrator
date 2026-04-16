@@ -18,35 +18,54 @@ type SupervisorCommand =
   | { type: "cycle_done"; summary: string }
   | { type: "stop"; summary: string }
 
+const COMMAND_PREFIXES = [
+  "PROMPT ", "WAIT", "MESSAGES", "REVIEW", "RESTART", "ABORT",
+  "NOTE_BEHAVIOR ", "NOTE ", "DIRECTIVE ", "NOTIFY ", "INTENT ",
+  "CYCLE_DONE", "STOP",
+]
+
 function parseSupervisorCommands(response: string): SupervisorCommand[] {
   const commands: SupervisorCommand[] = []
   const codeBlockMatch = response.match(/```commands?\n([\s\S]*?)```/)
   const lines = codeBlockMatch ? codeBlockMatch[1]!.split("\n") : response.split("\n")
 
+  let lastPrompt: { type: "prompt"; message: string } | null = null
+
   for (const line of lines) {
     const trimmed = line.trim()
     if (!trimmed) continue
     if (trimmed.startsWith("PROMPT ")) {
-      commands.push({ type: "prompt", message: trimmed.slice(7) })
+      lastPrompt = { type: "prompt", message: trimmed.slice(7) }
+      commands.push(lastPrompt)
     } else if (trimmed === "WAIT") {
+      lastPrompt = null
       commands.push({ type: "wait" })
     } else if (trimmed === "MESSAGES") {
+      lastPrompt = null
       commands.push({ type: "messages" })
     } else if (trimmed === "REVIEW") {
+      lastPrompt = null
       commands.push({ type: "review" })
     } else if (trimmed === "RESTART") {
+      lastPrompt = null
       commands.push({ type: "restart" })
     } else if (trimmed === "ABORT") {
+      lastPrompt = null
       commands.push({ type: "abort" })
     } else if (trimmed.startsWith("NOTE_BEHAVIOR ")) {
+      lastPrompt = null
       commands.push({ type: "note_behavior", text: trimmed.slice(14) })
     } else if (trimmed.startsWith("NOTE ")) {
+      lastPrompt = null
       commands.push({ type: "note", text: trimmed.slice(5) })
     } else if (trimmed.startsWith("DIRECTIVE ")) {
+      lastPrompt = null
       commands.push({ type: "directive", text: trimmed.slice(10) })
     } else if (trimmed.startsWith("NOTIFY ")) {
+      lastPrompt = null
       commands.push({ type: "notify", message: trimmed.slice(7) })
     } else if (trimmed.startsWith("INTENT ")) {
+      lastPrompt = null
       const rest = trimmed.slice(7)
       const filesMatch = rest.match(/\[files?:\s*([^\]]+)\]/)
       const files = filesMatch
@@ -55,9 +74,13 @@ function parseSupervisorCommands(response: string): SupervisorCommand[] {
       const description = rest.replace(/\[files?:\s*[^\]]+\]/, "").trim()
       commands.push({ type: "intent", description, files })
     } else if (trimmed.startsWith("CYCLE_DONE")) {
+      lastPrompt = null
       commands.push({ type: "cycle_done", summary: trimmed.slice(10).trim() || "Cycle completed." })
     } else if (trimmed.startsWith("STOP")) {
+      lastPrompt = null
       commands.push({ type: "stop", summary: trimmed.slice(4).trim() || "Supervisor stopped." })
+    } else if (lastPrompt) {
+      lastPrompt.message += "\n" + trimmed
     }
   }
   return commands
@@ -184,5 +207,61 @@ CYCLE_DONE All done with good progress
       "messages", "prompt", "wait", "review", "restart", "abort",
       "note", "note_behavior", "directive", "notify", "intent", "cycle_done",
     ])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Multi-line PROMPT tests
+// ---------------------------------------------------------------------------
+
+describe("multi-line PROMPT", () => {
+  test("collects continuation lines into the PROMPT message", () => {
+    const response = `\`\`\`commands
+PROMPT Check each tab for these requirements:
+1. Does animation auto-start?
+2. Does it pause when leaving?
+3. Is there a reset button?
+WAIT
+\`\`\``
+    const cmds = parseSupervisorCommands(response)
+    expect(cmds).toHaveLength(2)
+    expect(cmds[0]!.type).toBe("prompt")
+    const msg = (cmds[0] as { type: "prompt"; message: string }).message
+    expect(msg).toContain("Check each tab for these requirements:")
+    expect(msg).toContain("1. Does animation auto-start?")
+    expect(msg).toContain("2. Does it pause when leaving?")
+    expect(msg).toContain("3. Is there a reset button?")
+    expect(cmds[1]!.type).toBe("wait")
+  })
+
+  test("multi-line PROMPT stops at next command", () => {
+    const response = `PROMPT Do this task:
+- step one
+- step two
+MESSAGES`
+    const cmds = parseSupervisorCommands(response)
+    expect(cmds).toHaveLength(2)
+    const msg = (cmds[0] as { type: "prompt"; message: string }).message
+    expect(msg).toContain("- step one")
+    expect(msg).toContain("- step two")
+    expect(msg).not.toContain("MESSAGES")
+    expect(cmds[1]!.type).toBe("messages")
+  })
+
+  test("single-line PROMPT still works", () => {
+    const cmds = parseSupervisorCommands("PROMPT Fix the bug in auth.ts")
+    expect(cmds).toHaveLength(1)
+    expect((cmds[0] as { type: "prompt"; message: string }).message).toBe("Fix the bug in auth.ts")
+  })
+
+  test("continuation lines are not collected after non-PROMPT commands", () => {
+    const response = `MESSAGES
+some random text
+WAIT`
+    const cmds = parseSupervisorCommands(response)
+    // "some random text" should be ignored, not appended to MESSAGES
+    expect(cmds).toHaveLength(2)
+    expect(cmds[0]!.type).toBe("messages")
+    expect(cmds[1]!.type).toBe("wait")
   })
 })

@@ -495,6 +495,14 @@ body.light .toast-info { background: #eff6ff; color: #2563eb; border-color: #256
 .collapsible.response-entry .collapsible-header { color: #4ade80; }
 .collapsible.response-entry .collapsible-body { color: #e0e0e0; }
 
+/* Expandable log entries — click to reveal full text */
+.expandable { cursor: pointer; }
+.expandable:hover { opacity: 0.85; }
+.expandable .expandable-preview { display: inline; }
+.expandable .expandable-full { display: none; margin: 4px 0 2px 0; white-space: pre-wrap; word-break: break-word; font-size: 11px; font-family: inherit; background: transparent; color: inherit; padding: 0; }
+.expandable.expanded .expandable-preview { display: none; }
+.expandable.expanded .expandable-full { display: block; }
+
 /* Cycle summary */
 .cycle-summary {
   background: #1a1a30;

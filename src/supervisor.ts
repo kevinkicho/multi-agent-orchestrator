@@ -416,9 +416,16 @@ function isUnknownAgentError(err: unknown): boolean {
 }
 
 /** Wait for a single agent to finish (not all agents) */
-async function waitForAgent(orchestrator: Orchestrator, agentName: string, timeoutMs = 300_000): Promise<void> {
+async function waitForAgent(
+  orchestrator: Orchestrator,
+  agentName: string,
+  timeoutMs = 300_000,
+  opts?: { signal?: AbortSignal; pauseState?: PauseState },
+): Promise<void> {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
+    if (opts?.signal?.aborted) return
+    if (opts?.pauseState && isPauseRequested(opts.pauseState)) return
     const statuses = await orchestrator.status()
     const s = statuses.get(agentName)
     if (!s || s.status !== "busy") return
@@ -514,7 +521,7 @@ export async function runAgentSupervisor(
       const agentSt = agentStatuses.get(agentName)
       if (agentSt?.status === "idle" || agentSt?.status === "ready") {
         await orchestrator.prompt(agentName, "List the tools and commands you have access to (git, test runners, linters, build tools, package managers). Reply with a brief list, no explanation needed.")
-        await waitForAgent(orchestrator, agentName, 30_000) // short timeout for probe
+        await waitForAgent(orchestrator, agentName, 30_000, { signal: config.signal, pauseState: config.pauseState }) // short timeout for probe
         const probeMessages = await orchestrator.getMessages(agentName)
         const probeResponse = extractLastAssistantText(probeMessages)
         if (probeResponse && probeResponse.length > 10) {
@@ -926,7 +933,7 @@ Be specific with file paths, line numbers, and code snippets.`
             }
 
             // Wait for review to complete
-            await waitForAgent(orchestrator, targetAgent)
+            await waitForAgent(orchestrator, targetAgent, 300_000, { signal: config.signal, pauseState: config.pauseState })
 
             // Get review response
             const reviewMsgs = await orchestrator.getMessages(targetAgent)
@@ -1311,7 +1318,7 @@ Be specific with file paths, line numbers, and code snippets.`
       // Wait for agent to finish, then collect response
       if (shouldWait) {
         emit(`Waiting for ${agentName} to finish...`)
-        await waitForAgent(orchestrator, agentName)
+        await waitForAgent(orchestrator, agentName, 300_000, { signal: config.signal, pauseState: config.pauseState })
 
         // Collect new response (only messages added after our prompt)
         try {

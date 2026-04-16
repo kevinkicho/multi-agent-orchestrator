@@ -616,7 +616,7 @@ export class ProjectManager {
   pauseAll(): void {
     for (const id of this.pauseStates.keys()) {
       const project = this.projects.get(id)
-      if (project && project.status === "supervising") {
+      if (project && (project.status === "supervising" || project.status === "running")) {
         this.pauseProject(id)
       }
     }

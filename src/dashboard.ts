@@ -956,6 +956,11 @@ export async function startDashboard(
         }, { headers: corsHeaders })
       }
 
+      if (url.pathname === "/api/resources/reset-llm" && req.method === "POST") {
+        opts?.resourceManager?.resetLlmSlots()
+        return Response.json({ ok: true }, { headers: corsHeaders })
+      }
+
       if (url.pathname === "/api/resources/intents" && req.method === "GET") {
         if (!opts?.resourceManager) return Response.json({ intents: {} }, { headers: corsHeaders })
         const intents: Record<string, { description: string; files: string[]; declaredAt: number }> = {}

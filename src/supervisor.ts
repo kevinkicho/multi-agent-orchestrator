@@ -741,43 +741,30 @@ export async function runAgentSupervisor(
         }
       }
 
-      let response: string
-      // LLM semaphore — limit concurrent Ollama calls
-      if (config.resourceManager) await config.resourceManager.acquireLlmSlot()
-      try {
-        const llmResult = await chatCompletionWithUsage(ollamaUrl, model, messages, config.structuredOutput ? { jsonMode: true } : undefined)
-        response = llmResult.content
-        config.tokenTracker?.record(agentName, model, llmResult.usage, cycleCount, analyticsSessionId ?? undefined)
-        consecutiveLlmFailures = 0 // reset on success
-        consecutive429s = 0
-        // Ledger: record inbound LLM response
-        recordPrompt({
-          source: "supervisor", target: agentName, direction: "inbound",
-          projectName: directory, agentName, model, cycleNumber: cycleCount,
-          sessionId: analyticsSessionId ?? undefined,
-          content: response,
-        }).catch(() => {})
-      } catch (err) {
-        // ---- Distinguish 429 rate-limit from genuine failures ----
-        if (isRateLimitError(err)) {
-          consecutive429s++
-          // Report to shared rate-limit coordinator so other agents back off too
-          config.resourceManager?.reportRateLimit(agentName)
-          // Escalating cooldown: 30s, 60s, 120s, 240s (cap 5 min)
-          // 429 is NOT a broken agent — don't count as a restart-worthy failure
-          const cooldownMs = Math.min(30_000 * Math.pow(2, consecutive429s - 1), 300_000)
-          emit(`RATE LIMITED (429) — attempt ${consecutive429s}, cooling down ${cooldownMs / 1000}s then skipping to next cycle`)
-          logPerformance({
-            timestamp: Date.now(), projectName: directory, agentName, model,
-            event: "cycle_error", cycleNumber: cycleCount,
-            details: `rate-limit-429 (consecutive: ${consecutive429s})`,
-          })
-          // Don't retry — the retry will also get 429'd if other supervisors are running.
-          // Just wait and let the next cycle try after the cooldown.
-          await new Promise(r => setTimeout(r, cooldownMs))
-          break
-        } else {
-          // Non-429 failure — original escalating backoff logic
+      let response: string = ""
+      let llmBreakCycle = false
+      // LLM call with semaphore — withLlmSlot guarantees release even on error
+      const doLlmCall = async (): Promise<{ content: string; usage?: import("./brain").TokenUsage } | null> => {
+        try {
+          const result = await chatCompletionWithUsage(ollamaUrl, model, messages, config.structuredOutput ? { jsonMode: true } : undefined)
+          consecutiveLlmFailures = 0
+          consecutive429s = 0
+          return result
+        } catch (err) {
+          if (isRateLimitError(err)) {
+            consecutive429s++
+            config.resourceManager?.reportRateLimit(agentName)
+            const cooldownMs = Math.min(30_000 * Math.pow(2, consecutive429s - 1), 300_000)
+            emit(`RATE LIMITED (429) — attempt ${consecutive429s}, cooling down ${cooldownMs / 1000}s then skipping to next cycle`)
+            logPerformance({
+              timestamp: Date.now(), projectName: directory, agentName, model,
+              event: "cycle_error", cycleNumber: cycleCount,
+              details: `rate-limit-429 (consecutive: ${consecutive429s})`,
+            })
+            await new Promise(r => setTimeout(r, cooldownMs))
+            llmBreakCycle = true
+            return null
+          }
           consecutiveLlmFailures++
           const retryDelay = Math.min(5000 * Math.pow(2, consecutiveLlmFailures - 1), 60_000)
           emit(`LLM request failed (round ${round + 1}, failure #${consecutiveLlmFailures}): ${err}`)
@@ -785,9 +772,8 @@ export async function runAgentSupervisor(
           await new Promise(r => setTimeout(r, retryDelay))
           try {
             const retryResult = await chatCompletionWithUsage(ollamaUrl, model, messages, config.structuredOutput ? { jsonMode: true } : undefined)
-            response = retryResult.content
-            config.tokenTracker?.record(agentName, model, retryResult.usage, cycleCount, analyticsSessionId ?? undefined)
             consecutiveLlmFailures = 0
+            return retryResult
           } catch (retryErr) {
             emit(`LLM retry failed — skipping to next cycle: ${retryErr}`)
             logPerformance({
@@ -799,11 +785,27 @@ export async function runAgentSupervisor(
               emit(`Ollama persistently unreachable (${consecutiveLlmFailures} failures) — pausing ${pauseMs / 1000}s before next cycle`)
               await new Promise(r => setTimeout(r, pauseMs))
             }
-            break
+            llmBreakCycle = true
+            return null
           }
         }
-      } finally {
-        config.resourceManager?.releaseLlmSlot()
+      }
+
+      const llmResult = config.resourceManager
+        ? await config.resourceManager.withLlmSlot(doLlmCall)
+        : await doLlmCall()
+
+      if (llmBreakCycle || !llmResult) {
+        if (llmBreakCycle) break
+      } else {
+        response = llmResult.content
+        config.tokenTracker?.record(agentName, model, llmResult.usage, cycleCount, analyticsSessionId ?? undefined)
+        recordPrompt({
+          source: "supervisor", target: agentName, direction: "inbound",
+          projectName: directory, agentName, model, cycleNumber: cycleCount,
+          sessionId: analyticsSessionId ?? undefined,
+          content: response,
+        }).catch(() => {})
       }
 
       if (!response) {

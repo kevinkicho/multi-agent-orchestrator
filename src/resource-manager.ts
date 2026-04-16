@@ -184,6 +184,19 @@ export class ResourceManager {
     if (next) next()
   }
 
+  /**
+   * Scoped LLM slot — acquire, run callback, release on completion or error.
+   * Preferred over manual acquire/release to prevent slot leaks.
+   */
+  async withLlmSlot<T>(fn: () => Promise<T>): Promise<T> {
+    await this.acquireLlmSlot()
+    try {
+      return await fn()
+    } finally {
+      this.releaseLlmSlot()
+    }
+  }
+
   /** How many supervisors are waiting for an LLM slot. */
   getLlmQueueDepth(): number {
     return this.llmWaiters.length
@@ -192,6 +205,16 @@ export class ResourceManager {
   /** Current number of active LLM slots. */
   getLlmActiveCount(): number {
     return this.llmCurrent
+  }
+
+  /** Reset LLM slot counter — use when counter drifts due to error paths. */
+  resetLlmSlots(): void {
+    this.llmCurrent = 0
+    // Wake all waiters so they don't block forever
+    while (this.llmWaiters.length > 0) {
+      const next = this.llmWaiters.shift()
+      if (next) next()
+    }
   }
 
   /** Max LLM concurrency setting. */

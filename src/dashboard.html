@@ -32,8 +32,8 @@
     <nav class="toolbar" role="toolbar" aria-label="Dashboard controls">
       <input type="text" class="search-input" id="search-input" placeholder="Filter logs..." oninput="filterLogs(this.value)" aria-label="Filter log entries">
       <button class="toolbar-btn" onclick="exportLogs()" aria-label="Export logs to file">Export</button>
-      <button class="toolbar-btn" onclick="pauseAll()" style="color:#f59e0b;border-color:#f59e0b;" aria-label="Pause all projects">Pause All</button>
-      <button class="toolbar-btn" onclick="resumeAll()" style="color:#22d3ee;border-color:#22d3ee;" aria-label="Resume all projects">Resume All</button>
+      <button class="toolbar-btn" onclick="pauseAll()" style="color:#f59e0b;border-color:#f59e0b;" aria-label="Pause all projects" title="Pause all supervisors after their current cycles complete">Pause All</button>
+      <button class="toolbar-btn" onclick="resumeAll()" style="color:#22d3ee;border-color:#22d3ee;" aria-label="Resume all projects" title="Resume all paused supervisors immediately">Resume All</button>
       <button class="toolbar-btn" id="theme-btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme">Light</button>
     </nav>
   </header>

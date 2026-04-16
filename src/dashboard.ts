@@ -1047,6 +1047,14 @@ export async function startDashboard(
         })
       }
 
+      // Favicon — return the inline SVG to suppress browser 404 requests
+      if (url.pathname === "/favicon.ico") {
+        const svg = `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><radialGradient id='g' cx='32' cy='32' r='28'><stop offset='0%' stop-color='%239b8bff'/><stop offset='100%' stop-color='%235b4bdf'/></radialGradient></defs><rect width='64' height='64' rx='14' fill='%230a0a0f'/><line x1='32' y1='32' x2='16' y2='14' stroke='%234a4a6a' stroke-width='2'/><line x1='32' y1='32' x2='48' y2='14' stroke='%234a4a6a' stroke-width='2'/><line x1='32' y1='32' x2='16' y2='50' stroke='%234a4a6a' stroke-width='2'/><line x1='32' y1='32' x2='48' y2='50' stroke='%234a4a6a' stroke-width='2'/><circle cx='16' cy='14' r='6' fill='%232a2a3a' stroke='%234ade80' stroke-width='2'/><circle cx='48' cy='14' r='6' fill='%232a2a3a' stroke='%2360a5fa' stroke-width='2'/><circle cx='16' cy='50' r='6' fill='%232a2a3a' stroke='%23facc15' stroke-width='2'/><circle cx='48' cy='50' r='6' fill='%232a2a3a' stroke='%23c084fc' stroke-width='2'/><circle cx='32' cy='32' r='9' fill='url(%23g)'/><path d='M28 32 L31 35 L37 29' stroke='white' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>`
+        return new Response(svg, {
+          headers: { ...corsHeaders, "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400" },
+        })
+      }
+
       if (url.pathname === "/dashboard-client.js") {
         return new Response(DASHBOARD_JS, {
           headers: { ...corsHeaders, "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-cache" },

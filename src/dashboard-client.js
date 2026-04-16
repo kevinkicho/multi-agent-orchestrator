@@ -70,12 +70,12 @@ function ensureAgent(name) {
         <span style="font-size:10px;color:#666;margin-left:4px;">Supervisor:</span>
         <span class="agent-badge badge-idle" id="sbadge-${name}">IDLE</span>
         <span class="agent-badge" id="pausebadge-${name}" style="display:none;margin-right:4px;"></span>
-        <button class="project-row-remove" id="pausebtn-${name}" onclick="event.stopPropagation();togglePause('${name}')" title="Pause/Resume" style="color:#f59e0b;border-color:#f59e0b;">Pause</button>
+        <button class="project-row-remove" id="pausebtn-${name}" onclick="event.stopPropagation();togglePause('${name}')" title="Pause supervisor after current cycle completes (click again to resume)" style="color:#f59e0b;border-color:#f59e0b;">Pause</button>
         <span class="agent-badge" id="branchbadge-${name}" style="display:none;background:#1e293b;color:#10b981;font-size:9px;margin-right:4px;"></span>
-        <button class="project-row-remove" onclick="event.stopPropagation();mergeBranch(projectRows['${name}']?.projectId)" title="Merge branch" style="color:#10b981;border-color:#10b981;">Merge</button>
-        <button class="project-row-remove" onclick="event.stopPropagation();setValidation(projectRows['${name}']?.projectId)" title="Set validation" style="color:#22d3ee;border-color:#22d3ee;">Validate</button>
-        <button class="project-row-remove" onclick="event.stopPropagation();openABTestModal('${name}')" title="A/B Test" style="color:#c084fc;border-color:#c084fc;">A/B</button>
-        <button class="project-row-remove" onclick="event.stopPropagation();removeProject('${name}')" title="Remove project">Remove</button>
+        <button class="project-row-remove" onclick="event.stopPropagation();mergeBranch(projectRows['${name}']?.projectId)" title="Merge the agent's isolated git branch back into the main branch" style="color:#10b981;border-color:#10b981;">Merge</button>
+        <button class="project-row-remove" onclick="event.stopPropagation();setValidation(projectRows['${name}']?.projectId)" title="Set a shell command to run after each cycle (e.g. test suite) — fails trigger re-work" style="color:#22d3ee;border-color:#22d3ee;">Validate</button>
+        <button class="project-row-remove" onclick="event.stopPropagation();openABTestModal('${name}')" title="Run two models side-by-side on the same task and compare results" style="color:#c084fc;border-color:#c084fc;">A/B</button>
+        <button class="project-row-remove" onclick="event.stopPropagation();removeProject('${name}')" title="Stop supervisor, kill agent process, and remove this project">Remove</button>
       </div>
     </div>
     <div class="project-row-body">
@@ -101,7 +101,6 @@ function ensureAgent(name) {
             <span class="supervisor-icon">&#9670;</span>
             <span class="label">Supervisor</span>
           </div>
-          <span class="agent-badge badge-idle" id="svbadge-${name}">IDLE</span>
         </div>
         <div class="panel-log" id="slog-${name}"></div>
       </div>
@@ -115,7 +114,7 @@ function ensureAgent(name) {
     workerLog: row.querySelector('#wlog-' + name),
     supervisorLog: row.querySelector('#slog-' + name),
     workerBadge: row.querySelector('#badge-' + name),
-    supervisorBadge: row.querySelector('#svbadge-' + name),
+    supervisorBadge: row.querySelector('#sbadge-' + name),
     rowWorkerBadge: row.querySelector('#wbadge-' + name),
     rowSupervisorBadge: row.querySelector('#sbadge-' + name),
     projStatusBadge: row.querySelector('#projstatus-' + name),

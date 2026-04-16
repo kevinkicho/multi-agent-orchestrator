@@ -346,7 +346,7 @@ async function main() {
   const { EventBus } = await import("./event-bus")
   const { ResourceManager } = await import("./resource-manager")
   const eventBus = new EventBus()
-  const resourceManager = new ResourceManager(2) // max 2 concurrent LLM calls
+  const resourceManager = new ResourceManager(20) // max 20 concurrent LLM calls (supports up to 10 projects)
 
   // ProjectManager — handles dynamic agent provisioning from the dashboard
   const projectManager = new ProjectManager(orchestrator, dashLog, brainConfig, supervisorLimits, eventBus, resourceManager)

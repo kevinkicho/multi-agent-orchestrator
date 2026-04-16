@@ -1249,25 +1249,6 @@ function exportLogs() {
   a.click()
 }
 
-// Resizable brain panel
-const resizeHandle = document.getElementById('resize-handle')
-const brainSection = document.getElementById('brain-section')
-const brainBody = brainSection.querySelector('.brain-body')
-let isResizing = false
-resizeHandle.addEventListener('mousedown', (e) => {
-  isResizing = true
-  e.preventDefault()
-})
-document.addEventListener('mousemove', (e) => {
-  if (!isResizing) return
-  const viewH = window.innerHeight
-  const newH = viewH - e.clientY - 38  // subtract cmd-bar height
-  const clamped = Math.max(60, Math.min(viewH - 200, newH))
-  brainBody.style.height = clamped + 'px'
-  if (!brainSection.classList.contains('open')) brainSection.classList.add('open')
-})
-document.addEventListener('mouseup', () => { isResizing = false })
-
 // Remove project
 async function removeProject(agentName) {
   if (!confirm('Remove project "' + agentName + '"? This will stop the agent and supervisor.')) return

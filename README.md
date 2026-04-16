@@ -18,6 +18,7 @@ Multi-Agent Orchestrator spawns and manages multiple [opencode](https://github.c
 - [File Reference](#file-reference)
 - [Function Reference](#function-reference)
 - [API Endpoints](#api-endpoints)
+- [Testing](#testing)
 - [License](#license)
 
 ---
@@ -85,6 +86,12 @@ Each project gets:
 - **Permission handling** -- Auto-approve or manually review tool permissions through the dashboard.
 - **Auto-reconnect** -- Health monitoring with automatic reconnection when agents come back online.
 - **Crash resilience** -- Promise-chain mutexes, async write locks, retry logic, partial-failure tolerance, and auto-restart on supervisor failure throughout.
+- **Graceful shutdown** -- Signal handlers (SIGINT, SIGTERM, SIGHUP) and uncaught exception/rejection handlers ensure all ports are released, child processes killed, and supervisors stopped on any exit path.
+- **API token authentication** -- Per-session UUID token protects all mutating dashboard API endpoints (POST/PUT/DELETE) against unauthorized local access.
+- **Atomic file writes** -- All JSON persistence uses a write-to-temp-then-rename pattern to prevent corruption if the process crashes mid-write.
+- **Configurable supervisor limits** -- Tune cycle pause, max rounds, restart caps, conversation size, and stuck thresholds via `orchestrator.json` without code changes.
+- **Request timeouts** -- Ollama API calls abort after 5 minutes (chat completion) or 10 seconds (model info) to prevent indefinite hangs.
+- **Port conflict detection** -- Pre-flight port availability check with actionable error messages before starting the dashboard server.
 - **Behavioral note deduplication** -- Before saving a new behavioral note, checks keyword similarity against existing notes (60% overlap threshold) to prevent duplicate entries from repeated agent issues.
 - **Dynamic supervisor cycle pause** -- Cycle pause adapts to agent responsiveness: backs off (up to 4x base, max 120s) when agents produce empty responses, resets when productive.
 - **Performance log archival** -- Entries older than 7 days are automatically archived to daily files (`orchestrator-performance-archive/perf-YYYY-MM-DD.json`) instead of being dropped, preserving historical data while keeping the active log lean.
@@ -92,6 +99,13 @@ Each project gets:
 - **Project save/restore** -- Projects are auto-saved with their directives, models, and history. Restore from a previous session via the dashboard modal with directory existence pre-checks.
 - **Project status visibility** -- Dashboard shows project-level status badges (STARTING, RUNNING, SUPERVISING, FINISHED, ERROR) that update in real-time alongside worker and supervisor badges.
 - **Empty response escalation** -- Supervisors track consecutive empty agent responses with a 3-tier escalation: warn → abort → restart + behavioral note. Orchestrator-level stuck detection also monitors message content.
+
+### Security
+
+- **API token authentication** -- Dashboard generates a per-session UUID token injected into the HTML. All mutating requests (POST/PUT/DELETE) require this token in the `X-API-Token` header.
+- **URL parameter sanitization** -- All path-extracted parameters are decoded and stripped of path traversal sequences and control characters.
+- **Restricted directory browsing** -- The `/api/browse` endpoint blocks access to sensitive system paths (Windows, Program Files, /proc, /sys, etc.).
+- **CORS restrictions** -- Only `127.0.0.1` and `localhost` origins are accepted.
 
 ---
 
@@ -130,6 +144,14 @@ Configuration is loaded from `orchestrator.json` in the project root:
     "model": "glm-5.1:cloud",
     "ollamaUrl": "http://127.0.0.1:11434"
   },
+  "supervisor": {
+    "cyclePauseSeconds": 30,
+    "maxRoundsPerCycle": 30,
+    "maxRestartsPerCycle": 3,
+    "maxConsecutiveFailedCycles": 3,
+    "maxConversationMessages": 60,
+    "stuckThresholdMs": 300000
+  },
   "agents": []
 }
 ```
@@ -141,6 +163,12 @@ Configuration is loaded from `orchestrator.json` in the project root:
 | `dashboardPort` | `number` | `4000` | Port for the web dashboard |
 | `brain.model` | `string` | `"glm-5.1:cloud"` | Ollama model name for the supervisor brain |
 | `brain.ollamaUrl` | `string` | `"http://127.0.0.1:11434"` | Ollama API base URL |
+| `supervisor.cyclePauseSeconds` | `number` | `30` | Seconds between supervision cycles |
+| `supervisor.maxRoundsPerCycle` | `number` | `30` | Max LLM rounds per supervision cycle |
+| `supervisor.maxRestartsPerCycle` | `number` | `3` | Max agent restarts allowed per cycle before circuit breaker |
+| `supervisor.maxConsecutiveFailedCycles` | `number` | `3` | Consecutive failed cycles before supervisor pauses |
+| `supervisor.maxConversationMessages` | `number` | `60` | Max messages in LLM conversation before trimming |
+| `supervisor.stuckThresholdMs` | `number` | `300000` | Milliseconds before an agent is considered stuck (5 min) |
 | `agents` | `AgentConfig[]` | `[]` | Optional pre-configured agents (usually left empty; projects are added dynamically) |
 
 ### Environment Variables
@@ -319,22 +347,27 @@ Each agent's opencode instance streams Server-Sent Events (SSE). The orchestrato
 | `project-manager.ts` | Dynamic project provisioning: spawns opencode processes, allocates ports, manages project lifecycle, per-project model selection, directive updates, crash recovery, and auto-restart on supervisor failure. |
 | `dashboard.ts` | Web dashboard: HTTP server with REST API endpoints (including directive editing, model selection, agent restart/abort, Ollama model list proxy, performance data), long-poll event streaming, and an embedded single-page HTML/CSS/JS application with blinking status badges. |
 | `task-queue.ts` | Simple file-backed task queue for structured work assignment and progress tracking. |
-| `message-utils.ts` | Shared utilities for extracting and formatting opencode message arrays into readable text (default: last 6 messages, 3000 chars max). |
-| `performance-log.ts` | Performance logging: records cycle completions, errors, restarts, and stuck events per project per model. Provides aggregation by model for comparison. |
+| `message-utils.ts` | Shared utilities for extracting and formatting opencode message arrays into readable text, plus `trimConversation` for LLM context management. |
+| `file-utils.ts` | Shared file I/O utilities: atomic writes (temp+rename), async `readJsonFile`/`writeJsonFile` using `Bun.file()`/`Bun.write()`. |
+| `performance-log.ts` | Performance logging with write lock: records cycle completions, errors, restarts, and stuck events per project per model. Provides aggregation by model for comparison. |
+| `dashboard.html` | Single-page dashboard application (~2249 lines of HTML/CSS/JS). Extracted from `dashboard.ts` for maintainability. Includes `apiFetch()` wrapper for API token authentication. |
 | `index.ts` | Public API barrel file: re-exports all types and functions for use as a library. |
+| `tests/core.test.ts` | Unit tests for `trimConversation`, `extractLastAssistantText`, `formatRecentMessages`. |
+| `tests/brain-commands.test.ts` | Unit tests for brain and supervisor command parsers. |
+| `tests/brain-memory.test.ts` | Unit tests for `isSimilarNote` behavioral note deduplication. |
 
 ### Config and Data Files
 
 | File | Description |
 |------|-------------|
-| `orchestrator.json` | Main configuration file (brain model, dashboard port, auto-approve setting, optional pre-configured agents). |
+| `orchestrator.json` | Main configuration file (brain model, dashboard port, auto-approve setting, supervisor limits, optional pre-configured agents). |
 | `orchestrator-projects.json` | Auto-saved list of active projects (including per-project model selection) for quick restore on restart. |
 | `.orchestrator-memory.json` | Persistent brain/supervisor memory (session summaries, project notes, behavioral notes). |
 | `orchestrator-tasks.json` | Task queue state (pending, in-progress, completed tasks). |
 | `orchestrator-performance.json` | Active performance log (last 500 entries; older entries archived automatically). |
 | `orchestrator-performance-archive/` | Date-based performance archives (`perf-YYYY-MM-DD.json`). Entries older than 7 days are moved here automatically. |
 | `tsconfig.json` | TypeScript configuration extending `@tsconfig/bun`. |
-| `package.json` | Package manifest with dependencies (`@opencode-ai/sdk`, `zod`) and scripts. |
+| `package.json` | Package manifest with dependencies (`@opencode-ai/sdk`, `zod`) and scripts (`dev`, `start`, `test`, `typecheck`). |
 
 ---
 
@@ -377,7 +410,6 @@ Each agent's opencode instance streams Server-Sent Events (SSE). The orchestrato
 | `runParallelSupervisors(orchestrator, config)` | Starts parallel supervisor instances for all connected agents, each running independently. |
 | `buildSupervisorPrompt(agentName, directory, reviewEnabled, hasReviewer, behavioralNotes)` | Generates the system prompt for a project supervisor including available commands, behavioral notes from previous cycles, and guidelines for stuck agent recovery. |
 | `parseSupervisorCommands(response)` | Parses the LLM's response into structured supervisor commands (PROMPT, WAIT, MESSAGES, REVIEW, RESTART, ABORT, NOTE, NOTE_BEHAVIOR, DIRECTIVE, CYCLE_DONE, STOP). |
-| `trimConversation(messages, maxMessages?)` | Trims the conversation history to stay within context limits (default: 60 messages), preserving the system prompt and inserting a summary marker. |
 | `waitForAgent(orchestrator, agentName, timeoutMs?)` | Polls an agent's status until it is no longer busy (up to 5 minutes by default). |
 
 ### `brain.ts` -- High-Level Brain
@@ -385,12 +417,11 @@ Each agent's opencode instance streams Server-Sent Events (SSE). The orchestrato
 | Function | Description |
 |----------|-------------|
 | `runBrain(orchestrator, config)` | Runs the orchestrator brain: a multi-round LLM loop that plans and executes commands across all agents toward a single objective. Saves progress to memory. |
-| `chatCompletion(ollamaUrl, model, messages)` | Sends a chat completion request to Ollama's OpenAI-compatible API with dynamic `max_tokens` based on the model's context size. Validates the response shape. |
-| `getModelContextSize(ollamaUrl, model)` | Queries Ollama's `/api/show` endpoint to detect a model's context window size. Scans architecture-prefixed keys (e.g. `qwen2.context_length`, `llama.context_length`). Results are cached for 5 minutes. |
+| `chatCompletion(ollamaUrl, model, messages)` | Sends a chat completion request to Ollama's OpenAI-compatible API with dynamic `max_tokens` based on the model's context size. Includes a 5-minute request timeout. Validates the response shape. |
+| `getModelContextSize(ollamaUrl, model)` | Queries Ollama's `/api/show` endpoint (10s timeout) to detect a model's context window size. Scans architecture-prefixed keys (e.g. `qwen2.context_length`, `llama.context_length`). Results are cached for 5 minutes. |
 | `parseCommands(response)` | Parses the brain's response into structured commands (PROMPT, PROMPT_ALL, STATUS, MESSAGES, WAIT, NOTE, DONE). |
 | `formatAgentInfo(orchestrator)` | Formats a summary of all available agents and their directories for inclusion in the brain's context. |
 | `waitForAgents(orchestrator, timeoutMs?)` | Polls all agents until none are busy (up to 5 minutes by default). |
-| `trimConversation(messages, maxMessages?)` | Trims conversation history to stay within model context limits (default: 60 messages). |
 
 ### `brain-memory.ts` -- Persistent Memory
 
@@ -441,7 +472,7 @@ Each agent's opencode instance streams Server-Sent Events (SSE). The orchestrato
 | `DashboardLog.push(event)` | Appends an event to the log and notifies all subscribers. |
 | `DashboardLog.getHistory()` | Returns the full event history buffer. |
 | `DashboardLog.subscribe(fn)` | Registers a listener for new events, returns an unsubscribe function. |
-| `startDashboard(orchestrator, log, port, opts?)` | Starts the Bun HTTP server for the dashboard: serves the HTML SPA, REST API endpoints (status, messages, permissions, prompts, commands, projects, directives, model selection, agent restart/abort, Ollama model proxy, performance data, directory browsing), and long-poll event streaming. |
+| `startDashboard(orchestrator, log, port, opts?)` | Starts the Bun HTTP server for the dashboard with pre-flight port availability check, per-session API token authentication on mutating endpoints, URL parameter sanitization, and restricted directory browsing. Serves the HTML SPA from `dashboard.html`, REST API endpoints, and long-poll event streaming. |
 
 ### `task-queue.ts` -- Task Queue
 
@@ -460,15 +491,25 @@ Each agent's opencode instance streams Server-Sent Events (SSE). The orchestrato
 |----------|-------------|
 | `loadPerformanceLog()` | Loads the performance log from `orchestrator-performance.json`. Returns an empty log if file doesn't exist. |
 | `savePerformanceLog(log)` | Writes the performance log to disk. Archives entries older than 7 days to daily files in `orchestrator-performance-archive/`. Keeps the last 500 active entries. |
-| `logPerformance(entry)` | Appends a performance entry (cycle_complete, cycle_error, restart, stuck, supervisor_stop, supervisor_start) to the log. |
+| `logPerformance(entry)` | Appends a performance entry (cycle_complete, cycle_error, restart, stuck, supervisor_stop, supervisor_start) to the log. Uses a write lock for concurrent supervisor safety. |
 | `getModelStats(log)` | Aggregates performance data by model: total cycles, errors, restarts, stuck events, stops, average cycle duration, projects used, and first/last usage timestamps. |
 
 ### `message-utils.ts` -- Message Utilities
 
 | Function | Description |
 |----------|-------------|
+| `trimConversation(messages, maxMessages?)` | Trims an LLM conversation to stay within context limits (default: 60 messages), preserving the system prompt and inserting a summary marker. Shared by brain.ts and supervisor.ts. |
 | `extractLastAssistantText(messages)` | Extracts the text content from the most recent assistant message in an opencode message array. |
 | `formatRecentMessages(messages, count?, maxLen?)` | Formats the N most recent messages into readable `[role] content` lines with truncation (default: 6 messages, 3000 chars max). |
+
+### `file-utils.ts` -- File I/O Utilities
+
+| Function | Description |
+|----------|-------------|
+| `atomicWrite(filePath, content)` | Writes a file atomically by writing to a temp path then renaming. Prevents corruption on crash. |
+| `readFileOrNull(filePath)` | Reads a file as text using `Bun.file()`, returning `null` if it doesn't exist or is unreadable. |
+| `readJsonFile(filePath, fallback)` | Reads and parses a JSON file, returning the fallback if it doesn't exist or is invalid. |
+| `writeJsonFile(filePath, data)` | Writes a JSON file atomically with pretty-printing. |
 
 ### `cli.ts` -- CLI Entry Point
 
@@ -501,8 +542,9 @@ Barrel file that re-exports all public types and functions for use as a library:
 - `DashboardLog`, `DashboardEvent`, `startDashboard`
 - `ProjectManager`, `ProjectState`, `listDirectories`
 - `Task`, `TaskQueue`, `loadTaskQueue`, `saveTaskQueue`, `addTask`, `updateTask`, `getNextPendingTask`, `formatQueueForPrompt`
-- `AgentSupervisorConfig`, `ParallelSupervisorsConfig`, `ProjectRole`, `runAgentSupervisor`, `runParallelSupervisors`
-- `extractLastAssistantText`, `formatRecentMessages`
+- `AgentSupervisorConfig`, `ParallelSupervisorsConfig`, `ProjectRole`, `SupervisorLimits`, `runAgentSupervisor`, `runParallelSupervisors`
+- `extractLastAssistantText`, `formatRecentMessages`, `trimConversation`
+- `atomicWrite`, `readFileOrNull`, `readJsonFile`, `writeJsonFile`
 - `PerformanceEntry`, `PerformanceLog`, `loadPerformanceLog`, `logPerformance`, `getModelStats`
 
 ---
@@ -535,6 +577,23 @@ The dashboard server exposes these REST endpoints:
 | `POST` | `/api/projects/<id>/directive-comment` | Add a user comment on a directive entry (body: `{ comment, historyIndex? }`) |
 | `GET` | `/api/saved-projects` | Load previously saved project configs (includes directory existence check) |
 | `POST` | `/api/soft-stop` | Request soft stop for all supervisors |
+
+---
+
+## Testing
+
+```bash
+# Run all tests
+bun test
+
+# Type check
+bun run typecheck
+```
+
+The test suite covers:
+- **`core.test.ts`** -- `trimConversation` (trimming, system prompt preservation, edge cases), `extractLastAssistantText` (role filtering, multi-part joining), `formatRecentMessages` (truncation, tool-use display)
+- **`brain-commands.test.ts`** -- Brain command parser (PROMPT, PROMPT_ALL, STATUS, MESSAGES, WAIT, NOTE, DONE) and supervisor command parser (PROMPT, WAIT, MESSAGES, REVIEW, RESTART, ABORT, NOTE, NOTE_BEHAVIOR, DIRECTIVE, CYCLE_DONE, STOP) with code block extraction
+- **`brain-memory.test.ts`** -- `isSimilarNote` behavioral note deduplication (duplicate detection, case insensitivity, punctuation handling, short word filtering)
 
 ---
 

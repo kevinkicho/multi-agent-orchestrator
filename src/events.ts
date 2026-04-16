@@ -57,29 +57,34 @@ export function subscribeToAgentEvents(
         const decoder = new TextDecoder()
         let buffer = ""
 
-        while (!controller.signal.aborted) {
-          const { done, value } = await reader.read()
-          if (done) break
+        try {
+          while (!controller.signal.aborted) {
+            const { done, value } = await reader.read()
+            if (done) break
 
-          buffer += decoder.decode(value, { stream: true })
-          const lines = buffer.split("\n")
-          buffer = lines.pop() ?? ""
+            buffer += decoder.decode(value, { stream: true })
+            const lines = buffer.split("\n")
+            buffer = lines.pop() ?? ""
 
-          for (const line of lines) {
-            if (!line.startsWith("data:")) continue
-            const data = line.slice(5).trim()
-            if (!data) continue
+            for (const line of lines) {
+              if (!line.startsWith("data:")) continue
+              const data = line.slice(5).trim()
+              if (!data) continue
 
-            try {
-              const parsed = JSON.parse(data)
-              handler({
-                agentName: agent.config.name,
-                event: parsed,
-              })
-            } catch {
-              // skip malformed JSON
+              try {
+                const parsed = JSON.parse(data)
+                handler({
+                  agentName: agent.config.name,
+                  event: parsed,
+                })
+              } catch {
+                // skip malformed JSON
+              }
             }
           }
+        } finally {
+          // Release the reader so the underlying connection is freed
+          reader.cancel().catch(() => {})
         }
       } catch (err) {
         if (controller.signal.aborted) return

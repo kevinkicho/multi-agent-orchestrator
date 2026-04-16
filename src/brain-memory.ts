@@ -1,5 +1,5 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs"
-import { resolve, dirname } from "path"
+import { resolve } from "path"
+import { readJsonFile, writeJsonFile } from "./file-utils"
 
 export type BrainMemoryEntry = {
   timestamp: number
@@ -28,27 +28,18 @@ function getMemoryPath(): string {
 // Simple async write lock to prevent concurrent read-modify-write races
 // when multiple parallel supervisors save memory simultaneously
 let writeLock: Promise<void> = Promise.resolve()
-function withWriteLock<T>(fn: () => T): Promise<T> {
+function withWriteLock<T>(fn: () => Promise<T>): Promise<T> {
   const next = writeLock.then(fn, fn) // run fn after previous write completes (even if it errored)
   writeLock = next.then(() => {}, () => {}) // update lock, swallow errors
   return next
 }
 
-export function loadBrainMemory(): BrainMemoryStore {
-  const path = getMemoryPath()
-  if (!existsSync(path)) return { ...DEFAULT_STORE, entries: [], projectNotes: {} }
-  try {
-    return JSON.parse(readFileSync(path, "utf-8"))
-  } catch {
-    return { ...DEFAULT_STORE, entries: [], projectNotes: {} }
-  }
+export async function loadBrainMemory(): Promise<BrainMemoryStore> {
+  return readJsonFile<BrainMemoryStore>(getMemoryPath(), { ...DEFAULT_STORE, entries: [], projectNotes: {} })
 }
 
-export function saveBrainMemory(store: BrainMemoryStore): void {
-  const path = getMemoryPath()
-  const dir = dirname(path)
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
-  writeFileSync(path, JSON.stringify(store, null, 2))
+export async function saveBrainMemory(store: BrainMemoryStore): Promise<void> {
+  await writeJsonFile(getMemoryPath(), store)
 }
 
 export async function addMemoryEntry(
@@ -56,13 +47,13 @@ export async function addMemoryEntry(
   entry: BrainMemoryEntry,
 ): Promise<BrainMemoryStore> {
   // Re-read from disk inside the lock to prevent concurrent write races
-  return withWriteLock(() => {
-    const fresh = loadBrainMemory()
+  return withWriteLock(async () => {
+    const fresh = await loadBrainMemory()
     const result: BrainMemoryStore = {
       ...fresh,
       entries: [...fresh.entries, entry].slice(-50), // keep last 50 sessions
     }
-    saveBrainMemory(result)
+    await saveBrainMemory(result)
     return result
   })
 }
@@ -73,8 +64,8 @@ export async function addProjectNote(
   note: string,
 ): Promise<BrainMemoryStore> {
   // Re-read from disk inside the lock to prevent concurrent write races
-  return withWriteLock(() => {
-    const fresh = loadBrainMemory()
+  return withWriteLock(async () => {
+    const fresh = await loadBrainMemory()
     const notes = fresh.projectNotes[agentName] ?? []
     const result: BrainMemoryStore = {
       ...fresh,
@@ -83,7 +74,7 @@ export async function addProjectNote(
         [agentName]: [...notes, note].slice(-20), // keep last 20 notes per agent
       },
     }
-    saveBrainMemory(result)
+    await saveBrainMemory(result)
     return result
   })
 }
@@ -104,8 +95,8 @@ export async function addBehavioralNote(
   agentName: string,
   note: string,
 ): Promise<BrainMemoryStore> {
-  return withWriteLock(() => {
-    const fresh = loadBrainMemory()
+  return withWriteLock(async () => {
+    const fresh = await loadBrainMemory()
     const notes = fresh.behavioralNotes?.[agentName] ?? []
     // Deduplicate — skip if a similar note already exists
     if (notes.some(existing => isSimilarNote(existing, note))) {
@@ -118,7 +109,7 @@ export async function addBehavioralNote(
         [agentName]: [...notes, note].slice(-10),
       },
     }
-    saveBrainMemory(result)
+    await saveBrainMemory(result)
     return result
   })
 }

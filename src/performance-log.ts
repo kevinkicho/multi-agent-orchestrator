@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs"
-import { resolve, dirname } from "path"
+import { existsSync, mkdirSync } from "fs"
+import { resolve } from "path"
+import { readJsonFile, writeJsonFile } from "./file-utils"
 
 export type PerformanceEntry = {
   timestamp: number
@@ -30,17 +31,11 @@ function getArchiveDir(): string {
   return resolve(process.cwd(), PERF_ARCHIVE_DIR)
 }
 
-export function loadPerformanceLog(): PerformanceLog {
-  const path = getPerfPath()
-  if (!existsSync(path)) return { entries: [] }
-  try {
-    return JSON.parse(readFileSync(path, "utf-8"))
-  } catch {
-    return { entries: [] }
-  }
+export async function loadPerformanceLog(): Promise<PerformanceLog> {
+  return readJsonFile<PerformanceLog>(getPerfPath(), { entries: [] })
 }
 
-export function savePerformanceLog(log: PerformanceLog): void {
+export async function savePerformanceLog(log: PerformanceLog): Promise<void> {
   // Archive entries older than ARCHIVE_AGE_DAYS
   const cutoff = Date.now() - ARCHIVE_AGE_DAYS * 24 * 60 * 60 * 1000
   const old = log.entries.filter(e => e.timestamp < cutoff)
@@ -58,11 +53,8 @@ export function savePerformanceLog(log: PerformanceLog): void {
       }
       for (const [day, entries] of Object.entries(byDate)) {
         const archivePath = resolve(archiveDir, `perf-${day}.json`)
-        let existing: PerformanceEntry[] = []
-        if (existsSync(archivePath)) {
-          try { existing = JSON.parse(readFileSync(archivePath, "utf-8")) } catch {}
-        }
-        writeFileSync(archivePath, JSON.stringify([...existing, ...entries], null, 2))
+        const existing = await readJsonFile<PerformanceEntry[]>(archivePath, [])
+        await writeJsonFile(archivePath, [...existing, ...entries])
       }
     } catch (err) {
       console.error(`[performance-log] Failed to archive: ${err}`)
@@ -71,18 +63,23 @@ export function savePerformanceLog(log: PerformanceLog): void {
 
   // Keep only recent entries in active log, capped at MAX_ACTIVE_ENTRIES
   log.entries = recent.slice(-MAX_ACTIVE_ENTRIES)
-
-  try {
-    writeFileSync(getPerfPath(), JSON.stringify(log, null, 2))
-  } catch (err) {
-    console.error(`[performance-log] Failed to save: ${err}`)
-  }
+  await writeJsonFile(getPerfPath(), log)
 }
 
-export function logPerformance(entry: PerformanceEntry): void {
-  const log = loadPerformanceLog()
-  log.entries.push(entry)
-  savePerformanceLog(log)
+// Write lock to prevent concurrent read-modify-write races from parallel supervisors
+let writeLock: Promise<void> = Promise.resolve()
+function withWriteLock<T>(fn: () => Promise<T>): Promise<T> {
+  const next = writeLock.then(fn, fn)
+  writeLock = next.then(() => {}, () => {})
+  return next
+}
+
+export async function logPerformance(entry: PerformanceEntry): Promise<void> {
+  await withWriteLock(async () => {
+    const log = await loadPerformanceLog()
+    log.entries.push(entry)
+    await savePerformanceLog(log)
+  })
 }
 
 /** Aggregate performance stats by model */
@@ -151,7 +148,7 @@ export function getModelStats(log: PerformanceLog): Record<string, {
     }
   }
 
-  const result: Record<string, any> = {}
+  const result: ReturnType<typeof getModelStats> = {}
   for (const [model, s] of Object.entries(stats)) {
     result[model] = {
       model: s.model,

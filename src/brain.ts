@@ -6,7 +6,7 @@ import {
   addProjectNote,
   formatMemoryForPrompt,
 } from "./brain-memory"
-import { extractLastAssistantText, formatRecentMessages } from "./message-utils"
+import { extractLastAssistantText, formatRecentMessages, trimConversation } from "./message-utils"
 
 export type BrainConfig = {
   /** Ollama API base URL */
@@ -66,9 +66,10 @@ async function getModelContextSize(ollamaUrl: string, model: string): Promise<nu
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: model }),
+      signal: AbortSignal.timeout(10_000), // 10s timeout for model info
     })
     if (res.ok) {
-      const data = await res.json() as any
+      const data = await res.json() as { model_info?: Record<string, unknown> }
       // Ollama prefixes context_length with the model architecture (e.g. "qwen2.context_length", "llama.context_length")
       // Scan all model_info keys for one ending in ".context_length" or "context_length" exactly
       let ctx = 0
@@ -100,24 +101,42 @@ export async function chatCompletion(
   // Use ~1/4 of context for output, capped at 16384
   const maxTokens = contextSize > 0 ? Math.min(Math.floor(contextSize / 4), 16384) : 16384
 
-  const response = await fetch(`${ollamaUrl}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model,
-      messages,
-      temperature: 0.3,
-      max_tokens: maxTokens,
-    }),
-  })
+  // 5-minute timeout — prevents indefinite hangs if Ollama stalls mid-generation
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 300_000)
+
+  let response: Response
+  try {
+    response = await fetch(`${ollamaUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature: 0.3,
+        max_tokens: maxTokens,
+      }),
+      signal: controller.signal,
+    })
+  } catch (err) {
+    clearTimeout(timeout)
+    if (controller.signal.aborted) {
+      throw new Error(`Ollama request timed out after 5 minutes`)
+    }
+    throw err
+  }
+  clearTimeout(timeout)
 
   if (!response.ok) {
     throw new Error(`Ollama API error: ${response.status} ${await response.text()}`)
   }
 
-  let data: any
+  type OllamaChatResponse = {
+    choices?: Array<{ message?: { content?: string } }>
+  }
+  let data: OllamaChatResponse
   try {
-    data = await response.json()
+    data = await response.json() as OllamaChatResponse
   } catch {
     throw new Error(`Ollama returned invalid JSON (status ${response.status})`)
   }
@@ -128,17 +147,6 @@ export async function chatCompletion(
   return content
 }
 
-/** Trim conversation to stay within model context limits. */
-function trimConversation(messages: Message[], maxMessages = 60): void {
-  if (messages.length <= maxMessages) return
-  const keep = maxMessages - 2
-  const trimmed = messages.splice(1, messages.length - 1 - keep)
-  const roundsTrimmed = Math.floor(trimmed.length / 2)
-  messages.splice(1, 0, {
-    role: "user",
-    content: `[Context trimmed: ${roundsTrimmed} earlier rounds removed to stay within context limits. Recent conversation follows.]`,
-  })
-}
 
 type ParsedCommand =
   | { type: "prompt"; agent: string; message: string }
@@ -211,7 +219,7 @@ export async function runBrain(
   config: BrainConfig,
 ): Promise<void> {
   const maxRounds = config.maxRounds ?? 50
-  let memory = loadBrainMemory()
+  let memory = await loadBrainMemory()
   const memoryContext = formatMemoryForPrompt(memory)
 
   const initialContent = [
@@ -233,6 +241,8 @@ export async function runBrain(
       : "Brain started. Thinking about initial plan...",
   )
 
+  let consecutiveLlmFailures = 0
+
   for (let round = 0; round < maxRounds; round++) {
     // Get LLM decision
     trimConversation(messages)
@@ -240,14 +250,21 @@ export async function runBrain(
     let response: string
     try {
       response = await chatCompletion(config.ollamaUrl, config.model, messages)
+      consecutiveLlmFailures = 0
     } catch (err) {
-      config.onThinking?.(`LLM request failed (round ${round + 1}): ${err}`)
-      // Wait and retry once
-      await new Promise(r => setTimeout(r, 5000))
+      consecutiveLlmFailures++
+      const retryDelay = Math.min(5000 * Math.pow(2, consecutiveLlmFailures - 1), 60_000)
+      config.onThinking?.(`LLM request failed (round ${round + 1}, failure #${consecutiveLlmFailures}): ${err}`)
+      config.onThinking?.(`Retrying in ${retryDelay / 1000}s...`)
+      await new Promise(r => setTimeout(r, retryDelay))
       try {
         response = await chatCompletion(config.ollamaUrl, config.model, messages)
+        consecutiveLlmFailures = 0
       } catch (retryErr) {
         config.onThinking?.(`LLM retry failed — stopping brain: ${retryErr}`)
+        if (consecutiveLlmFailures >= 3) {
+          config.onThinking?.(`Ollama persistently unreachable (${consecutiveLlmFailures} failures) — stopping brain`)
+        }
         break
       }
     }
@@ -366,7 +383,7 @@ export async function runBrain(
           type: "cycle-summary",
           cycle: 0,
           agent: name,
-          summary: (commands.find((c) => c.type === "done") as any)?.summary ?? "Objective completed.",
+          summary: (commands.find((c): c is Extract<ParsedCommand, { type: "done" }> => c.type === "done"))?.summary ?? "Objective completed.",
         })
       }
       config.onThinking?.("Brain: objective complete.")

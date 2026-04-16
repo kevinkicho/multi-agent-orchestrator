@@ -9,12 +9,32 @@ import { resolve } from "path"
 import { loadTaskQueue, addTask, formatQueueForPrompt } from "./task-queue"
 import { extractLastAssistantText, formatRecentMessages } from "./message-utils"
 
+/** Tunable supervisor limits — all optional with sensible defaults */
+type SupervisorLimits = {
+  /** Max agent restarts per supervision cycle. Default: 3 */
+  maxRestartsPerCycle?: number
+  /** Consecutive failed cycles before circuit breaker triggers. Default: 3 */
+  maxConsecutiveFailedCycles?: number
+  /** Base backoff delay (ms) for restart exponential backoff. Default: 30000 */
+  restartBackoffBaseMs?: number
+  /** Max LLM conversation messages before trimming. Default: 60 */
+  maxConversationMessages?: number
+  /** Seconds between supervision cycles. Default: 30 */
+  cyclePauseSeconds?: number
+  /** Max LLM rounds per cycle. Default: 30 */
+  maxRoundsPerCycle?: number
+  /** Time (ms) before an agent is considered stuck. Default: 300000 */
+  stuckThresholdMs?: number
+}
+
 type ConfigFile = {
   agents: AgentConfig[]
   autoApprove?: boolean
   pollInterval?: number
   dashboardPort?: number
   brain?: { model?: string; ollamaUrl?: string }
+  /** Tunable supervisor limits */
+  supervisor?: SupervisorLimits
   /** Phase 3: optional project role mapping { agentName: { coder, reviewer? } } */
   projects?: Record<string, { coder: string; reviewer?: string }>
 }
@@ -44,12 +64,14 @@ function parseArgs(): {
   verbose: boolean
   dashboardPort: number
   brain: { model: string; ollamaUrl: string }
+  supervisor: SupervisorLimits
   projects?: Record<string, { coder: string; reviewer?: string }>
 } {
   const args = process.argv.slice(2)
   let autoApprove = false
   let verbose = false
   let dashboardPort = 4000
+  let dashboardPortExplicit = false
   let configPath: string | undefined
   const agents: AgentConfig[] = []
 
@@ -63,6 +85,7 @@ function parseArgs(): {
       configPath = args[++i]!
     } else if (arg === "--dashboard-port" && args[i + 1]) {
       dashboardPort = parseInt(args[++i]!, 10)
+      dashboardPortExplicit = true
     } else if (arg === "--agent" && args[i + 1]) {
       const parts = args[++i]!.split("=")
       if (parts.length >= 2) {
@@ -92,11 +115,12 @@ function parseArgs(): {
     agents: agents.length > 0 ? agents : fileConfig?.agents ?? [],
     autoApprove: autoApprove || fileConfig?.autoApprove || false,
     verbose,
-    dashboardPort: fileConfig?.dashboardPort ?? dashboardPort,
+    dashboardPort: dashboardPortExplicit ? dashboardPort : (fileConfig?.dashboardPort ?? dashboardPort),
     brain: {
       model: fileConfig?.brain?.model ?? "glm-5.1:cloud",
       ollamaUrl: fileConfig?.brain?.ollamaUrl ?? "http://127.0.0.1:11434",
     },
+    supervisor: fileConfig?.supervisor ?? {},
     projects: fileConfig?.projects,
   }
 }
@@ -126,7 +150,7 @@ function statusIcon(status: string): string {
 
 
 async function main() {
-  const { agents, autoApprove, verbose, dashboardPort, brain: brainConfig, projects } = parseArgs()
+  const { agents, autoApprove, verbose, dashboardPort, brain: brainConfig, supervisor: supervisorLimits, projects } = parseArgs()
 
   // Dashboard event log — shared between orchestrator callbacks and the web UI
   const dashLog = new DashboardLog()
@@ -135,9 +159,11 @@ async function main() {
   let activeSoftStop: { requested: boolean } | null = null
 
   console.log("=== OpenCode Orchestrator ===")
-  console.log(`Dashboard: http://127.0.0.1:${dashboardPort}`)
   if (agents.length > 0) {
     console.log(`Pre-configured agents: ${agents.map((a) => `${a.name} @ ${a.url}`).join(", ")}`)
+  } else {
+    console.log("No pre-configured agents. Use the dashboard to add projects,")
+    console.log("or configure agents in orchestrator.json.")
   }
   if (autoApprove) console.log("Auto-approve: enabled")
   console.log("")
@@ -145,11 +171,12 @@ async function main() {
   const config: OrchestratorConfig = {
     agents,
     autoApprove,
+    stuckThresholdMs: supervisorLimits.stuckThresholdMs,
 
     onEvent(event: AgentEvent) {
       const { type } = event.event
       if (type === "session.status") {
-        const status = (event.event.properties as any).status
+        const status = event.event.properties.status as string | undefined
         if (status === "busy" || status === "running") return
       }
       if (verbose) {
@@ -259,7 +286,7 @@ async function main() {
   lazyOrchestrator = orchestrator
 
   // ProjectManager — handles dynamic agent provisioning from the dashboard
-  const projectManager = new ProjectManager(orchestrator, dashLog, brainConfig)
+  const projectManager = new ProjectManager(orchestrator, dashLog, brainConfig, supervisorLimits)
 
   // REPL reader — declared early so handleCommand can re-prompt after background brain tasks
   let reader: any = null
@@ -336,15 +363,15 @@ async function main() {
     }
 
     if (trimmed === "tasks") {
-      const queue = loadTaskQueue()
+      const queue = await loadTaskQueue()
       return { ok: true, output: formatQueueForPrompt(queue) }
     }
 
     if (trimmed.startsWith("task add ")) {
       const title = trimmed.slice(9).trim()
       if (!title) return { ok: false, error: "Usage: task add <title>" }
-      let queue = loadTaskQueue()
-      queue = addTask(queue, { title, description: "" })
+      let queue = await loadTaskQueue()
+      queue = await addTask(queue, { title, description: "" })
       return { ok: true, output: `Added task: ${title}` }
     }
 
@@ -396,9 +423,10 @@ async function main() {
             ollamaUrl: brainConfig.ollamaUrl,
             model: brainConfig.model,
             directive: activeDirective,
-            cyclePauseSeconds: 30,
-            maxRoundsPerCycle: 30,
+            cyclePauseSeconds: supervisorLimits.cyclePauseSeconds ?? 30,
+            maxRoundsPerCycle: supervisorLimits.maxRoundsPerCycle ?? 30,
             reviewEnabled: true,
+            supervisorLimits,
             projects,
             signal: ac.signal,
             softStop,
@@ -425,7 +453,7 @@ async function main() {
 
     if (trimmed === "brain-queue") {
       if (brainRunning) return { ok: false, error: "Brain is already running." }
-      const queue = loadTaskQueue()
+      const queue = await loadTaskQueue()
       const pending = queue.tasks.filter(t => t.status === "pending")
       if (pending.length === 0) return { ok: false, error: "No pending tasks. Use 'task add <title>' first." }
 
@@ -535,18 +563,52 @@ async function main() {
   }
 
   // Start the dashboard web server
-  const dashboard = await startDashboard(orchestrator, dashLog, dashboardPort, {
-    onSoftStop() {
-      if (activeSoftStop) {
-        activeSoftStop.requested = true
-        console.log("\n[dashboard] Soft stop requested from web UI.")
-        dashLog.push({ type: "brain-thinking", text: "--- Soft stop requested from dashboard ---" })
-      }
-      // Also soft-stop all project supervisors
-      projectManager.softStopAll()
-    },
-    onCommand: handleCommand,
-    projectManager,
+  let dashboard: { stop: () => void }
+  try {
+    dashboard = await startDashboard(orchestrator, dashLog, dashboardPort, {
+      onSoftStop() {
+        if (activeSoftStop) {
+          activeSoftStop.requested = true
+          console.log("\n[dashboard] Soft stop requested from web UI.")
+          dashLog.push({ type: "brain-thinking", text: "--- Soft stop requested from dashboard ---" })
+        }
+        // Also soft-stop all project supervisors
+        projectManager.softStopAll()
+      },
+      onCommand: handleCommand,
+      projectManager,
+    })
+    console.log(`Dashboard: http://127.0.0.1:${dashboardPort}`)
+  } catch (err) {
+    console.error(`Failed to start dashboard: ${err instanceof Error ? err.message : err}`)
+    process.exit(1)
+  }
+
+  // --- Graceful shutdown on signals ---
+  let shuttingDown = false
+  function gracefulShutdown(signal: string) {
+    if (shuttingDown) {
+      console.log(`\n[${signal}] Forced exit.`)
+      process.exit(1)
+    }
+    shuttingDown = true
+    console.log(`\n[${signal}] Shutting down...`)
+    projectManager.shutdown()
+    dashboard.stop()
+    orchestrator.shutdown()
+    process.exit(0)
+  }
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"))
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"))
+  process.on("SIGHUP", () => gracefulShutdown("SIGHUP"))
+  // Catch unhandled errors so the dashboard port is released even on crashes
+  process.on("uncaughtException", (err) => {
+    console.error("[uncaughtException]", err)
+    gracefulShutdown("uncaughtException")
+  })
+  process.on("unhandledRejection", (err) => {
+    console.error("[unhandledRejection]", err)
+    gracefulShutdown("unhandledRejection")
   })
 
   // --- Interactive REPL ---
@@ -583,10 +645,8 @@ async function main() {
     }
 
     if (trimmed === "quit" || trimmed === "exit") {
-      projectManager.shutdown()
-      dashboard.stop()
-      orchestrator.shutdown()
-      process.exit(0)
+      gracefulShutdown("quit")
+      return
     }
 
     const result = await handleCommand(trimmed)
@@ -597,10 +657,7 @@ async function main() {
   })
 
   reader.on("close", () => {
-    projectManager.shutdown()
-    dashboard.stop()
-    orchestrator.shutdown()
-    process.exit(0)
+    gracefulShutdown("close")
   })
 }
 

@@ -1,9 +1,10 @@
 import { spawn, type Subprocess } from "bun"
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from "fs"
+import { existsSync, readdirSync, statSync } from "fs"
 import { resolve, basename } from "path"
 import type { Orchestrator } from "./orchestrator"
 import type { DashboardLog } from "./dashboard"
 import { runAgentSupervisor } from "./supervisor"
+import { readJsonFile, writeJsonFile } from "./file-utils"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -63,7 +64,7 @@ async function findFreePort(startFrom: number): Promise<number> {
     usedPorts.add(port) // reserve before testing
     try {
       const server = Bun.serve({ port, hostname: "127.0.0.1", fetch: () => new Response("") })
-      server.stop()
+      server.stop(true) // force-close immediately so port is released
       return port // already in usedPorts
     } catch {
       usedPorts.delete(port) // release failed reservation
@@ -147,6 +148,7 @@ export class ProjectManager {
     private orchestrator: Orchestrator,
     private dashLog: DashboardLog,
     private brainConfig: { model: string; ollamaUrl: string },
+    private supervisorLimits?: import("./supervisor").SupervisorLimits,
   ) {}
 
   /** Add a project: spawns a worker agent and starts its supervisor.
@@ -295,9 +297,10 @@ export class ProjectManager {
           agentName: project.agentName,
           directory: project.directory,
           directive: project.directive,
-          cyclePauseSeconds: 30,
-          maxRoundsPerCycle: 30,
+          cyclePauseSeconds: this.supervisorLimits?.cyclePauseSeconds ?? 30,
+          maxRoundsPerCycle: this.supervisorLimits?.maxRoundsPerCycle ?? 30,
           reviewEnabled: true,
+          limits: this.supervisorLimits,
           dashboardLog: this.dashLog,
           signal: ac.signal,
           softStop,
@@ -378,18 +381,28 @@ export class ProjectManager {
     const ac = this.supervisorAborts.get(projectId)
     if (ac) ac.abort()
 
+    // Mark as stopped BEFORE killing process to prevent monitorProcess
+    // from detecting the intentional kill as an unexpected crash
+    project.status = "stopped"
+
     // Remove from orchestrator
     this.orchestrator.removeAgent(project.agentName)
 
-    // Kill process
+    // Kill process and wait for it to actually exit so the port is released
     const proc = this.processes.get(projectId)
     if (proc) {
       proc.kill()
+      // Give the process up to 5s to exit and release its port
+      await Promise.race([proc.exited, new Promise((r) => setTimeout(r, 5_000))])
       this.processes.delete(projectId)
     }
 
     usedPorts.delete(project.workerPort)
-    project.status = "stopped"
+
+    // Remove from the projects map so it doesn't leak memory over many add/remove cycles
+    this.projects.delete(projectId)
+    this.supervisorAborts.delete(projectId)
+    this.softStops.delete(projectId)
 
     this.dashLog.push({ type: "brain-thinking", text: `Removed project: ${project.name}` })
     this.saveProjects()
@@ -526,35 +539,29 @@ export class ProjectManager {
           ...(p.directiveHistory.length > 1 ? { directiveHistory: p.directiveHistory } : {}),
         })),
     }
-    try {
-      writeFileSync(resolve(process.cwd(), PROJECTS_FILE), JSON.stringify(data, null, 2))
-    } catch (err) {
+    writeJsonFile(resolve(process.cwd(), PROJECTS_FILE), data).catch(err => {
       console.error(`[project-manager] Failed to save projects file: ${err}`)
-    }
+    })
   }
 
   /** Load previously saved projects (for restore on startup) */
-  loadSavedProjects(): Array<{ name: string; directory: string; directive: string; model?: string; directiveHistory?: DirectiveHistoryEntry[] }> {
+  async loadSavedProjects(): Promise<Array<{ name: string; directory: string; directive: string; model?: string; directiveHistory?: DirectiveHistoryEntry[] }>> {
     const paths = [
       resolve(process.cwd(), PROJECTS_FILE),
       resolve(import.meta.dirname, "..", PROJECTS_FILE),
     ]
     for (const p of paths) {
-      if (existsSync(p)) {
-        try {
-          const data = JSON.parse(readFileSync(p, "utf-8")) as SavedProjects
-          return data.projects ?? []
-        } catch {}
-      }
+      const data = await readJsonFile<SavedProjects | null>(p, null)
+      if (data) return data.projects ?? []
     }
     return []
   }
 
-  /** Shut down everything */
+  /** Shut down everything — kills all child processes and waits for port release */
   shutdown() {
     this.hardStopAll()
     for (const proc of this.processes.values()) {
-      proc.kill()
+      try { proc.kill() } catch {}
     }
     this.processes.clear()
     usedPorts.clear()

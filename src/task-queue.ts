@@ -1,5 +1,5 @@
-import { existsSync, readFileSync, writeFileSync } from "fs"
 import { resolve } from "path"
+import { readJsonFile, writeJsonFile } from "./file-utils"
 
 export type TaskStatus = "pending" | "in_progress" | "completed" | "failed"
 
@@ -23,21 +23,15 @@ function getQueuePath(): string {
   return resolve(process.cwd(), "orchestrator-tasks.json")
 }
 
-export function loadTaskQueue(): TaskQueue {
-  const path = getQueuePath()
-  if (!existsSync(path)) return { tasks: [] }
-  try {
-    return JSON.parse(readFileSync(path, "utf-8"))
-  } catch {
-    return { tasks: [] }
-  }
+export async function loadTaskQueue(): Promise<TaskQueue> {
+  return readJsonFile<TaskQueue>(getQueuePath(), { tasks: [] })
 }
 
-export function saveTaskQueue(queue: TaskQueue): void {
-  writeFileSync(getQueuePath(), JSON.stringify(queue, null, 2))
+export async function saveTaskQueue(queue: TaskQueue): Promise<void> {
+  await writeJsonFile(getQueuePath(), queue)
 }
 
-export function addTask(queue: TaskQueue, task: Omit<Task, "id" | "status" | "createdAt">): TaskQueue {
+export async function addTask(queue: TaskQueue, task: Omit<Task, "id" | "status" | "createdAt">): Promise<TaskQueue> {
   const id = `task-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
   const updated: TaskQueue = {
     tasks: [
@@ -45,11 +39,11 @@ export function addTask(queue: TaskQueue, task: Omit<Task, "id" | "status" | "cr
       { ...task, id, status: "pending", createdAt: Date.now() },
     ],
   }
-  saveTaskQueue(updated)
+  await saveTaskQueue(updated)
   return updated
 }
 
-export function updateTask(queue: TaskQueue, id: string, updates: Partial<Pick<Task, "status" | "result">>): TaskQueue {
+export async function updateTask(queue: TaskQueue, id: string, updates: Partial<Pick<Task, "status" | "result">>): Promise<TaskQueue> {
   const updated: TaskQueue = {
     tasks: queue.tasks.map((t) =>
       t.id === id
@@ -62,7 +56,7 @@ export function updateTask(queue: TaskQueue, id: string, updates: Partial<Pick<T
         : t,
     ),
   }
-  saveTaskQueue(updated)
+  await saveTaskQueue(updated)
   return updated
 }
 

@@ -141,20 +141,28 @@ async function main() {
     stderr: "inherit",
   })
 
-  // Cleanup on exit
+  // Cleanup on exit — kill all child processes so ports are released
+  let cleanedUp = false
   const cleanup = () => {
+    if (cleanedUp) return
+    cleanedUp = true
     console.log("\n[launcher] Shutting down all processes...")
-    orchestratorProc.kill()
+    try { orchestratorProc.kill() } catch {}
     for (const proc of procs) {
-      proc.kill()
+      try { proc.kill() } catch {}
     }
-    process.exit(0)
   }
 
-  process.on("SIGINT", cleanup)
-  process.on("SIGTERM", cleanup)
+  process.on("SIGINT", () => { cleanup(); process.exit(0) })
+  process.on("SIGTERM", () => { cleanup(); process.exit(0) })
+  process.on("SIGHUP", () => { cleanup(); process.exit(0) })
+  process.on("uncaughtException", (err) => {
+    console.error("[launcher] Uncaught:", err)
+    cleanup()
+    process.exit(1)
+  })
 
-  // Wait for orchestrator to exit
+  // Wait for orchestrator to exit, then clean up child serve processes
   await orchestratorProc.exited
   cleanup()
 }

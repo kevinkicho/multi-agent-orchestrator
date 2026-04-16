@@ -8,7 +8,7 @@ import {
   addBehavioralNote,
   formatMemoryForPrompt,
 } from "./brain-memory"
-import { extractLastAssistantText, formatRecentMessages } from "./message-utils"
+import { extractLastAssistantText, formatRecentMessages, trimConversation } from "./message-utils"
 import { logPerformance } from "./performance-log"
 
 // ---------------------------------------------------------------------------
@@ -22,6 +22,17 @@ export type ProjectRole = {
   coder: string
   /** Optional dedicated reviewer agent (Phase 3). Falls back to self-review. */
   reviewer?: string
+}
+
+/** Tunable limits for the supervisor — all optional with sensible defaults */
+export type SupervisorLimits = {
+  maxRestartsPerCycle?: number
+  maxConsecutiveFailedCycles?: number
+  restartBackoffBaseMs?: number
+  maxConversationMessages?: number
+  cyclePauseSeconds?: number
+  maxRoundsPerCycle?: number
+  stuckThresholdMs?: number
 }
 
 export type AgentSupervisorConfig = {
@@ -41,6 +52,8 @@ export type AgentSupervisorConfig = {
   reviewEnabled?: boolean
   /** Optional separate reviewer agent name (Phase 3) */
   reviewerAgent?: string
+  /** Configurable limits */
+  limits?: SupervisorLimits
   /** Callbacks */
   onThinking?: (thought: string) => void
   dashboardLog?: DashboardLog
@@ -63,6 +76,8 @@ export type ParallelSupervisorsConfig = {
   cyclePauseSeconds?: number
   maxRoundsPerCycle?: number
   reviewEnabled?: boolean
+  /** Configurable limits passed to each supervisor */
+  supervisorLimits?: SupervisorLimits
   /** Optional project role mapping: { agentName: { coder, reviewer? } } */
   projects?: Record<string, ProjectRole>
   onThinking?: (agentName: string, thought: string) => void
@@ -193,25 +208,6 @@ function parseSupervisorCommands(response: string): SupervisorCommand[] {
 }
 
 // ---------------------------------------------------------------------------
-// Conversation management
-// ---------------------------------------------------------------------------
-
-/** Trim conversation to stay within model context limits.
- *  Keeps the system prompt (index 0) and the most recent messages.
- *  Inserts a summary marker so the LLM knows context was trimmed. */
-function trimConversation(messages: Message[], maxMessages = 60): void {
-  if (messages.length <= maxMessages) return
-  // Keep system prompt + last (maxMessages - 2) messages + a summary marker
-  const keep = maxMessages - 2
-  const trimmed = messages.splice(1, messages.length - 1 - keep)
-  const roundsTrimmed = Math.floor(trimmed.length / 2)
-  messages.splice(1, 0, {
-    role: "user",
-    content: `[Context trimmed: ${roundsTrimmed} earlier rounds removed to stay within context limits. Recent conversation follows.]`,
-  })
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -254,15 +250,24 @@ export async function runAgentSupervisor(
     model,
     reviewEnabled = true,
     reviewerAgent,
+    limits = {},
   } = config
   let directive = config.directive
-  const baseCyclePause = (config.cyclePauseSeconds ?? 30) * 1000
+  const baseCyclePause = (config.cyclePauseSeconds ?? limits.cyclePauseSeconds ?? 30) * 1000
   let cyclePause = baseCyclePause
-  const maxRoundsPerCycle = config.maxRoundsPerCycle ?? 30
+  const maxRoundsPerCycle = config.maxRoundsPerCycle ?? limits.maxRoundsPerCycle ?? 30
+  const maxConversationMessages = limits.maxConversationMessages ?? 60
   const hasReviewer = !!reviewerAgent
   let cycleCount = 0
   let consecutiveEmptyResponses = 0
   let consecutiveIdleCycles = 0 // tracks cycles where agent was idle/no work done
+  let cycleRestartCount = 0 // restarts within the current cycle (capped)
+  let consecutiveFailedCycles = 0 // cycles that hit the restart cap without progress
+
+  const MAX_RESTARTS_PER_CYCLE = limits.maxRestartsPerCycle ?? 3
+  const MAX_CONSECUTIVE_FAILED_CYCLES = limits.maxConsecutiveFailedCycles ?? 3
+  const RESTART_BACKOFF_BASE = limits.restartBackoffBaseMs ?? 30_000
+  let consecutiveLlmFailures = 0 // tracks persistent Ollama failures across cycles
 
   const emit = (text: string) => {
     config.onThinking?.(text)
@@ -277,16 +282,21 @@ export async function runAgentSupervisor(
   emitStatus("running")
   logPerformance({ timestamp: Date.now(), projectName: directory, agentName, model, event: "supervisor_start" })
 
+  let loggedStop = false
+
   while (!config.signal?.aborted) {
     cycleCount++
+    cycleRestartCount = 0 // Reset per-cycle restart counter
+    consecutiveEmptyResponses = 0 // Reset empty counter for new cycle
+    let cycleHadProgress = false // Track if agent produced useful output this cycle
     const cycleStartTime = Date.now()
     emit(`\n===== ${agentName} — CYCLE ${cycleCount} =====\n`)
 
-    let memory = loadBrainMemory()
+    let memory = await loadBrainMemory()
     const memoryContext = formatMemoryForPrompt(memory)
 
     // Extract behavioral notes for this agent to inject into system prompt
-    const behavioralNotes = (memory.behavioralNotes?.[agentName] ?? []).slice(-10)
+    const behavioralNotes = (memory.behavioralNotes?.[agentName] ?? []).slice(-3)
 
     // Get agent status
     const statuses = await orchestrator.status()
@@ -327,27 +337,39 @@ export async function runAgentSupervisor(
 
     let cycleDone = false
     let stopped = false
+    let restartCapHit = false
 
-    for (let round = 0; round < maxRoundsPerCycle && !cycleDone && !stopped; round++) {
+    for (let round = 0; round < maxRoundsPerCycle && !cycleDone && !stopped && !restartCapHit; round++) {
       if (config.signal?.aborted) break
 
-      trimConversation(messages)
+      trimConversation(messages, maxConversationMessages)
 
       let response: string
       try {
         response = await chatCompletion(ollamaUrl, model, messages)
+        consecutiveLlmFailures = 0 // reset on success
       } catch (err) {
-        emit(`LLM request failed (round ${round + 1}): ${err}`)
-        // Wait and retry once
-        await new Promise(r => setTimeout(r, 5000))
+        consecutiveLlmFailures++
+        // Escalating backoff: 5s, 10s, 20s, 40s, 60s (capped)
+        const retryDelay = Math.min(5000 * Math.pow(2, consecutiveLlmFailures - 1), 60_000)
+        emit(`LLM request failed (round ${round + 1}, failure #${consecutiveLlmFailures}): ${err}`)
+        emit(`Retrying in ${retryDelay / 1000}s...`)
+        await new Promise(r => setTimeout(r, retryDelay))
         try {
           response = await chatCompletion(ollamaUrl, model, messages)
+          consecutiveLlmFailures = 0
         } catch (retryErr) {
           emit(`LLM retry failed — skipping to next cycle: ${retryErr}`)
           logPerformance({
             timestamp: Date.now(), projectName: directory, agentName, model,
             event: "cycle_error", cycleNumber: cycleCount, details: String(retryErr),
           })
+          // If Ollama is persistently down, add a longer pause before next cycle
+          if (consecutiveLlmFailures >= 3) {
+            const pauseMs = Math.min(30_000 * consecutiveLlmFailures, 300_000)
+            emit(`Ollama persistently unreachable (${consecutiveLlmFailures} failures) — pausing ${pauseMs / 1000}s before next cycle`)
+            await new Promise(r => setTimeout(r, pauseMs))
+          }
           break
         }
       }
@@ -470,11 +492,20 @@ Be specific with file paths, line numbers, and code snippets.`
           }
 
           case "restart": {
+            if (cycleRestartCount >= MAX_RESTARTS_PER_CYCLE) {
+              results.push(`Cannot restart — already hit per-cycle cap of ${MAX_RESTARTS_PER_CYCLE} restarts. Ending cycle early.`)
+              emit(`RESTART CAP: Supervisor-issued restart blocked at ${MAX_RESTARTS_PER_CYCLE} restarts this cycle`)
+              restartCapHit = true
+              break
+            }
             emit(`Restarting ${agentName} session...`)
+            const backoffMs = RESTART_BACKOFF_BASE * Math.pow(2, Math.min(cycleRestartCount, 4))
+            await new Promise(r => setTimeout(r, backoffMs))
             try {
               const newSession = await orchestrator.restartAgent(agentName)
-              results.push(`Agent ${agentName} restarted successfully. New session: ${newSession}`)
-              emit(`Agent restarted. New session: ${newSession}`)
+              cycleRestartCount++
+              results.push(`Agent ${agentName} restarted successfully (attempt ${cycleRestartCount}/${MAX_RESTARTS_PER_CYCLE}). New session: ${newSession}`)
+              emit(`Agent restarted (attempt ${cycleRestartCount}/${MAX_RESTARTS_PER_CYCLE}). New session: ${newSession}`)
               logPerformance({
                 timestamp: Date.now(), projectName: directory, agentName, model,
                 event: "restart", cycleNumber: cycleCount,
@@ -526,6 +557,7 @@ Be specific with file paths, line numbers, and code snippets.`
               break
             }
             cycleDone = true
+            cycleHadProgress = true
             await addMemoryEntry(memory, {
               timestamp: Date.now(),
               objective: `${agentName} cycle ${cycleCount}: ${directive}`,
@@ -575,13 +607,14 @@ Be specific with file paths, line numbers, and code snippets.`
               timestamp: Date.now(), projectName: directory, agentName, model,
               event: "supervisor_stop", cycleNumber: cycleCount,
               summary: cmd.summary, details: isFailure ? "failure" : "normal",
-            })
-            if (isFailure) {
-              config.dashboardLog?.push({
-                type: "supervisor-alert",
-                agent: agentName,
-                text: `SUPERVISOR STOPPED (failure): ${cmd.summary}`,
-              } as any)
+              })
+              loggedStop = true
+              if (isFailure) {
+                config.dashboardLog?.push({
+                  type: "supervisor-alert",
+                  agent: agentName,
+                  text: `SUPERVISOR STOPPED (failure): ${cmd.summary}`,
+                })
             }
             break
           }
@@ -602,6 +635,7 @@ Be specific with file paths, line numbers, and code snippets.`
           const lastText = extractLastAssistantText(newMsgs)
           if (lastText) {
             consecutiveEmptyResponses = 0
+            cycleHadProgress = true
             results.push(`${agentName} response:\n${lastText.slice(0, 5000)}`)
             config.dashboardLog?.push({ type: "agent-response", agent: agentName, text: lastText })
           } else {
@@ -610,18 +644,34 @@ Be specific with file paths, line numbers, and code snippets.`
             emit(`WARNING: ${agentName} returned empty response (${consecutiveEmptyResponses} consecutive)`)
 
             if (consecutiveEmptyResponses >= 3) {
-              // After 3 empties, restart the agent session
+              if (cycleRestartCount >= MAX_RESTARTS_PER_CYCLE) {
+                // Hit the per-cycle restart cap — end this cycle early
+                emit(`RESTART CAP: ${agentName} hit ${MAX_RESTARTS_PER_CYCLE} restarts this cycle — ending cycle early`)
+                results.push(`Agent hit restart cap (${MAX_RESTARTS_PER_CYCLE} restarts this cycle). Ending cycle — will retry next cycle with longer pause.`)
+                logPerformance({
+                  timestamp: Date.now(), projectName: directory, agentName, model,
+                  event: "restart", cycleNumber: cycleCount, details: "restart-cap-exceeded",
+                })
+                await addBehavioralNote(memory, agentName, `Agent hit restart cap (${MAX_RESTARTS_PER_CYCLE} restarts in cycle ${cycleCount}). Agent needs much simpler prompts — one action per prompt, no multi-step tasks.`)
+                restartCapHit = true
+                break
+              }
+
+              // After 3 empties, restart the agent session (with backoff)
               const emptyCount = consecutiveEmptyResponses
-              emit(`Agent ${agentName} has returned ${emptyCount} consecutive empty responses — restarting session...`)
+              const backoffMs = RESTART_BACKOFF_BASE * Math.pow(2, Math.min(cycleRestartCount, 4))
+              emit(`Agent ${agentName} has returned ${emptyCount} consecutive empty responses — restarting session (attempt ${cycleRestartCount + 1}/${MAX_RESTARTS_PER_CYCLE}, backoff ${backoffMs / 1000}s)...`)
+              await new Promise(r => setTimeout(r, backoffMs))
               try {
                 const newSession = await orchestrator.restartAgent(agentName)
+                cycleRestartCount++
                 consecutiveEmptyResponses = 0
-                results.push(`Agent was non-responsive (${emptyCount} empty responses). Session restarted: ${newSession}. Re-send your last task.`)
+                results.push(`Agent was non-responsive (${emptyCount} empty responses). Session restarted (attempt ${cycleRestartCount}/${MAX_RESTARTS_PER_CYCLE}): ${newSession}. Re-send your last task.`)
                 logPerformance({
                   timestamp: Date.now(), projectName: directory, agentName, model,
                   event: "restart", cycleNumber: cycleCount, details: "empty-response escalation",
                 })
-                await addBehavioralNote(memory, agentName, `Agent went non-responsive with empty outputs. Had to restart session. Consider simpler, single-action prompts.`)
+                await addBehavioralNote(memory, agentName, `Agent non-responsive (${emptyCount} empty responses in cycle ${cycleCount}). Restarted session. Use short, single-action prompts. Avoid multi-step instructions.`)
               } catch (err) {
                 results.push(`Agent non-responsive and restart failed: ${err}`)
               }
@@ -650,21 +700,49 @@ Be specific with file paths, line numbers, and code snippets.`
     if (stopped || config.signal?.aborted) break
 
     // Dynamic cycle pause — adjust based on agent activity
-    if (consecutiveEmptyResponses > 0) {
-      // Agent struggling — back off to give it more time
+    if (consecutiveEmptyResponses > 0 || cycleRestartCount > 0) {
+      // Agent struggling — exponential backoff
       consecutiveIdleCycles++
-      cyclePause = Math.min(baseCyclePause * Math.min(consecutiveIdleCycles + 1, 4), 120_000)
+      const backoffMultiplier = Math.min(consecutiveIdleCycles, 6)
+      cyclePause = Math.min(baseCyclePause * backoffMultiplier, 300_000) // cap at 5 minutes
       emit(`Agent responsiveness low — next cycle pause: ${Math.round(cyclePause / 1000)}s`)
-    } else {
-      // Agent productive — use shorter pause to keep momentum
+    } else if (cycleHadProgress) {
+      // Agent productive — reset backoff
       consecutiveIdleCycles = 0
       cyclePause = baseCyclePause
+    }
+
+    // Circuit breaker — if too many consecutive failed cycles, pause supervision
+    if (restartCapHit) {
+      consecutiveFailedCycles++
+      if (consecutiveFailedCycles >= MAX_CONSECUTIVE_FAILED_CYCLES) {
+        emit(`CIRCUIT BREAKER: ${agentName} has hit restart caps ${consecutiveFailedCycles} cycles in a row — pausing supervision`)
+        config.dashboardLog?.push({
+          type: "supervisor-alert",
+          agent: agentName,
+          text: `CIRCUIT BREAKER: Supervisor paused after ${consecutiveFailedCycles} consecutive failed cycles. Agent ${agentName} is persistently non-responsive. Consider adjusting directive or restarting the project.`,
+        })
+        logPerformance({
+          timestamp: Date.now(), projectName: directory, agentName, model,
+          event: "supervisor_stop", cycleNumber: cycleCount,
+          summary: `Circuit breaker: ${consecutiveFailedCycles} consecutive failed cycles, agent persistently non-responsive`,
+          details: "circuit-breaker",
+        })
+        loggedStop = true
+        await addBehavioralNote(memory, agentName, `CRITICAL: Agent was persistently non-responsive across ${consecutiveFailedCycles} cycles. Circuit breaker triggered. This agent needs fundamentally different prompts — keep to one simple action, or consider restructuring the directive.`)
+        // Stop this supervisor — the project manager can restart it or the user can intervene
+        config.onSupervisorStop?.(agentName, `Circuit breaker triggered after ${consecutiveFailedCycles} consecutive failed cycles — agent is persistently non-responsive`, true)
+        break
+      }
+    } else if (cycleRestartCount === 0) {
+      // Reset failed cycle counter if the cycle had no restarts at all
+      consecutiveFailedCycles = 0
     }
 
     // Check soft stop
     if (config.softStop?.requested) {
       emit(`Soft stop — ${agentName} supervisor finishing after cycle ${cycleCount}.`)
-      await addMemoryEntry(loadBrainMemory(), {
+      await addMemoryEntry(await loadBrainMemory(), {
         timestamp: Date.now(),
         objective: `${agentName} supervisor: ${directive}`,
         summary: `Soft-stopped after cycle ${cycleCount}.`,
@@ -695,6 +773,14 @@ Be specific with file paths, line numbers, and code snippets.`
 
   emit(`${agentName} supervisor ended after ${cycleCount} cycles.`)
   emitStatus("done")
+  if (!loggedStop) {
+    logPerformance({
+      timestamp: Date.now(), projectName: directory, agentName, model,
+      event: "supervisor_stop", cycleNumber: cycleCount,
+      summary: `Supervisor ended after ${cycleCount} cycles`,
+      details: consecutiveFailedCycles > 0 ? "completed-with-failures" : "normal",
+    })
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -728,6 +814,7 @@ export async function runParallelSupervisors(
       maxRoundsPerCycle: config.maxRoundsPerCycle,
       reviewEnabled: config.reviewEnabled ?? true,
       reviewerAgent,
+      limits: config.supervisorLimits,
       onThinking: (thought) => config.onThinking?.(agentName, thought),
       dashboardLog: config.dashboardLog,
       signal: config.signal,

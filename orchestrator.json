@@ -2,17 +2,27 @@
   "autoApprove": false,
   "pollInterval": 2000,
   "dashboardPort": 4000,
+  "mode": "projects",
   "brain": {
     "model": "glm-5.1:cloud",
     "ollamaUrl": "http://127.0.0.1:11434"
   },
   "supervisor": {
     "cyclePauseSeconds": 30,
-    "maxRoundsPerCycle": 30,
+    "maxRoundsPerCycle": 12,
     "maxRestartsPerCycle": 3,
     "maxConsecutiveFailedCycles": 3,
-    "maxConversationMessages": 60,
+    "maxConversationMessages": 40,
     "stuckThresholdMs": 300000
   },
-  "agents": []
+  "scheduling": "sequential",
+  "concurrency": 2,
+  "cyclesPerRotation": 2,
+  "agents": [],
+  "team": {
+    "goal": "",
+    "members": [],
+    "managerIntervalSeconds": 120,
+    "managerMaxRounds": 8
+  }
 }

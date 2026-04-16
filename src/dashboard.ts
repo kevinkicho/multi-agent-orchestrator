@@ -5,6 +5,9 @@ import type { AgentState } from "./agent"
 import { agentListPermissions, agentReplyPermission } from "./agent"
 import type { ProjectManager } from "./project-manager"
 import { listDirectories } from "./project-manager"
+import type { TeamManager } from "./team-manager"
+import { loadBrainMemory, addBehavioralNote, addProjectNote, listArchives, loadAgentArchive, restoreAgentMemory } from "./brain-memory"
+import { detectCrash, formatCrashReport } from "./session-state"
 
 /** Decode and sanitize a URL path segment — strips path traversal and control characters */
 function sanitizeParam(raw: string): string {
@@ -22,23 +25,48 @@ export type DashboardEvent =
   | { type: "permission-resolved"; agent: string; requestID: string; decision: string }
   | { type: "cycle-summary"; cycle: number; agent: string; summary: string }
   | { type: "supervisor-thinking"; agent: string; text: string }
-  | { type: "supervisor-status"; agent: string; status: "running" | "idle" | "done" | "reviewing" }
+  | { type: "supervisor-status"; agent: string; status: "running" | "idle" | "done" | "reviewing" | "paused" }
   | { type: "supervisor-alert"; agent: string; text: string }
 
-/** Shared event log that the dashboard reads from */
+/** Shared event log that the dashboard reads from.
+ *  Cursors are absolute indices (baseOffset + position in the current array).
+ *  When the array is trimmed, baseOffset advances so existing cursors remain valid. */
 export class DashboardLog {
   private listeners = new Set<(event: DashboardEvent) => void>()
   private history: DashboardEvent[] = []
   private maxHistory = 500
+  /** Absolute index of history[0]. Advances when old events are trimmed. */
+  private baseOffset = 0
 
   push(event: DashboardEvent) {
     this.history.push(event)
     if (this.history.length > this.maxHistory) {
-      this.history = this.history.slice(-this.maxHistory)
+      const trimCount = this.history.length - this.maxHistory
+      this.history = this.history.slice(trimCount)
+      this.baseOffset += trimCount
     }
     for (const listener of this.listeners) {
       listener(event)
     }
+  }
+
+  /** Returns the absolute cursor pointing past the last event */
+  getCursor(): number {
+    return this.baseOffset + this.history.length
+  }
+
+  /** Get events starting from an absolute cursor. Returns events + new cursor. */
+  getEventsSince(since: number): { events: DashboardEvent[]; cursor: number } {
+    const relativeIdx = since - this.baseOffset
+    if (relativeIdx < 0) {
+      // Client is so far behind that some events were trimmed — send everything we have
+      return { events: [...this.history], cursor: this.getCursor() }
+    }
+    if (relativeIdx >= this.history.length) {
+      // Client is up to date
+      return { events: [], cursor: this.getCursor() }
+    }
+    return { events: this.history.slice(relativeIdx), cursor: this.getCursor() }
   }
 
   getHistory(): DashboardEvent[] {
@@ -59,6 +87,10 @@ export async function startDashboard(
     onSoftStop?: () => void;
     onCommand?: (command: string) => Promise<{ ok: boolean; output?: string; error?: string }>;
     projectManager?: ProjectManager;
+    getTeamManager?: () => TeamManager | null;
+    eventBus?: import("./event-bus").EventBus;
+    resourceManager?: import("./resource-manager").ResourceManager;
+    tokenTracker?: import("./token-tracker").TokenTracker;
   },
 ): Promise<{ stop: () => void }> {
   // Generate a session token for API authentication.
@@ -114,15 +146,14 @@ export async function startDashboard(
 
       // SSE endpoint — long-poll style to avoid Bun chunked encoding issues
       if (url.pathname === "/api/events") {
-        // Get cursor from query param (index into history)
+        // Get cursor from query param (absolute index, survives history trimming)
         const since = parseInt(url.searchParams.get("since") ?? "0", 10)
-        const history = log.getHistory()
+        const { events: missed, cursor: newCursor } = log.getEventsSince(since)
 
         // If client is behind, send all missed events immediately
-        if (since < history.length) {
-          const missed = history.slice(since)
+        if (missed.length > 0) {
           return Response.json(
-            { events: missed, cursor: history.length },
+            { events: missed, cursor: newCursor },
             { headers: corsHeaders },
           )
         }
@@ -153,9 +184,51 @@ export async function startDashboard(
         })
 
         return Response.json(
-          { events, cursor: log.getHistory().length },
+          { events, cursor: log.getCursor() },
           { headers: corsHeaders },
         )
+      }
+
+      // SSE stream from EventBus — real-time cross-agent events
+      if (url.pathname === "/api/events/stream" && opts?.eventBus) {
+        const bus = opts.eventBus
+        const typeFilter = url.searchParams.get("type") || undefined
+
+        const stream = new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder()
+            const send = (data: string) => {
+              try { controller.enqueue(encoder.encode(`data: ${data}\n\n`)) } catch { /* client disconnected */ }
+            }
+
+            // Send recent events as initial batch
+            const recent = bus.getRecent(typeFilter ? { type: typeFilter } : undefined, 20)
+            for (const evt of recent) {
+              send(JSON.stringify(evt))
+            }
+
+            // Subscribe to new events
+            const unsub = bus.onAny((evt) => {
+              if (typeFilter && evt.type !== typeFilter) return
+              send(JSON.stringify(evt))
+            })
+
+            // Clean up on disconnect
+            req.signal.addEventListener("abort", () => {
+              unsub()
+              try { controller.close() } catch {}
+            })
+          },
+        })
+
+        return new Response(stream, {
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+          },
+        })
       }
 
       // Status endpoint
@@ -244,6 +317,12 @@ export async function startDashboard(
           }
           log.push({ type: "agent-prompt", agent: agentName, text: body.text })
           await orchestrator.prompt(agentName, body.text)
+          // Record in prompt ledger
+          const { recordPrompt: recordP } = await import("./prompt-ledger")
+          recordP({
+            source: "user", target: agentName, direction: "outbound",
+            agentName, content: body.text,
+          }).catch(() => {})
           return Response.json({ ok: true }, { headers: corsHeaders })
         } catch (err) {
           return Response.json({ error: String(err) }, { status: 500, headers: corsHeaders })
@@ -392,7 +471,7 @@ export async function startDashboard(
         }
       }
 
-      // Fetch available Ollama models (proxy to Ollama API)
+      // Fetch available Ollama models (legacy endpoint — still works for backward compat)
       if (url.pathname === "/api/ollama-models") {
         const pm = opts?.projectManager
         const ollamaUrl = pm?.getOllamaUrl() ?? "http://127.0.0.1:11434"
@@ -412,6 +491,76 @@ export async function startDashboard(
         } catch {
           return Response.json({ models: [] }, { headers: corsHeaders })
         }
+      }
+
+      // ---- Provider management endpoints ----
+      if (url.pathname === "/api/providers" && req.method === "GET") {
+        const { loadProviders } = await import("./providers")
+        const providers = await loadProviders()
+        // Mask API keys in response (show only last 4 chars)
+        const masked = providers.map(p => ({
+          ...p,
+          apiKey: p.apiKey ? "***" + p.apiKey.slice(-4) : "",
+          hasKey: !!(p.apiKey || (p.apiKeyEnv && process.env[p.apiKeyEnv])),
+        }))
+        return Response.json({ providers: masked }, { headers: corsHeaders })
+      }
+
+      if (url.pathname === "/api/providers" && req.method === "POST") {
+        const { addOrUpdateProvider } = await import("./providers")
+        const body = await req.json() as { id: string; name: string; baseUrl: string; type: string; apiKey?: string; apiKeyEnv?: string; models?: string[]; enabled?: boolean; defaultTemperature?: number; defaultMaxTokens?: number }
+        await addOrUpdateProvider({
+          id: body.id,
+          name: body.name,
+          baseUrl: body.baseUrl,
+          type: (body.type as "openai-compatible" | "anthropic") || "openai-compatible",
+          apiKey: body.apiKey ?? "",
+          apiKeyEnv: body.apiKeyEnv,
+          models: body.models ?? [],
+          enabled: body.enabled ?? true,
+          defaultTemperature: body.defaultTemperature,
+          defaultMaxTokens: body.defaultMaxTokens,
+        })
+        return Response.json({ ok: true }, { headers: corsHeaders })
+      }
+
+      if (url.pathname.match(/^\/api\/providers\/[^/]+\/enable$/) && req.method === "POST") {
+        const { enableProvider } = await import("./providers")
+        const providerId = sanitizeParam(url.pathname.split("/")[3]!)
+        const body = await req.json() as { enabled: boolean }
+        const ok = await enableProvider(providerId, body.enabled)
+        return Response.json({ ok }, { headers: corsHeaders })
+      }
+
+      if (url.pathname.match(/^\/api\/providers\/[^/]+\/apikey$/) && req.method === "POST") {
+        const { setProviderApiKey } = await import("./providers")
+        const providerId = sanitizeParam(url.pathname.split("/")[3]!)
+        const body = await req.json() as { apiKey: string }
+        const ok = await setProviderApiKey(providerId, body.apiKey)
+        return Response.json({ ok }, { headers: corsHeaders })
+      }
+
+      if (url.pathname.match(/^\/api\/providers\/[^/]+\/models$/) && req.method === "POST") {
+        const { addModelToProvider } = await import("./providers")
+        const providerId = sanitizeParam(url.pathname.split("/")[3]!)
+        const body = await req.json() as { model: string }
+        const ok = await addModelToProvider(providerId, body.model)
+        return Response.json({ ok }, { headers: corsHeaders })
+      }
+
+      if (url.pathname.match(/^\/api\/providers\/[^/]+\/models$/) && req.method === "DELETE") {
+        const { removeModelFromProvider } = await import("./providers")
+        const providerId = sanitizeParam(url.pathname.split("/")[3]!)
+        const body = await req.json() as { model: string }
+        const ok = await removeModelFromProvider(providerId, body.model)
+        return Response.json({ ok }, { headers: corsHeaders })
+      }
+
+      // List all models across all enabled providers
+      if (url.pathname === "/api/models" && req.method === "GET") {
+        const { listAllModels } = await import("./providers")
+        const models = await listAllModels()
+        return Response.json({ models }, { headers: corsHeaders })
       }
 
       // Performance log endpoint
@@ -453,6 +602,439 @@ export async function startDashboard(
         return Response.json(saved, { headers: corsHeaders })
       }
 
+      // --- Memory archive endpoints ---
+
+      if (url.pathname === "/api/archives" && req.method === "GET") {
+        const archives = await listArchives()
+        return Response.json(archives, { headers: corsHeaders })
+      }
+
+      if (url.pathname.match(/^\/api\/archives\/[^/]+$/) && req.method === "GET") {
+        const agentName = sanitizeParam(url.pathname.split("/").pop()!)
+        const archive = await loadAgentArchive(agentName)
+        if (!archive) return new Response("Not Found", { status: 404, headers: corsHeaders })
+        return Response.json(archive, { headers: corsHeaders })
+      }
+
+      if (url.pathname.match(/^\/api\/archives\/[^/]+\/restore$/) && req.method === "POST") {
+        const agentName = sanitizeParam(url.pathname.split("/")[3]!)
+        const restored = await restoreAgentMemory(agentName)
+        if (!restored) return Response.json({ ok: false, error: "No archive found" }, { status: 404, headers: corsHeaders })
+        return Response.json({ ok: true }, { headers: corsHeaders })
+      }
+
+      // --- Team management endpoints ---
+
+      // List team members
+      if (url.pathname === "/api/team/members" && req.method === "GET") {
+        const tm = opts?.getTeamManager?.()
+        if (!tm) return Response.json({ members: [], active: false }, { headers: corsHeaders })
+        return Response.json({ members: tm.listMembers(), active: true }, { headers: corsHeaders })
+      }
+
+      // Get pending hire requests
+      if (url.pathname === "/api/team/hire-requests" && req.method === "GET") {
+        const tm = opts?.getTeamManager?.()
+        if (!tm) return Response.json([], { headers: corsHeaders })
+        return Response.json(tm.getHireRequests(), { headers: corsHeaders })
+      }
+
+      // Approve a hire request
+      if (url.pathname === "/api/team/hire-requests" && req.method === "POST") {
+        const tm = opts?.getTeamManager?.()
+        if (!tm) return Response.json({ error: "No team running" }, { status: 400, headers: corsHeaders })
+        try {
+          const body = await req.json() as { index: number; agentName: string }
+          const reqs = tm.getHireRequests()
+          if (body.index < 0 || body.index >= reqs.length) {
+            return Response.json({ error: "Invalid index" }, { status: 400, headers: corsHeaders })
+          }
+          const hire = reqs[body.index]!
+          tm.addMember({ role: hire.role, agentName: body.agentName, directory: hire.directory, directive: `Work on ${hire.role} tasks for the team goal.` })
+          tm.removeHireRequest(body.index)
+          return Response.json({ ok: true }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // Get pending dissolve requests
+      if (url.pathname === "/api/team/dissolve-requests" && req.method === "GET") {
+        const tm = opts?.getTeamManager?.()
+        if (!tm) return Response.json([], { headers: corsHeaders })
+        return Response.json(tm.getDissolveRequests(), { headers: corsHeaders })
+      }
+
+      // Approve a dissolve request
+      if (url.pathname === "/api/team/dissolve-requests" && req.method === "POST") {
+        const tm = opts?.getTeamManager?.()
+        if (!tm) return Response.json({ error: "No team running" }, { status: 400, headers: corsHeaders })
+        try {
+          const body = await req.json() as { agentName: string }
+          tm.removeMember(body.agentName)
+          tm.removeDissolveRequest(body.agentName)
+          return Response.json({ ok: true }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // Crash recovery info — returns details about previous crashed session
+      if (url.pathname === "/api/crash-info" && req.method === "GET") {
+        try {
+          const { crashed, state } = await detectCrash()
+          return Response.json({ crashed, state }, { headers: corsHeaders })
+        } catch {
+          return Response.json({ crashed: false, state: null }, { headers: corsHeaders })
+        }
+      }
+
+      // User annotation feedback — saves to brain memory
+      if (url.pathname === "/api/feedback" && req.method === "POST") {
+        try {
+          const body = await req.json() as {
+            selectedText: string
+            note: string
+            panel: string   // "worker" | "supervisor" | "brain"
+            agent: string
+            feedbackType: string // "behavioral" | "project"
+          }
+          if (!body.note?.trim()) {
+            return Response.json({ error: "Note is required" }, { status: 400, headers: corsHeaders })
+          }
+          const agentName = body.agent === "_brain" ? "_global" : body.agent
+          const contextLabel = `[${body.panel}]`
+          const fullNote = `User feedback ${contextLabel}: "${body.note.trim()}" (re: "${body.selectedText?.slice(0, 150) ?? ""}")`
+
+          const store = await loadBrainMemory()
+          if (body.feedbackType === "project") {
+            await addProjectNote(store, agentName, fullNote)
+          } else {
+            await addBehavioralNote(store, agentName, fullNote)
+          }
+          // Record in prompt ledger
+          const { recordPrompt: recordP } = await import("./prompt-ledger")
+          recordP({
+            source: "user", target: agentName === "_global" ? "brain" : agentName,
+            direction: "outbound", agentName: agentName === "_global" ? undefined : agentName,
+            content: fullNote, tags: ["feedback", body.feedbackType],
+          }).catch(() => {})
+          return Response.json({ ok: true }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // --- Analytics endpoints ---
+
+      // List analytics sessions (optional ?agent= filter)
+      if (url.pathname === "/api/analytics/sessions" && req.method === "GET") {
+        try {
+          const { loadAnalytics } = await import("./analytics")
+          const store = await loadAnalytics()
+          const agentFilter = url.searchParams.get("agent")
+          const sessions = agentFilter
+            ? store.sessions.filter(s => s.agentName === agentFilter)
+            : store.sessions
+          return Response.json(sessions.slice().reverse(), { headers: corsHeaders })
+        } catch {
+          return Response.json([], { headers: corsHeaders })
+        }
+      }
+
+      // Single session detail
+      if (url.pathname.match(/^\/api\/analytics\/sessions\/[^/]+$/) && req.method === "GET") {
+        try {
+          const { loadAnalytics } = await import("./analytics")
+          const sessionId = sanitizeParam(url.pathname.split("/").pop() ?? "")
+          const store = await loadAnalytics()
+          const session = store.sessions.find(s => s.id === sessionId)
+          if (!session) return Response.json({ error: "Session not found" }, { status: 404, headers: corsHeaders })
+          const snapshots = store.snapshots.filter(s => s.agentName === session.agentName && s.timestamp >= session.startedAt && (!session.endedAt || s.timestamp <= session.endedAt))
+          return Response.json({ session, snapshots }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // Trigger AI evaluation for a session
+      if (url.pathname.match(/^\/api\/analytics\/evaluate\/[^/]+$/) && req.method === "POST") {
+        try {
+          const { evaluateSession } = await import("./analytics")
+          const sessionId = sanitizeParam(url.pathname.split("/").pop() ?? "")
+          const body = await req.json() as { ollamaUrl?: string; model?: string }
+          const pm = opts?.projectManager
+          const ollamaUrl = body.ollamaUrl || pm?.getOllamaUrl() || "http://127.0.0.1:11434"
+          const model = body.model || "llama3.2"
+          const evaluation = await evaluateSession(sessionId, ollamaUrl, model)
+          if (!evaluation) return Response.json({ error: "Evaluation failed" }, { status: 500, headers: corsHeaders })
+          return Response.json(evaluation, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // A/B comparison between two sessions
+      if (url.pathname === "/api/analytics/compare" && req.method === "POST") {
+        try {
+          const { compareSessions } = await import("./analytics")
+          const body = await req.json() as { sessionA: string; sessionB: string; ollamaUrl?: string; model?: string }
+          if (!body.sessionA || !body.sessionB) return Response.json({ error: "sessionA and sessionB required" }, { status: 400, headers: corsHeaders })
+          const pm = opts?.projectManager
+          const ollamaUrl = body.ollamaUrl || pm?.getOllamaUrl() || "http://127.0.0.1:11434"
+          const model = body.model || "llama3.2"
+          const comparison = await compareSessions(body.sessionA, body.sessionB, ollamaUrl, model)
+          if (!comparison) return Response.json({ error: "Comparison failed" }, { status: 500, headers: corsHeaders })
+          return Response.json(comparison, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // List comparisons
+      if (url.pathname === "/api/analytics/comparisons" && req.method === "GET") {
+        try {
+          const { loadAnalytics } = await import("./analytics")
+          const store = await loadAnalytics()
+          return Response.json(store.comparisons.slice().reverse(), { headers: corsHeaders })
+        } catch {
+          return Response.json([], { headers: corsHeaders })
+        }
+      }
+
+      // Timeline data for charts
+      if (url.pathname === "/api/analytics/timeline" && req.method === "GET") {
+        try {
+          const { getTimelineData } = await import("./analytics")
+          return Response.json(await getTimelineData(), { headers: corsHeaders })
+        } catch {
+          return Response.json([], { headers: corsHeaders })
+        }
+      }
+
+      // ---- Pause / Resume endpoints ----
+
+      if (url.pathname.match(/^\/api\/projects\/[^/]+\/pause$/) && req.method === "POST") {
+        const projectId = sanitizeParam(url.pathname.split("/")[3]!)
+        if (!opts?.projectManager?.getProject(projectId)) {
+          return Response.json({ ok: false, error: "Project not found" }, { status: 404, headers: corsHeaders })
+        }
+        try {
+          opts.projectManager.pauseProject(projectId)
+          return Response.json({ ok: true }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ ok: false, error: String(err) }, { status: 400, headers: corsHeaders })
+        }
+      }
+
+      if (url.pathname.match(/^\/api\/projects\/[^/]+\/resume$/) && req.method === "POST") {
+        const projectId = sanitizeParam(url.pathname.split("/")[3]!)
+        if (!opts?.projectManager?.getProject(projectId)) {
+          return Response.json({ ok: false, error: "Project not found" }, { status: 404, headers: corsHeaders })
+        }
+        try {
+          opts.projectManager.resumeProject(projectId)
+          return Response.json({ ok: true }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ ok: false, error: String(err) }, { status: 400, headers: corsHeaders })
+        }
+      }
+
+      if (url.pathname === "/api/pause-all" && req.method === "POST") {
+        opts?.projectManager?.pauseAll()
+        return Response.json({ ok: true }, { headers: corsHeaders })
+      }
+
+      if (url.pathname === "/api/resume-all" && req.method === "POST") {
+        opts?.projectManager?.resumeAll()
+        return Response.json({ ok: true }, { headers: corsHeaders })
+      }
+
+      // ---- Prompt Ledger endpoints ----
+
+      if (url.pathname === "/api/ledger" && req.method === "GET") {
+        try {
+          const { loadLedger, queryLedger } = await import("./prompt-ledger")
+          const store = await loadLedger()
+          const query: import("./prompt-ledger").LedgerQuery = {}
+          if (url.searchParams.get("source")) query.source = url.searchParams.get("source")!
+          if (url.searchParams.get("agentName")) query.agentName = url.searchParams.get("agentName")!
+          if (url.searchParams.get("since")) query.since = Number(url.searchParams.get("since"))
+          if (url.searchParams.get("until")) query.until = Number(url.searchParams.get("until"))
+          if (url.searchParams.get("search")) query.search = url.searchParams.get("search")!
+          if (url.searchParams.get("tags")) query.tags = url.searchParams.get("tags")!.split(",")
+          if (url.searchParams.get("limit")) query.limit = Number(url.searchParams.get("limit"))
+          if (url.searchParams.get("offset")) query.offset = Number(url.searchParams.get("offset"))
+          return Response.json(queryLedger(store, query), { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ entries: [], total: 0, error: String(err) }, { headers: corsHeaders })
+        }
+      }
+
+      if (url.pathname === "/api/ledger/stats" && req.method === "GET") {
+        try {
+          const { loadLedger, getLedgerStats } = await import("./prompt-ledger")
+          const store = await loadLedger()
+          return Response.json(getLedgerStats(store), { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ bySource: {}, byAgent: {}, byHour: {}, error: String(err) }, { headers: corsHeaders })
+        }
+      }
+
+      // ---- A/B Test endpoints ----
+
+      if (url.pathname.match(/^\/api\/projects\/[^/]+\/ab-test$/) && req.method === "POST") {
+        const projectId = sanitizeParam(url.pathname.split("/")[3]!)
+        try {
+          const body = await req.json() as {
+            variants: [{ model: string; directive: string; maxCycles: number }, { model: string; directive: string; maxCycles: number }]
+            evalModel?: string
+          }
+          const project = opts?.projectManager?.getProject(projectId)
+          if (!project) {
+            return Response.json({ ok: false, error: "Project not found" }, { status: 404, headers: corsHeaders })
+          }
+          const pm = opts?.projectManager
+          if (!pm) {
+            return Response.json({ ok: false, error: "No project manager" }, { status: 500, headers: corsHeaders })
+          }
+          const { runABTest } = await import("./analytics")
+          const config: import("./analytics").ABTestConfig = {
+            projectId,
+            agentName: project.agentName,
+            projectDirectory: (project as any).directory,
+            variants: [
+              { label: "A", ...body.variants[0] },
+              { label: "B", ...body.variants[1] },
+            ],
+            ollamaUrl: pm.getOllamaUrl(),
+            evalModel: body.evalModel ?? (project as any).model ?? "llama3",
+          }
+          // Run in background — don't block the HTTP response
+          const resultPromise = runABTest(config, pm, (status, result) => {
+            log.push({ type: "brain-thinking", text: `[A/B Test ${result.id}] ${status}` })
+          })
+          resultPromise.catch(() => {})
+          return Response.json({ ok: true, message: "A/B test started" }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ ok: false, error: String(err) }, { status: 400, headers: corsHeaders })
+        }
+      }
+
+      if (url.pathname.match(/^\/api\/projects\/[^/]+\/ab-test$/) && req.method === "GET") {
+        try {
+          const { loadAnalytics } = await import("./analytics")
+          const store = await loadAnalytics()
+          const projectId = sanitizeParam(url.pathname.split("/")[3]!)
+          const tests = (store.abTests ?? []).filter(t => t.config.projectId === projectId)
+          return Response.json(tests, { headers: corsHeaders })
+        } catch {
+          return Response.json([], { headers: corsHeaders })
+        }
+      }
+
+      if (url.pathname === "/api/ab-tests" && req.method === "GET") {
+        try {
+          const { loadAnalytics } = await import("./analytics")
+          const store = await loadAnalytics()
+          return Response.json(store.abTests ?? [], { headers: corsHeaders })
+        } catch {
+          return Response.json([], { headers: corsHeaders })
+        }
+      }
+
+      // ---- Event Bus endpoints ----
+      if (url.pathname === "/api/events/bus/recent" && req.method === "GET") {
+        if (!opts?.eventBus) return Response.json([], { headers: corsHeaders })
+        const limit = parseInt(url.searchParams.get("limit") ?? "50", 10)
+        const type = url.searchParams.get("type") || undefined
+        const events = opts.eventBus.getRecent(type ? { type } : undefined, limit)
+        return Response.json(events, { headers: corsHeaders })
+      }
+
+      // ---- Resource Manager endpoints ----
+      if (url.pathname === "/api/resources/locks" && req.method === "GET") {
+        if (!opts?.resourceManager) return Response.json({ locks: {}, llmQueueDepth: 0 }, { headers: corsHeaders })
+        const locks: Record<string, { agentName: string; files: string[]; acquiredAt: number }> = {}
+        for (const [agent, lock] of opts.resourceManager.getActiveLocks()) {
+          locks[agent] = lock
+        }
+        return Response.json({
+          locks,
+          llmQueueDepth: opts.resourceManager.getLlmQueueDepth(),
+          llmActive: opts.resourceManager.getLlmActiveCount(),
+          llmMax: opts.resourceManager.getLlmMaxConcurrency(),
+        }, { headers: corsHeaders })
+      }
+
+      if (url.pathname === "/api/resources/intents" && req.method === "GET") {
+        if (!opts?.resourceManager) return Response.json({ intents: {} }, { headers: corsHeaders })
+        const intents: Record<string, { description: string; files: string[]; declaredAt: number }> = {}
+        for (const [agent, intent] of opts.resourceManager.getAllIntents()) {
+          intents[agent] = { description: intent.description, files: intent.files, declaredAt: intent.declaredAt }
+        }
+        return Response.json({ intents }, { headers: corsHeaders })
+      }
+
+      // ---- Branch endpoints ----
+      if (req.method === "GET" && url.pathname.match(/^\/api\/projects\/[^/]+\/branch$/)) {
+        const projectId = sanitizeParam(url.pathname.split("/")[3]!)
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Not available" }, { status: 500, headers: corsHeaders })
+        return Response.json({ branch: pm.getAgentBranch(projectId) }, { headers: corsHeaders })
+      }
+
+      if (req.method === "POST" && url.pathname.match(/^\/api\/projects\/[^/]+\/merge$/)) {
+        const projectId = sanitizeParam(url.pathname.split("/")[3]!)
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Not available" }, { status: 500, headers: corsHeaders })
+        const project = pm.getProject(projectId)
+        if (!project) return Response.json({ error: "Unknown project" }, { status: 404, headers: corsHeaders })
+        try {
+          const body = (await req.json()) as { targetBranch?: string }
+          const result = await pm.mergeAgentBranch(projectId, body.targetBranch)
+          return Response.json(result, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 400, headers: corsHeaders })
+        }
+      }
+
+      // ---- Validation config endpoint ----
+      if (req.method === "POST" && url.pathname.match(/^\/api\/projects\/[^/]+\/validation$/)) {
+        const projectId = sanitizeParam(url.pathname.split("/")[3]!)
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Not available" }, { status: 500, headers: corsHeaders })
+        const project = pm.getProject(projectId)
+        if (!project) return Response.json({ error: "Unknown project" }, { status: 404, headers: corsHeaders })
+        try {
+          const body = (await req.json()) as { command?: string; preset?: string; timeoutMs?: number; failAction?: string }
+          pm.setValidationConfig(projectId, {
+            command: body.command,
+            preset: body.preset as any,
+            timeoutMs: body.timeoutMs,
+            failAction: (body.failAction as "warn" | "inject" | "pause") ?? "inject",
+          })
+          return Response.json({ ok: true }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 400, headers: corsHeaders })
+        }
+      }
+
+      // ---- Token tracking endpoints ----
+      if (url.pathname === "/api/tokens" && req.method === "GET") {
+        if (!opts?.tokenTracker) return Response.json({ total: 0, agents: {} }, { headers: corsHeaders })
+        const tracker = opts.tokenTracker
+        const agents: Record<string, unknown> = {}
+        for (const [agent, stats] of tracker.getAllStats()) {
+          agents[agent] = stats
+        }
+        return Response.json({
+          total: tracker.getTotalTokens(),
+          agents,
+          recent: tracker.getRecent(20),
+        }, { headers: corsHeaders })
+      }
+
       // Soft stop endpoint
       if (url.pathname === "/api/soft-stop" && req.method === "POST") {
         if (opts?.onSoftStop) {
@@ -466,6 +1048,19 @@ export async function startDashboard(
       if (url.pathname === "/" || url.pathname === "/index.html") {
         return new Response(injectedHtml, {
           headers: { ...corsHeaders, "Content-Type": "text/html; charset=utf-8" },
+        })
+      }
+
+      // Static assets — CSS and JS served from pre-loaded cache
+      if (url.pathname === "/dashboard-client.css") {
+        return new Response(DASHBOARD_CSS, {
+          headers: { ...corsHeaders, "Content-Type": "text/css; charset=utf-8", "Cache-Control": "no-cache" },
+        })
+      }
+
+      if (url.pathname === "/dashboard-client.js") {
+        return new Response(DASHBOARD_JS, {
+          headers: { ...corsHeaders, "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-cache" },
         })
       }
 
@@ -504,5 +1099,7 @@ function checkPortAvailable(port: number): void {
   }
 }
 
-/** Load dashboard HTML from file once at startup */
+/** Load dashboard assets from files once at startup */
 const DASHBOARD_HTML = readFileSync(resolve(import.meta.dirname, "dashboard.html"), "utf-8")
+const DASHBOARD_CSS = readFileSync(resolve(import.meta.dirname, "dashboard-client.css"), "utf-8")
+const DASHBOARD_JS = readFileSync(resolve(import.meta.dirname, "dashboard-client.js"), "utf-8")

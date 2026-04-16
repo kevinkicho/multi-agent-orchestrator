@@ -3,8 +3,14 @@ import { existsSync, readdirSync, statSync } from "fs"
 import { resolve, basename } from "path"
 import type { Orchestrator } from "./orchestrator"
 import type { DashboardLog } from "./dashboard"
-import { runAgentSupervisor } from "./supervisor"
+import { runAgentSupervisor, type ValidationPreset } from "./supervisor"
 import { readJsonFile, writeJsonFile } from "./file-utils"
+import { formatThought, C } from "./tui-format"
+import { createPauseState, requestPause, requestResume, type PauseState } from "./pause-service"
+import { gitExec, gitCurrentBranch, gitCreateBranch, gitCheckout, gitMerge, gitDeleteBranch, gitForceDeleteBranch } from "./git-utils"
+import type { EventBus } from "./event-bus"
+import type { ResourceManager } from "./resource-manager"
+import { archiveAgentMemory, hasAgentArchive, restoreAgentMemory } from "./brain-memory"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -36,6 +42,13 @@ export type ProjectState = {
   status: "starting" | "running" | "supervising" | "stopped" | "error"
   addedAt: number
   error?: string
+  pauseStatus?: "none" | "requested" | "paused"
+  pauseRequestedAt?: number
+  pausedAt?: number
+  /** Git branch this agent works on (for branch isolation) */
+  agentBranch?: string
+  /** Post-cycle validation config */
+  postCycleValidation?: { command?: string; preset?: ValidationPreset; timeoutMs?: number; failAction?: "warn" | "inject" | "pause" }
 }
 
 type SavedProjects = {
@@ -141,6 +154,11 @@ export class ProjectManager {
   private processes = new Map<string, Subprocess>()
   private supervisorAborts = new Map<string, AbortController>()
   private softStops = new Map<string, { requested: boolean }>()
+  /** Pending auto-restart timers — tracked so they can be cancelled on remove/restart */
+  private autoRestartTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private pauseStates = new Map<string, PauseState>()
+  /** Cycle limit callbacks — auto-pause after N cycles (used by A/B test) */
+  private cycleLimitCallbacks = new Map<string, { maxCycles: number; count: number }>()
   private addLock: Promise<void> = Promise.resolve()
   private idCounter = 0
 
@@ -149,6 +167,8 @@ export class ProjectManager {
     private dashLog: DashboardLog,
     private brainConfig: { model: string; ollamaUrl: string },
     private supervisorLimits?: import("./supervisor").SupervisorLimits,
+    private eventBus?: EventBus,
+    private resourceManager?: ResourceManager,
   ) {}
 
   /** Add a project: spawns a worker agent and starts its supervisor.
@@ -256,6 +276,39 @@ export class ProjectManager {
       })
 
       project.status = "running"
+
+      // Create agent-specific git branch for isolation
+      try {
+        const currentBranch = await gitCurrentBranch(resolvedDir)
+        const branchName = `agent/${agentName}`
+        // Delete stale branch if it already exists (from a previous run that wasn't cleaned up)
+        const existingBranches = await gitExec(resolvedDir, "branch", "--list", branchName).catch(() => "")
+        if (existingBranches.trim()) {
+          await gitForceDeleteBranch(resolvedDir, branchName).catch(() => {})
+        }
+        await gitCreateBranch(resolvedDir, branchName, currentBranch)
+        project.agentBranch = branchName
+        this.dashLog.push({ type: "brain-thinking", text: `Created branch ${branchName} for ${projectName}` })
+        this.eventBus?.emit({
+          type: "branch-created",
+          source: "project-manager",
+          agentName,
+          projectId: id,
+          data: { branch: branchName, from: currentBranch },
+        })
+      } catch (err) {
+        // Non-fatal — branch isolation is optional (may not be a git repo)
+        this.dashLog.push({ type: "brain-thinking", text: `Branch isolation skipped for ${projectName}: ${err}` })
+      }
+
+      // Restore archived memory if available (from a previous session with this agent name)
+      try {
+        if (await hasAgentArchive(agentName)) {
+          await restoreAgentMemory(agentName)
+          this.dashLog.push({ type: "brain-thinking", text: `Restored archived memory for ${agentName}` })
+        }
+      } catch {}
+
       this.dashLog.push({ type: "brain-thinking", text: `${projectName} agent ready. Starting supervisor...` })
 
       // Save projects
@@ -263,6 +316,14 @@ export class ProjectManager {
 
       // Start supervisor in background
       this.startSupervisor(id)
+
+      this.eventBus?.emit({
+        type: "project-added",
+        source: "project-manager",
+        agentName,
+        projectId: id,
+        data: { name: projectName, directory: resolvedDir, branch: project.agentBranch },
+      })
 
       return project
     } catch (err) {
@@ -286,6 +347,8 @@ export class ProjectManager {
     this.supervisorAborts.set(projectId, ac)
     const softStop = { requested: false }
     this.softStops.set(projectId, softStop)
+    const pauseState = createPauseState()
+    this.pauseStates.set(projectId, pauseState)
 
     project.status = "supervising"
 
@@ -304,8 +367,35 @@ export class ProjectManager {
           dashboardLog: this.dashLog,
           signal: ac.signal,
           softStop,
+          pauseState,
+          postCycleValidation: project.postCycleValidation,
+          eventBus: this.eventBus,
+          resourceManager: this.resourceManager,
+          // Fast coordination: listen for notifications from other agents
+          urgentEventPatterns: this.eventBus ? [
+            { type: "agent-notification" },
+            { type: "resource-contention" },
+            { type: "intent-conflict" },
+          ] : undefined,
+          onUrgentEvent: (event) => {
+            if (event.agentName === project.agentName) return null
+            if (event.type === "agent-notification") {
+              return `Agent ${event.agentName} says: ${(event.data as Record<string, unknown>).message}`
+            }
+            if (event.type === "resource-contention") {
+              const data = event.data as { conflicts?: Array<{ file: string; heldBy: string }> }
+              const files = data.conflicts?.map(c => c.file).join(", ") ?? "unknown"
+              return `[REDIRECT] Agent ${event.agentName} has file contention on: ${files}. Check if your work overlaps.`
+            }
+            if (event.type === "intent-conflict") {
+              const data = event.data as { conflicts?: Array<{ agent: string; files: string[] }> }
+              const details = data.conflicts?.map(c => `${c.agent}: ${c.files.join(", ")}`).join("; ") ?? "unknown"
+              return `Agent ${event.agentName} declared work that overlaps with: ${details}. Coordinate to avoid conflicts.`
+            }
+            return null
+          },
           onThinking: (thought) => {
-            console.log(`[${project.agentName}] ${thought}`)
+            console.log(formatThought(project.agentName, thought))
           },
           onDirectiveUpdate: (newDirective) => {
             this.updateDirective(project.id, newDirective, "supervisor")
@@ -313,36 +403,51 @@ export class ProjectManager {
           getUnreadComments: () => {
             return this.getUnreadComments(project.agentName)
           },
+          onCycleComplete: (cycleNumber) => {
+            const limit = this.cycleLimitCallbacks.get(projectId)
+            if (limit) {
+              limit.count = cycleNumber
+              if (cycleNumber >= limit.maxCycles) {
+                this.cycleLimitCallbacks.delete(projectId)
+                this.pauseProject(projectId)
+              }
+            }
+          },
           onSupervisorStop: (agentName, summary, isFailure) => {
             if (isFailure) {
-              console.error(`[${agentName}] SUPERVISOR STOPPED (failure): ${summary}`)
+              console.error(`${C.brightRed}${C.bold}[${agentName}] SUPERVISOR STOPPED (failure):${C.reset} ${C.red}${summary}${C.reset}`)
               this.dashLog.push({
                 type: "brain-thinking",
                 text: `ALERT: ${project.name} supervisor stopped due to failure: ${summary}. Consider restarting the project.`,
               })
               // Auto-restart supervisor after a delay if the agent process is still alive
-              setTimeout(() => {
+              // Track timer so it can be cancelled if the project is removed or manually restarted
+              const timer = setTimeout(() => {
+                this.autoRestartTimers.delete(projectId)
                 const p = this.projects.get(projectId)
                 if (p && p.status !== "stopped" && this.processes.has(projectId)) {
-                  console.log(`[${agentName}] Auto-restarting supervisor after failure...`)
+                  console.log(`${C.brightYellow}[${agentName}] Auto-restarting supervisor after failure...${C.reset}`)
                   this.dashLog.push({ type: "brain-thinking", text: `Auto-restarting ${project.name} supervisor after failure...` })
                   this.restartSupervisor(projectId)
                 }
               }, 10_000) // 10s delay before auto-restart
+              this.autoRestartTimers.set(projectId, timer)
             }
           },
         })
       } catch (err) {
         if (!ac.signal.aborted) {
-          console.error(`[${project.agentName}] Supervisor error:`, err)
+          console.error(`${C.red}[${project.agentName}] Supervisor error:${C.reset}`, err)
           this.dashLog.push({ type: "brain-thinking", text: `${project.name} supervisor error: ${err}` })
         }
       } finally {
         if (project.status === "supervising") {
           project.status = "running"
         }
-        this.supervisorAborts.delete(projectId)
-        this.softStops.delete(projectId)
+        // Only delete our own refs — a restart may have already replaced them
+        if (this.supervisorAborts.get(projectId) === ac) this.supervisorAborts.delete(projectId)
+        if (this.softStops.get(projectId) === softStop) this.softStops.delete(projectId)
+        if (this.pauseStates.get(projectId) === pauseState) this.pauseStates.delete(projectId)
       }
     })()
   }
@@ -377,9 +482,38 @@ export class ProjectManager {
     const project = this.projects.get(projectId)
     if (!project) throw new Error(`Unknown project: ${projectId}`)
 
+    // Archive agent memory before removing (non-fatal)
+    await archiveAgentMemory(project.agentName, project.directive).catch(err => {
+      console.error(`[project-manager] Failed to archive memory for ${project.agentName}: ${err}`)
+    })
+
+    // Cancel any pending auto-restart timer to prevent a zombie supervisor from starting
+    const pendingTimer = this.autoRestartTimers.get(projectId)
+    if (pendingTimer) { clearTimeout(pendingTimer); this.autoRestartTimers.delete(projectId) }
+
+    // Resume paused supervisor so it unblocks before abort
+    const ps = this.pauseStates.get(projectId)
+    if (ps) requestResume(ps)
+
     // Stop supervisor
     const ac = this.supervisorAborts.get(projectId)
     if (ac) ac.abort()
+
+    // Clean up agent branch (non-fatal)
+    if (project.agentBranch) {
+      try {
+        const currentBranch = await gitCurrentBranch(project.directory)
+        if (currentBranch === project.agentBranch) {
+          await gitCheckout(project.directory, "main").catch(() =>
+            gitCheckout(project.directory, "master")
+          )
+        }
+        await gitDeleteBranch(project.directory, project.agentBranch).catch(() => {})
+      } catch { /* non-fatal */ }
+    }
+
+    // Release file locks
+    this.resourceManager?.releaseFiles(project.agentName)
 
     // Mark as stopped BEFORE killing process to prevent monitorProcess
     // from detecting the intentional kill as an unexpected crash
@@ -403,9 +537,123 @@ export class ProjectManager {
     this.projects.delete(projectId)
     this.supervisorAborts.delete(projectId)
     this.softStops.delete(projectId)
+    this.pauseStates.delete(projectId)
 
     this.dashLog.push({ type: "brain-thinking", text: `Removed project: ${project.name}` })
+    this.eventBus?.emit({
+      type: "project-removed",
+      source: "project-manager",
+      agentName: project.agentName,
+      projectId,
+      data: { name: project.name },
+    })
     this.saveProjects()
+  }
+
+  // ---- Pause / Resume ----
+
+  pauseProject(projectId: string): void {
+    const ps = this.pauseStates.get(projectId)
+    if (!ps) throw new Error(`No pause state for project: ${projectId}`)
+    requestPause(ps)
+    const project = this.projects.get(projectId)
+    if (project) {
+      project.pauseStatus = ps.status
+      project.pauseRequestedAt = ps.requestedAt ?? undefined
+    }
+    this.dashLog.push({ type: "brain-thinking", text: `Pause requested for ${project?.name ?? projectId}` })
+  }
+
+  resumeProject(projectId: string): void {
+    const ps = this.pauseStates.get(projectId)
+    if (!ps) throw new Error(`No pause state for project: ${projectId}`)
+    requestResume(ps)
+    const project = this.projects.get(projectId)
+    if (project) {
+      project.pauseStatus = "none"
+      project.pauseRequestedAt = undefined
+      project.pausedAt = undefined
+    }
+    this.dashLog.push({ type: "brain-thinking", text: `Resume requested for ${project?.name ?? projectId}` })
+  }
+
+  pauseAll(): void {
+    for (const id of this.pauseStates.keys()) {
+      const project = this.projects.get(id)
+      if (project && project.status === "supervising") {
+        this.pauseProject(id)
+      }
+    }
+  }
+
+  resumeAll(): void {
+    for (const id of this.pauseStates.keys()) {
+      const ps = this.pauseStates.get(id)
+      if (ps && ps.status !== "none") {
+        this.resumeProject(id)
+      }
+    }
+  }
+
+  getPauseState(projectId: string): PauseState | undefined {
+    return this.pauseStates.get(projectId)
+  }
+
+  /** Set a cycle limit — supervisor auto-pauses after N cycles. Used by A/B testing. */
+  setCycleLimit(projectId: string, maxCycles: number): void {
+    this.cycleLimitCallbacks.set(projectId, { maxCycles, count: 0 })
+  }
+
+  /** Clear any active cycle limit */
+  clearCycleLimit(projectId: string): void {
+    this.cycleLimitCallbacks.delete(projectId)
+  }
+
+  // ---- Branch Isolation ----
+
+  /** Get the git branch name for a project's agent */
+  getAgentBranch(projectId: string): string | undefined {
+    return this.projects.get(projectId)?.agentBranch
+  }
+
+  /** Merge an agent's branch into a target branch (default: main).
+   *  Agent must be paused or not supervising — merging while actively running risks conflicts. */
+  async mergeAgentBranch(projectId: string, targetBranch?: string): Promise<{ success: boolean; output: string }> {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    if (!project.agentBranch) throw new Error(`No agent branch for project: ${projectId}`)
+
+    // Safety: don't merge while agent is actively running — could corrupt its working tree
+    const ps = this.pauseStates.get(projectId)
+    if (project.status === "supervising" && (!ps || ps.status !== "paused")) {
+      throw new Error(`Cannot merge while supervisor is actively running. Pause the project first.`)
+    }
+
+    const target = targetBranch ?? "main"
+    await gitCheckout(project.directory, target)
+    const result = await gitMerge(project.directory, project.agentBranch)
+
+    if (result.success) {
+      this.eventBus?.emit({
+        type: "branch-merged",
+        source: "project-manager",
+        agentName: project.agentName,
+        projectId,
+        data: { branch: project.agentBranch, into: target },
+      })
+      this.dashLog.push({ type: "brain-thinking", text: `Merged ${project.agentBranch} into ${target}` })
+    }
+
+    // Checkout back to agent branch so work continues
+    await gitCheckout(project.directory, project.agentBranch)
+    return result
+  }
+
+  /** Set post-cycle validation config for a project */
+  setValidationConfig(projectId: string, config: { command?: string; preset?: ValidationPreset; timeoutMs?: number; failAction?: "warn" | "inject" | "pause" }): void {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    project.postCycleValidation = config
   }
 
   /** Soft stop all supervisors */
@@ -424,15 +672,20 @@ export class ProjectManager {
   }
 
   /** Restart supervisor for a project */
-  restartSupervisor(projectId: string, directive?: string) {
+  restartSupervisor(projectId: string, directive?: string, model?: string) {
     const project = this.projects.get(projectId)
     if (!project) return
+
+    // Cancel any pending auto-restart timer to prevent double-start
+    const pendingTimer = this.autoRestartTimers.get(projectId)
+    if (pendingTimer) { clearTimeout(pendingTimer); this.autoRestartTimers.delete(projectId) }
 
     // Stop existing supervisor
     const ac = this.supervisorAborts.get(projectId)
     if (ac) ac.abort()
 
     if (directive) project.directive = directive
+    if (model) project.model = model
 
     // Start new one after a brief delay — verify project still exists and isn't stopped
     setTimeout(() => {
@@ -521,6 +774,15 @@ export class ProjectManager {
   }
 
   listProjects(): ProjectState[] {
+    // Enrich with live pause state
+    for (const [id, project] of this.projects) {
+      const ps = this.pauseStates.get(id)
+      if (ps) {
+        project.pauseStatus = ps.status
+        project.pauseRequestedAt = ps.requestedAt ?? undefined
+        project.pausedAt = ps.pausedAt ?? undefined
+      }
+    }
     return Array.from(this.projects.values())
   }
 
@@ -559,6 +821,9 @@ export class ProjectManager {
 
   /** Shut down everything — kills all child processes and waits for port release */
   shutdown() {
+    // Cancel all pending auto-restart timers
+    for (const timer of this.autoRestartTimers.values()) clearTimeout(timer)
+    this.autoRestartTimers.clear()
     this.hardStopAll()
     for (const proc of this.processes.values()) {
       try { proc.kill() } catch {}

@@ -8,6 +8,9 @@ import { existsSync, readFileSync } from "fs"
 import { resolve } from "path"
 import { loadTaskQueue, addTask, formatQueueForPrompt } from "./task-queue"
 import { extractLastAssistantText, formatRecentMessages } from "./message-utils"
+import { formatThought, C } from "./tui-format"
+import { detectCrash, initSessionState, markCleanShutdown, formatCrashReport } from "./session-state"
+import { recordPrompt } from "./prompt-ledger"
 
 /** Tunable supervisor limits — all optional with sensible defaults */
 type SupervisorLimits = {
@@ -27,16 +30,45 @@ type SupervisorLimits = {
   stuckThresholdMs?: number
 }
 
+type TeamMemberConfig = {
+  role: string
+  agentName: string
+  directory: string
+  directive: string
+}
+
+type TeamConfigFile = {
+  goal: string
+  members: TeamMemberConfig[]
+  managerIntervalSeconds?: number
+  managerMaxRounds?: number
+}
+
 type ConfigFile = {
   agents: AgentConfig[]
   autoApprove?: boolean
   pollInterval?: number
   dashboardPort?: number
+  /** Operating mode: "projects" (isolated per-project supervisors) or "teams" (shared goal with manager) */
+  mode?: "projects" | "teams"
   brain?: { model?: string; ollamaUrl?: string }
   /** Tunable supervisor limits */
   supervisor?: SupervisorLimits
   /** Phase 3: optional project role mapping { agentName: { coder, reviewer? } } */
   projects?: Record<string, { coder: string; reviewer?: string }>
+  /**
+   * Scheduling mode for supervisors:
+   * - "parallel": All supervisors run simultaneously (fast, high API usage)
+   * - "sequential": Rotate through agents N at a time (slower, low API usage)
+   * Default: "parallel"
+   */
+  scheduling?: "parallel" | "sequential"
+  /** For sequential mode: how many agents to supervise concurrently. Default: 1 */
+  concurrency?: number
+  /** For sequential mode: cycles per agent before rotating. Default: 2 */
+  cyclesPerRotation?: number
+  /** Teams mode configuration (only used when mode = "teams") */
+  team?: TeamConfigFile
 }
 
 function loadConfigFile(): ConfigFile | null {
@@ -63,9 +95,14 @@ function parseArgs(): {
   autoApprove: boolean
   verbose: boolean
   dashboardPort: number
+  mode: "projects" | "teams"
   brain: { model: string; ollamaUrl: string }
   supervisor: SupervisorLimits
   projects?: Record<string, { coder: string; reviewer?: string }>
+  scheduling: "parallel" | "sequential"
+  concurrency: number
+  cyclesPerRotation: number
+  team?: TeamConfigFile
 } {
   const args = process.argv.slice(2)
   let autoApprove = false
@@ -116,12 +153,17 @@ function parseArgs(): {
     autoApprove: autoApprove || fileConfig?.autoApprove || false,
     verbose,
     dashboardPort: dashboardPortExplicit ? dashboardPort : (fileConfig?.dashboardPort ?? dashboardPort),
+    mode: fileConfig?.mode ?? "projects",
     brain: {
       model: fileConfig?.brain?.model ?? "glm-5.1:cloud",
       ollamaUrl: fileConfig?.brain?.ollamaUrl ?? "http://127.0.0.1:11434",
     },
     supervisor: fileConfig?.supervisor ?? {},
     projects: fileConfig?.projects,
+    scheduling: fileConfig?.scheduling ?? "parallel",
+    concurrency: fileConfig?.concurrency ?? 1,
+    cyclesPerRotation: fileConfig?.cyclesPerRotation ?? 2,
+    team: fileConfig?.team,
   }
 }
 
@@ -148,9 +190,8 @@ function statusIcon(status: string): string {
   }
 }
 
-
 async function main() {
-  const { agents, autoApprove, verbose, dashboardPort, brain: brainConfig, supervisor: supervisorLimits, projects } = parseArgs()
+  const { agents, autoApprove, verbose, dashboardPort, mode, brain: brainConfig, supervisor: supervisorLimits, projects, scheduling, concurrency, cyclesPerRotation, team: teamConfig } = parseArgs()
 
   // Dashboard event log — shared between orchestrator callbacks and the web UI
   const dashLog = new DashboardLog()
@@ -158,7 +199,24 @@ async function main() {
   // Soft-stop flag — set by the "stop" command to finish current cycle then exit
   let activeSoftStop: { requested: boolean } | null = null
 
-  console.log("=== OpenCode Orchestrator ===")
+  console.log(`${C.brightMagenta}${C.bold}=== OpenCode Orchestrator ===${C.reset}`)
+
+  // --- Crash detection: check if previous session exited uncleanly ---
+  const { crashed, state: prevState } = await detectCrash()
+  if (crashed && prevState) {
+    console.log(`\n${C.brightYellow}${C.bold}⚠ Crash Recovery Available${C.reset}`)
+    console.log(C.yellow + formatCrashReport(prevState) + C.reset)
+    console.log(`\n${C.dim}Projects from the previous session will be available to restore via the dashboard.${C.reset}`)
+    console.log(`${C.dim}Use "Restore Saved" to pick up where you left off.${C.reset}\n`)
+    dashLog.push({
+      type: "brain-thinking",
+      text: `⚠ Previous session (PID ${prevState.pid}) crashed. ${Object.keys(prevState.supervisors).length} supervisor(s) were active. Use "Restore Saved" to resume.`,
+    })
+  }
+
+  // Write session state for this run (enables crash detection on next startup)
+  await initSessionState({ dashboardPort, mode })
+
   if (agents.length > 0) {
     console.log(`Pre-configured agents: ${agents.map((a) => `${a.name} @ ${a.url}`).join(", ")}`)
   } else {
@@ -211,7 +269,11 @@ async function main() {
       : undefined,
 
     onStatusChange(agentName, status, detail) {
-      console.log(`${statusIcon(status)} ${agentName} -> ${status}${detail ? ` (${detail})` : ""}`)
+      const statusColor = status === "error" || status === "disconnected" ? C.brightRed
+        : status === "busy" ? C.yellow
+        : status === "completed" ? C.green
+        : C.blue
+      console.log(`${statusColor}${statusIcon(status)}${C.reset} ${C.cyan}${agentName}${C.reset} ${C.gray}->${C.reset} ${statusColor}${status}${C.reset}${detail ? ` ${C.dim}(${detail})${C.reset}` : ""}`)
       dashLog.push({
         type: "agent-status",
         agent: agentName,
@@ -224,17 +286,17 @@ async function main() {
       const response = extractLastAssistantText(messages)
       if (response) {
         console.log("")
-        console.log(`--- ${agentName} response ---`)
+        console.log(`${C.green}${C.bold}--- ${agentName} response ---${C.reset}`)
         const maxLen = 2000
         if (response.length > maxLen) {
           console.log(
             response.slice(0, maxLen) +
-              `\n... (${response.length - maxLen} more chars, use "messages ${agentName}" to see full)`,
+              `\n${C.dim}... (${response.length - maxLen} more chars, use "messages ${agentName}" to see full)${C.reset}`,
           )
         } else {
           console.log(response)
         }
-        console.log(`--- end ${agentName} ---`)
+        console.log(`${C.green}--- end ${agentName} ---${C.reset}`)
         console.log("")
 
         // Forward full response to dashboard
@@ -247,13 +309,13 @@ async function main() {
     },
 
     async onPermissionRequest(agentName, permission) {
-      console.log(`\n[PERM] ${agentName} requests permission:`, JSON.stringify(permission, null, 2))
+      console.log(`\n${C.brightYellow}[PERM]${C.reset} ${C.cyan}${agentName}${C.reset} ${C.yellow}requests permission:${C.reset}`, JSON.stringify(permission, null, 2))
       return "approve"
     },
 
     onAgentStuck(agentName, busyDurationMs) {
       const mins = Math.round(busyDurationMs / 60_000)
-      console.log(`\n[STUCK] ${agentName} has been busy for ${mins}min with no new messages`)
+      console.log(`\n${C.brightRed}[STUCK]${C.reset} ${C.cyan}${agentName}${C.reset} ${C.red}has been busy for ${mins}min with no new messages${C.reset}`)
       dashLog.push({
         type: "agent-status",
         agent: agentName,
@@ -285,18 +347,37 @@ async function main() {
   const orchestrator = await createOrchestrator(config)
   lazyOrchestrator = orchestrator
 
+  // Event bus and resource manager — shared across all agents
+  const { EventBus } = await import("./event-bus")
+  const { ResourceManager } = await import("./resource-manager")
+  const eventBus = new EventBus()
+  const resourceManager = new ResourceManager(2) // max 2 concurrent LLM calls
+
   // ProjectManager — handles dynamic agent provisioning from the dashboard
-  const projectManager = new ProjectManager(orchestrator, dashLog, brainConfig, supervisorLimits)
+  const projectManager = new ProjectManager(orchestrator, dashLog, brainConfig, supervisorLimits, eventBus, resourceManager)
 
   // REPL reader — declared early so handleCommand can re-prompt after background brain tasks
   let reader: any = null
 
+  // Team manager instance — lives across commands, set when team-loop starts
+  let activeTeamManager: import("./team-manager").TeamManager | null = null
+
   // Shared command handler for both REPL and dashboard
   let brainRunning = false
+
+  function findProject(idOrName: string) {
+    return projectManager.listProjects().find(p => p.id === idOrName || p.name === idOrName || p.agentName === idOrName)
+  }
 
   async function handleCommand(command: string): Promise<{ ok: boolean; output?: string; error?: string }> {
     const trimmed = command.trim()
     if (!trimmed) return { ok: false, error: "Empty command" }
+
+    // Record user command to prompt ledger
+    recordPrompt({
+      source: "user", target: "system", direction: "outbound",
+      content: trimmed,
+    }).catch(() => {})
 
     if (trimmed === "status") {
       const statuses = await orchestrator.status()
@@ -318,7 +399,7 @@ async function main() {
       const parts: string[] = []
       if (activeSoftStop) {
         activeSoftStop.requested = true
-        parts.push("brain-loop")
+        parts.push(activeTeamManager ? "team-loop" : "brain-loop")
       }
       if (hasProjectSupervisors) {
         projectManager.softStopAll()
@@ -328,6 +409,164 @@ async function main() {
       console.log("\n[stop] Soft stop requested.")
       dashLog.push({ type: "brain-thinking", text: "--- Soft stop requested ---" })
       return { ok: true, output: `Soft stop requested for: ${parts.join(", ")}. Will finish current cycles.` }
+    }
+
+    if (trimmed.startsWith("pause ")) {
+      const idOrName = trimmed.slice(6).trim()
+      if (!idOrName) return { ok: false, error: "Usage: pause <project-id-or-name>" }
+      const project = projectManager.listProjects().find(p => p.id === idOrName || p.name === idOrName || p.agentName === idOrName)
+      if (!project) return { ok: false, error: `Unknown project: ${idOrName}` }
+      try {
+        projectManager.pauseProject(project.id)
+        return { ok: true, output: `Pause requested for ${project.name}. Supervisor will finish current plan and hold.` }
+      } catch (err) { return { ok: false, error: String(err) } }
+    }
+
+    if (trimmed.startsWith("resume ")) {
+      const idOrName = trimmed.slice(7).trim()
+      if (!idOrName) return { ok: false, error: "Usage: resume <project-id-or-name>" }
+      const project = projectManager.listProjects().find(p => p.id === idOrName || p.name === idOrName || p.agentName === idOrName)
+      if (!project) return { ok: false, error: `Unknown project: ${idOrName}` }
+      try {
+        projectManager.resumeProject(project.id)
+        return { ok: true, output: `Resume requested for ${project.name}.` }
+      } catch (err) { return { ok: false, error: String(err) } }
+    }
+
+    if (trimmed === "pause-all") {
+      projectManager.pauseAll()
+      return { ok: true, output: "Pause requested for all supervising projects." }
+    }
+
+    if (trimmed === "resume-all") {
+      projectManager.resumeAll()
+      return { ok: true, output: "Resume requested for all paused projects." }
+    }
+
+    // ---- Branch & Validation commands ----
+    if (trimmed.startsWith("branch ")) {
+      const idOrName = trimmed.slice(7).trim()
+      const project = findProject(idOrName)
+      if (!project) return { ok: false, error: `Unknown project: ${idOrName}` }
+      const branch = projectManager.getAgentBranch(project.id)
+      return { ok: true, output: branch ? `Agent branch: ${branch}` : "No agent branch (branch isolation not active)" }
+    }
+
+    if (trimmed.startsWith("merge ")) {
+      const parts = trimmed.slice(6).trim().split(" ")
+      const idOrName = parts[0]!
+      const target = parts[1] || "main"
+      const project = findProject(idOrName)
+      if (!project) return { ok: false, error: `Unknown project: ${idOrName}` }
+      try {
+        const result = await projectManager.mergeAgentBranch(project.id, target)
+        return { ok: result.success, output: result.success ? `Merged into ${target}` : `Merge failed: ${result.output}` }
+      } catch (err) { return { ok: false, error: String(err) } }
+    }
+
+    if (trimmed.startsWith("validate ")) {
+      const rest = trimmed.slice(9).trim()
+      const spaceIdx = rest.indexOf(" ")
+      if (spaceIdx === -1) return { ok: false, error: "Usage: validate <project-id> <command|preset>\nPresets: test, typecheck, lint, build, test+typecheck" }
+      const idOrName = rest.slice(0, spaceIdx)
+      const commandOrPreset = rest.slice(spaceIdx + 1)
+      const project = findProject(idOrName)
+      if (!project) return { ok: false, error: `Unknown project: ${idOrName}` }
+      const presets = ["test", "typecheck", "lint", "build", "test+typecheck"]
+      const isPreset = presets.includes(commandOrPreset.trim().toLowerCase())
+      try {
+        const config = isPreset
+          ? { preset: commandOrPreset.trim().toLowerCase() as any, failAction: "inject" as const }
+          : { command: commandOrPreset, failAction: "inject" as const }
+        projectManager.setValidationConfig(project.id, config)
+        return { ok: true, output: `Validation set for ${project.name}: ${isPreset ? `preset "${commandOrPreset}"` : commandOrPreset}` }
+      } catch (err) { return { ok: false, error: String(err) } }
+    }
+
+    if (trimmed === "locks") {
+      if (!resourceManager) return { ok: true, output: "Resource manager not available" }
+      const locks = resourceManager.getActiveLocks()
+      if (locks.size === 0) return { ok: true, output: "No active file locks" }
+      const lines = Array.from(locks.entries()).map(([agent, lock]) =>
+        `  ${agent}: ${lock.files.slice(0, 5).join(", ")}${lock.files.length > 5 ? "..." : ""}`
+      )
+      return { ok: true, output: `Active file locks:\n${lines.join("\n")}\nLLM queue: ${resourceManager.getLlmQueueDepth()} waiting` }
+    }
+
+    if (trimmed === "providers") {
+      const { loadProviders, resolveApiKey } = await import("./providers")
+      const providers = await loadProviders()
+      if (providers.length === 0) return { ok: true, output: "No providers configured" }
+      const lines = providers.map(p => {
+        const status = p.enabled ? "[ON]" : "[OFF]"
+        const hasKey = resolveApiKey(p) ? "key:yes" : (p.id === "ollama" ? "key:n/a" : "key:NO")
+        const models = p.models.length > 0 ? p.models.slice(0, 3).join(", ") + (p.models.length > 3 ? "..." : "") : "(no models)"
+        return `  ${status} ${p.id} (${p.name}) — ${hasKey} — ${models}`
+      })
+      return { ok: true, output: `LLM Providers:\n${lines.join("\n")}` }
+    }
+
+    if (trimmed.startsWith("provider enable ") || trimmed.startsWith("provider disable ")) {
+      const parts = trimmed.split(" ")
+      const action = parts[1]
+      const id = parts[2]
+      if (!id) return { ok: false, output: "Usage: provider enable|disable <id>" }
+      const { enableProvider } = await import("./providers")
+      const ok = await enableProvider(id, action === "enable")
+      return { ok, output: ok ? `Provider ${id} ${action}d` : `Provider "${id}" not found` }
+    }
+
+    if (trimmed.startsWith("provider key ")) {
+      const parts = trimmed.split(" ")
+      const id = parts[2]
+      const key = parts.slice(3).join(" ")
+      if (!id || !key) return { ok: false, output: "Usage: provider key <id> <api-key>" }
+      const { setProviderApiKey } = await import("./providers")
+      const ok = await setProviderApiKey(id, key)
+      return { ok, output: ok ? `API key set for ${id}` : `Provider "${id}" not found` }
+    }
+
+    if (trimmed === "models") {
+      const { listAllModels } = await import("./providers")
+      const models = await listAllModels()
+      if (models.length === 0) return { ok: true, output: "No models available. Enable providers and add API keys." }
+      let lastProvider = ""
+      const lines: string[] = []
+      for (const m of models) {
+        if (m.provider !== lastProvider) {
+          lines.push(`  -- ${m.providerName} --`)
+          lastProvider = m.provider
+        }
+        const ref = m.provider === "ollama" ? m.model : `${m.provider}:${m.model}`
+        lines.push(`    ${ref}`)
+      }
+      return { ok: true, output: `Available models:\n${lines.join("\n")}\n\nUse provider:model format when setting model (e.g., openai:gpt-4o)` }
+    }
+
+    if (trimmed === "intents") {
+      if (!resourceManager) return { ok: true, output: "Resource manager not available" }
+      const intents = resourceManager.getAllIntents()
+      if (intents.size === 0) return { ok: true, output: "No declared work intents" }
+      const lines = Array.from(intents.entries()).map(([agent, intent]) => {
+        const files = intent.files.length > 0
+          ? intent.files.slice(0, 5).join(", ") + (intent.files.length > 5 ? "..." : "")
+          : "(no files)"
+        const ago = Math.round((Date.now() - intent.declaredAt) / 1000)
+        return `  ${agent}: ${intent.description} [${files}] (${ago}s ago)`
+      })
+      return { ok: true, output: `Declared work intents:\n${lines.join("\n")}` }
+    }
+
+    if (trimmed.startsWith("events")) {
+      if (!eventBus) return { ok: true, output: "Event bus not available" }
+      const limit = parseInt(trimmed.slice(6).trim()) || 20
+      const events = eventBus.getRecent(undefined, limit)
+      if (events.length === 0) return { ok: true, output: "No recent bus events" }
+      const lines = events.map(e => {
+        const time = new Date(e.timestamp).toLocaleTimeString()
+        return `  ${time} [${e.type}] ${e.agentName ?? e.source} ${JSON.stringify(e.data).slice(0, 80)}`
+      })
+      return { ok: true, output: `Recent events (${events.length}):\n${lines.join("\n")}` }
     }
 
     if (trimmed === "projects") {
@@ -387,7 +626,7 @@ async function main() {
     }
 
     if (trimmed.startsWith("brain-loop")) {
-      if (brainRunning) return { ok: false, error: "Brain is already running." }
+      if (brainRunning) return { ok: false, error: "Brain/team is already running." }
 
       // Guard: don't run parallel supervisors if ProjectManager already has supervisors on these agents
       const supervisedProjects = projectManager.listProjects().filter(p => p.status === "supervising")
@@ -410,12 +649,15 @@ async function main() {
         activeSoftStop = softStop
 
         let hardStopped = false
-        const stopLoop = () => { hardStopped = true; ac.abort(); activeSoftStop = null; console.log("\nHard stopping all supervisors...") }
+        const stopLoop = () => { hardStopped = true; ac.abort(); activeSoftStop = null; console.log(`\n${C.brightRed}Hard stopping all supervisors...${C.reset}`) }
         process.once("SIGINT", stopLoop)
 
-        console.log(`\nStarting ${agentCount} parallel supervisors...`)
-        console.log(`Directive: "${activeDirective}"`)
-        console.log('Type "stop" for soft stop, Ctrl+C for hard stop.\n')
+        console.log(`\n${C.brightMagenta}${C.bold}Starting ${agentCount} supervisors in ${scheduling} mode...${C.reset}`)
+        if (scheduling === "sequential") {
+          console.log(`  ${C.dim}Concurrency: ${concurrency} agent(s) at a time, ${cyclesPerRotation} cycles each${C.reset}`)
+        }
+        console.log(`${C.dim}Directive:${C.reset} ${C.white}"${activeDirective}"${C.reset}`)
+        console.log(`${C.dim}Type "stop" for soft stop, Ctrl+C for hard stop.${C.reset}\n`)
 
         const { runParallelSupervisors } = await import("./supervisor")
         try {
@@ -424,18 +666,21 @@ async function main() {
             model: brainConfig.model,
             directive: activeDirective,
             cyclePauseSeconds: supervisorLimits.cyclePauseSeconds ?? 30,
-            maxRoundsPerCycle: supervisorLimits.maxRoundsPerCycle ?? 30,
+            maxRoundsPerCycle: supervisorLimits.maxRoundsPerCycle ?? 12,
             reviewEnabled: true,
             supervisorLimits,
             projects,
+            scheduling,
+            concurrency,
+            cyclesPerRotation,
             signal: ac.signal,
             softStop,
             dashboardLog: dashLog,
             onThinking(agentName, thought) {
-              console.log(`[${agentName}] ${thought}`)
+              console.log(formatThought(agentName, thought))
             },
           })
-          console.log("\nAll supervisors finished.")
+          console.log(`\n${C.brightMagenta}${C.bold}All supervisors finished.${C.reset}`)
         } catch (err) {
           console.error(`Supervisor error: ${err}`)
         } finally {
@@ -449,6 +694,132 @@ async function main() {
         try { reader?.prompt() } catch {}
       })()
       return { ok: true, output: `${agentCount} parallel supervisors started: ${activeDirective}` }
+    }
+
+    // --- Team mode commands ---
+
+    if (trimmed === "team-loop" || trimmed.startsWith("team-loop ")) {
+      if (brainRunning) return { ok: false, error: "Brain/team is already running." }
+      if (!teamConfig || !teamConfig.goal) {
+        return { ok: false, error: 'No team config found. Add a "team" section with "goal" and "members" to orchestrator.json and set "mode": "teams".' }
+      }
+      if (teamConfig.members.length === 0) {
+        return { ok: false, error: 'Team has no members. Add members to "team.members" in orchestrator.json.' }
+      }
+
+      // Pre-flight: check that all team member agents are registered in the orchestrator
+      const registeredAgents = new Set(orchestrator.agents.keys())
+      const missingAgents = teamConfig.members.filter(m => !registeredAgents.has(m.agentName))
+      if (missingAgents.length > 0) {
+        const names = missingAgents.map(m => `"${m.agentName}"`).join(", ")
+        return { ok: false, error: `Team members reference unregistered agents: ${names}. Add them to "agents" in orchestrator.json first.` }
+      }
+
+      const goalOverride = trimmed.slice(9).trim()
+
+      ;(async () => {
+        brainRunning = true
+
+        const ac = new AbortController()
+        const softStop = { requested: false }
+        activeSoftStop = softStop
+
+        let hardStopped = false
+        const stopLoop = () => { hardStopped = true; ac.abort(); activeSoftStop = null; console.log(`\n${C.brightRed}Hard stopping team manager...${C.reset}`) }
+        process.once("SIGINT", stopLoop)
+
+        console.log(`\n${C.brightMagenta}${C.bold}Starting team mode with ${teamConfig!.members.length} members...${C.reset}`)
+        console.log(`${C.dim}Goal:${C.reset} ${C.white}"${goalOverride || teamConfig!.goal}"${C.reset}`)
+        console.log(`${C.dim}Manager check-in interval: ${teamConfig!.managerIntervalSeconds ?? 120}s${C.reset}`)
+        console.log(`${C.dim}Type "stop" for soft stop, Ctrl+C for hard stop.${C.reset}\n`)
+
+        const { TeamManager } = await import("./team-manager")
+        const tm = new TeamManager(orchestrator, {
+          ollamaUrl: brainConfig.ollamaUrl,
+          model: brainConfig.model,
+          goal: goalOverride || teamConfig!.goal,
+          members: teamConfig!.members,
+          managerIntervalSeconds: teamConfig!.managerIntervalSeconds,
+          managerMaxRounds: teamConfig!.managerMaxRounds,
+          supervisorLimits,
+          scheduling,
+          concurrency,
+          cyclesPerRotation,
+          signal: ac.signal,
+          softStop,
+          dashboardLog: dashLog,
+          onThinking(source, thought) {
+            console.log(formatThought(source, thought))
+          },
+        })
+        activeTeamManager = tm
+
+        try {
+          await tm.run()
+          console.log(`\n${C.brightMagenta}${C.bold}Team manager finished.${C.reset}`)
+        } catch (err) {
+          console.error(`${C.brightRed}Team manager error:${C.reset} ${err}`)
+        } finally {
+          const finalStatus = hardStopped ? "idle" : "done"
+          dashLog.push({ type: "brain-status", status: finalStatus })
+          if (hardStopped) dashLog.push({ type: "brain-thinking", text: "--- Team hard stopped by user ---" })
+          activeSoftStop = null
+          activeTeamManager = null
+          brainRunning = false
+          process.removeListener("SIGINT", stopLoop)
+        }
+        try { reader?.prompt() } catch {}
+      })()
+      return { ok: true, output: `Team started with ${teamConfig.members.length} members. Goal: "${goalOverride || teamConfig.goal}"` }
+    }
+
+    if (trimmed === "team") {
+      if (!activeTeamManager) return { ok: false, error: "No team running. Use 'team-loop' to start." }
+      const members = activeTeamManager.listMembers()
+      if (members.length === 0) return { ok: true, output: "No team members." }
+      const lines = members.map(m =>
+        `  ${m.role} (${m.agentName}) | ${m.status} | directive: ${m.directive.slice(0, 80)}...\n    last: ${m.recentSummary.slice(0, 120)}`
+      )
+      return { ok: true, output: `Team members:\n${lines.join("\n")}` }
+    }
+
+    if (trimmed === "team hire-requests") {
+      if (!activeTeamManager) return { ok: false, error: "No team running." }
+      const reqs = activeTeamManager.getHireRequests()
+      if (reqs.length === 0) return { ok: true, output: "No pending hire requests." }
+      const lines = reqs.map((r, i) => `  [${i}] ${r.role} at ${r.directory}`)
+      return { ok: true, output: `Pending hire requests:\n${lines.join("\n")}\nUse 'team approve-hire <index> <agent-name>' to approve.` }
+    }
+
+    if (trimmed.startsWith("team approve-hire ")) {
+      if (!activeTeamManager) return { ok: false, error: "No team running." }
+      const parts = trimmed.slice(18).trim().split(" ")
+      const idx = parseInt(parts[0] ?? "", 10)
+      const agentName = parts[1]
+      if (isNaN(idx) || !agentName) return { ok: false, error: "Usage: team approve-hire <index> <agent-name>" }
+      const reqs = activeTeamManager.getHireRequests()
+      if (idx < 0 || idx >= reqs.length) return { ok: false, error: `Invalid index. ${reqs.length} pending requests.` }
+      const req = reqs[idx]!
+      activeTeamManager.addMember({ role: req.role, agentName, directory: req.directory, directive: `Work on ${req.role} tasks for the team goal.` })
+      activeTeamManager.removeHireRequest(idx)
+      return { ok: true, output: `Hired ${agentName} as ${req.role} at ${req.directory}` }
+    }
+
+    if (trimmed === "team dissolve-requests") {
+      if (!activeTeamManager) return { ok: false, error: "No team running." }
+      const reqs = activeTeamManager.getDissolveRequests()
+      if (reqs.length === 0) return { ok: true, output: "No pending dissolve requests." }
+      const lines = reqs.map((r, i) => `  [${i}] ${r}`)
+      return { ok: true, output: `Pending dissolve requests:\n${lines.join("\n")}\nUse 'team approve-dissolve <agent-name>' to approve.` }
+    }
+
+    if (trimmed.startsWith("team approve-dissolve ")) {
+      if (!activeTeamManager) return { ok: false, error: "No team running." }
+      const agentName = trimmed.slice(21).trim()
+      if (!agentName) return { ok: false, error: "Usage: team approve-dissolve <agent-name>" }
+      activeTeamManager.removeMember(agentName)
+      activeTeamManager.removeDissolveRequest(agentName)
+      return { ok: true, output: `Dissolved team member: ${agentName}` }
     }
 
     if (trimmed === "brain-queue") {
@@ -577,12 +948,21 @@ async function main() {
       },
       onCommand: handleCommand,
       projectManager,
+      getTeamManager: () => activeTeamManager,
+      eventBus,
+      resourceManager,
     })
     console.log(`Dashboard: http://127.0.0.1:${dashboardPort}`)
   } catch (err) {
     console.error(`Failed to start dashboard: ${err instanceof Error ? err.message : err}`)
     process.exit(1)
   }
+
+  // --- Session heartbeat — updates PID file every 30s so crash detection has fresh timestamps ---
+  const { updateSessionHeartbeat } = await import("./session-state")
+  const heartbeatTimer = setInterval(() => {
+    updateSessionHeartbeat().catch(() => {})
+  }, 30_000)
 
   // --- Graceful shutdown on signals ---
   let shuttingDown = false
@@ -593,6 +973,9 @@ async function main() {
     }
     shuttingDown = true
     console.log(`\n[${signal}] Shutting down...`)
+    clearInterval(heartbeatTimer)
+    // Mark session as cleanly shut down before stopping components
+    markCleanShutdown().catch(() => {})
     projectManager.shutdown()
     dashboard.stop()
     orchestrator.shutdown()
@@ -618,21 +1001,28 @@ async function main() {
     prompt: "orchestrator> ",
   })
 
-  console.log("Commands:")
-  console.log("  <agent-name> <prompt>    Send prompt to an agent")
-  console.log("  all <prompt>             Send prompt to all agents")
-  console.log("  brain <objective>        One-shot brain (orchestrator-level)")
-  console.log("  brain-loop <directive>   Parallel per-agent supervisors")
-  console.log("  brain-queue              Run brain through the task queue")
-  console.log("  stop                     Soft stop all supervisors")
-  console.log("  projects                 List active projects")
-  console.log("  project add <dir> [name] Add a project (spawns agent + supervisor)")
-  console.log("  project remove <id>      Remove a project")
-  console.log("  tasks                    Show task queue")
-  console.log("  task add <title>         Add a task to the queue")
-  console.log("  status                   Show agent status")
-  console.log("  messages <agent-name>    Show recent messages")
-  console.log("  quit                     Exit")
+  const helpCmd = (cmd: string, desc: string) => console.log(`  ${C.brightCyan}${cmd.padEnd(27)}${C.reset}${C.dim}${desc}${C.reset}`)
+  console.log(`${C.bold}Commands:${C.reset}`)
+  helpCmd("<agent-name> <prompt>", "Send prompt to an agent")
+  helpCmd("all <prompt>", "Send prompt to all agents")
+  helpCmd("brain <objective>", "One-shot brain (orchestrator-level)")
+  helpCmd("brain-loop <directive>", "Start per-agent supervisors (projects mode)")
+  helpCmd("team-loop [goal]", "Start team mode with manager coordination")
+  helpCmd("brain-queue", "Run brain through the task queue")
+  helpCmd("stop", "Soft stop all supervisors/team")
+  helpCmd("team", "List team members and status")
+  helpCmd("team hire-requests", "View pending hire requests from manager")
+  helpCmd("team dissolve-requests", "View pending dissolve requests from manager")
+  helpCmd("projects", "List active projects")
+  helpCmd("project add <dir> [name]", "Add a project (spawns agent + supervisor)")
+  helpCmd("project remove <id>", "Remove a project")
+  helpCmd("tasks", "Show task queue")
+  helpCmd("task add <title>", "Add a task to the queue")
+  helpCmd("status", "Show agent status")
+  helpCmd("messages <agent-name>", "Show recent messages")
+  helpCmd("quit", "Exit")
+  console.log("")
+  console.log(`${C.dim}Mode: ${C.reset}${C.brightMagenta}${mode}${C.reset} ${C.dim}| Scheduling: ${C.reset}${C.brightCyan}${scheduling}${C.reset} ${C.dim}(concurrency=${concurrency}, cyclesPerRotation=${cyclesPerRotation})${C.reset}`)
   console.log("")
 
   reader.prompt()

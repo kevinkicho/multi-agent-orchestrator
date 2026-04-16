@@ -1,5 +1,7 @@
 import { resolve } from "path"
+import { mkdirSync } from "fs"
 import { readJsonFile, writeJsonFile } from "./file-utils"
+import { readFileOrNull } from "./file-utils"
 
 export type BrainMemoryEntry = {
   timestamp: number
@@ -9,20 +11,46 @@ export type BrainMemoryEntry = {
 }
 
 export type BrainMemoryStore = {
+  /** @deprecated Flat entries — kept for migration from old format */
   entries: BrainMemoryEntry[]
+  /** Per-agent session summaries, keyed by agent name, cap 20 each */
+  agentEntries?: Record<string, BrainMemoryEntry[]>
   /** Persistent notes the brain has accumulated about the projects */
   projectNotes: Record<string, string[]>
   /** Behavioral notes about how agents work best (injected into supervisor system prompts) */
   behavioralNotes?: Record<string, string[]>
 }
 
+export type AgentMemoryArchive = {
+  agentName: string
+  archivedAt: number
+  behavioralNotes: string[]
+  projectNotes: string[]
+  sessionSummaries: BrainMemoryEntry[]
+  lastDirective?: string
+}
+
 const DEFAULT_STORE: BrainMemoryStore = {
   entries: [],
+  agentEntries: {},
   projectNotes: {},
 }
 
 function getMemoryPath(): string {
   return resolve(process.cwd(), ".orchestrator-memory.json")
+}
+
+function getArchiveDir(): string {
+  return resolve(process.cwd(), ".orchestrator", "archives")
+}
+
+function ensureArchiveDir(): void {
+  try { mkdirSync(getArchiveDir(), { recursive: true }) } catch {}
+}
+
+function archivePath(agentName: string): string {
+  const safe = agentName.replace(/[^a-zA-Z0-9_-]/g, "_")
+  return resolve(getArchiveDir(), `${safe}.json`)
 }
 
 // Simple async write lock to prevent concurrent read-modify-write races
@@ -34,24 +62,71 @@ function withWriteLock<T>(fn: () => Promise<T>): Promise<T> {
   return next
 }
 
+// ---------------------------------------------------------------------------
+// Migration: flat entries[] → per-agent agentEntries{}
+// ---------------------------------------------------------------------------
+
+function migrateBrainMemory(store: BrainMemoryStore): BrainMemoryStore {
+  // Already migrated — agentEntries exists and entries is empty
+  if (store.agentEntries && Object.keys(store.agentEntries).length > 0 && store.entries.length === 0) {
+    return store
+  }
+  // Nothing to migrate
+  if (!store.entries || store.entries.length === 0) {
+    return { ...store, agentEntries: store.agentEntries ?? {} }
+  }
+  // Distribute entries into per-agent buckets
+  const agentEntries: Record<string, BrainMemoryEntry[]> = { ...(store.agentEntries ?? {}) }
+  for (const entry of store.entries) {
+    const agents = Object.keys(entry.agentLearnings)
+    if (agents.length === 0) {
+      // No agent attribution — put in _global
+      agentEntries["_global"] = [...(agentEntries["_global"] ?? []), entry]
+    } else {
+      for (const agent of agents) {
+        agentEntries[agent] = [...(agentEntries[agent] ?? []), entry]
+      }
+    }
+  }
+  // Cap each bucket at 20
+  for (const key of Object.keys(agentEntries)) {
+    agentEntries[key] = agentEntries[key]!.slice(-20)
+  }
+  return { ...store, entries: [], agentEntries }
+}
+
+// ---------------------------------------------------------------------------
+// Core load/save
+// ---------------------------------------------------------------------------
+
 export async function loadBrainMemory(): Promise<BrainMemoryStore> {
-  return readJsonFile<BrainMemoryStore>(getMemoryPath(), { ...DEFAULT_STORE, entries: [], projectNotes: {} })
+  const raw = await readJsonFile<BrainMemoryStore>(getMemoryPath(), { ...DEFAULT_STORE, entries: [], projectNotes: {} })
+  return migrateBrainMemory(raw)
 }
 
 export async function saveBrainMemory(store: BrainMemoryStore): Promise<void> {
   await writeJsonFile(getMemoryPath(), store)
 }
 
+// ---------------------------------------------------------------------------
+// Add entries / notes
+// ---------------------------------------------------------------------------
+
 export async function addMemoryEntry(
   _store: BrainMemoryStore,
   entry: BrainMemoryEntry,
+  agentName?: string,
 ): Promise<BrainMemoryStore> {
-  // Re-read from disk inside the lock to prevent concurrent write races
   return withWriteLock(async () => {
     const fresh = await loadBrainMemory()
+    const bucket = agentName || "_global"
+    const existing = fresh.agentEntries?.[bucket] ?? []
     const result: BrainMemoryStore = {
       ...fresh,
-      entries: [...fresh.entries, entry].slice(-50), // keep last 50 sessions
+      agentEntries: {
+        ...(fresh.agentEntries ?? {}),
+        [bucket]: [...existing, entry].slice(-20), // 20 per agent
+      },
     }
     await saveBrainMemory(result)
     return result
@@ -63,7 +138,6 @@ export async function addProjectNote(
   agentName: string,
   note: string,
 ): Promise<BrainMemoryStore> {
-  // Re-read from disk inside the lock to prevent concurrent write races
   return withWriteLock(async () => {
     const fresh = await loadBrainMemory()
     const notes = fresh.projectNotes[agentName] ?? []
@@ -71,7 +145,7 @@ export async function addProjectNote(
       ...fresh,
       projectNotes: {
         ...fresh.projectNotes,
-        [agentName]: [...notes, note].slice(-20), // keep last 20 notes per agent
+        [agentName]: [...notes, note].slice(-20),
       },
     }
     await saveBrainMemory(result)
@@ -79,15 +153,38 @@ export async function addProjectNote(
   })
 }
 
-/** Simple similarity check — returns true if two notes share enough keywords to be duplicates */
-function isSimilarNote(a: string, b: string, threshold = 0.6): boolean {
-  const wordsA = new Set(a.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(w => w.length > 3))
-  const wordsB = new Set(b.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(w => w.length > 3))
-  if (wordsA.size === 0 || wordsB.size === 0) return false
+/** Extract meaningful keywords from a note (>3 chars, lowercased, no numbers-only) */
+function extractKeywords(text: string): Set<string> {
+  return new Set(
+    text.toLowerCase()
+      .replace(/[^a-z0-9\s]/g, "")
+      .split(/\s+/)
+      .filter(w => w.length > 3 && !/^\d+$/.test(w))
+  )
+}
+
+/** Keyword overlap similarity — returns 0..1 */
+function keywordSimilarity(a: string, b: string): number {
+  const wordsA = extractKeywords(a)
+  const wordsB = extractKeywords(b)
+  if (wordsA.size === 0 || wordsB.size === 0) return 0
   let overlap = 0
   for (const w of wordsA) { if (wordsB.has(w)) overlap++ }
-  const similarity = overlap / Math.min(wordsA.size, wordsB.size)
-  return similarity >= threshold
+  return overlap / Math.min(wordsA.size, wordsB.size)
+}
+
+/** Check if two notes cover the same topic (e.g., both about non-responsiveness/restarts) */
+function isSameTopic(a: string, b: string): boolean {
+  if (keywordSimilarity(a, b) >= 0.6) return true
+  const categories = [
+    /non-responsive|empty.?response|unresponsive|zero output|restart/i,
+    /simple.?prompt|single.?action|one.?action|multi.?step/i,
+    /circuit.?breaker|restart.?cap|failed.?cycle/i,
+  ]
+  for (const pattern of categories) {
+    if (pattern.test(a) && pattern.test(b)) return true
+  }
+  return false
 }
 
 export async function addBehavioralNote(
@@ -98,15 +195,27 @@ export async function addBehavioralNote(
   return withWriteLock(async () => {
     const fresh = await loadBrainMemory()
     const notes = fresh.behavioralNotes?.[agentName] ?? []
-    // Deduplicate — skip if a similar note already exists
-    if (notes.some(existing => isSimilarNote(existing, note))) {
-      return fresh
+
+    const sameTopicIdx = notes.findIndex(existing => isSameTopic(existing, note))
+
+    let updated: string[]
+    if (sameTopicIdx !== -1) {
+      const existing = notes[sameTopicIdx]!
+      if (note.length >= existing.length) {
+        updated = [...notes]
+        updated[sameTopicIdx] = note
+      } else {
+        return fresh
+      }
+    } else {
+      updated = [...notes, note]
     }
+
     const result: BrainMemoryStore = {
       ...fresh,
       behavioralNotes: {
         ...(fresh.behavioralNotes ?? {}),
-        [agentName]: [...notes, note].slice(-10),
+        [agentName]: updated.slice(-10),
       },
     }
     await saveBrainMemory(result)
@@ -114,19 +223,42 @@ export async function addBehavioralNote(
   })
 }
 
-export function formatMemoryForPrompt(store: BrainMemoryStore): string {
+// ---------------------------------------------------------------------------
+// Format for LLM context
+// ---------------------------------------------------------------------------
+
+/**
+ * Format memory for LLM context.
+ * @param store — the full memory store
+ * @param agentName — if provided, only include notes for this agent
+ */
+export function formatMemoryForPrompt(store: BrainMemoryStore, agentName?: string): string {
   const lines: string[] = []
 
-  if (store.entries.length > 0) {
+  // Per-agent entries (new format) or fallback to legacy flat entries
+  const entries = agentName
+    ? (store.agentEntries?.[agentName] ?? store.entries.filter(e =>
+        e.objective.includes(agentName) || agentName in e.agentLearnings
+      ))
+    : mergeAllEntries(store)
+
+  if (entries.length > 0) {
     lines.push("## Previous Session Summaries (most recent first)")
-    const recent = store.entries.slice(-5).reverse()
+    const recent = entries.slice(-5).reverse()
     for (const entry of recent) {
       const date = new Date(entry.timestamp).toLocaleString()
       lines.push(`\n### ${date} — "${entry.objective}"`)
       lines.push(entry.summary)
-      for (const [agent, learnings] of Object.entries(entry.agentLearnings)) {
-        if (learnings.length > 0) {
-          lines.push(`  ${agent}: ${learnings.join("; ")}`)
+      if (agentName) {
+        const learnings = entry.agentLearnings[agentName]
+        if (learnings?.length) {
+          lines.push(`  ${agentName}: ${learnings.join("; ")}`)
+        }
+      } else {
+        for (const [agent, learnings] of Object.entries(entry.agentLearnings)) {
+          if (learnings.length > 0) {
+            lines.push(`  ${agent}: ${learnings.join("; ")}`)
+          }
         }
       }
     }
@@ -134,10 +266,13 @@ export function formatMemoryForPrompt(store: BrainMemoryStore): string {
 
   if (Object.keys(store.projectNotes).length > 0) {
     lines.push("\n## Project Notes")
-    for (const [agent, notes] of Object.entries(store.projectNotes)) {
+    const agentsToShow = agentName
+      ? [[agentName, store.projectNotes[agentName] ?? []] as const]
+      : Object.entries(store.projectNotes)
+    for (const [agent, notes] of agentsToShow) {
       if (notes.length > 0) {
         lines.push(`\n### ${agent}`)
-        for (const note of notes.slice(-10)) {
+        for (const note of notes.slice(-5)) {
           lines.push(`- ${note}`)
         }
       }
@@ -145,4 +280,128 @@ export function formatMemoryForPrompt(store: BrainMemoryStore): string {
   }
 
   return lines.length > 0 ? lines.join("\n") : ""
+}
+
+/** Merge all per-agent entries, sort by timestamp, return last 5 */
+function mergeAllEntries(store: BrainMemoryStore): BrainMemoryEntry[] {
+  const all: BrainMemoryEntry[] = []
+  for (const entries of Object.values(store.agentEntries ?? {})) {
+    all.push(...entries)
+  }
+  // Also include legacy entries if they exist
+  all.push(...(store.entries ?? []))
+  all.sort((a, b) => a.timestamp - b.timestamp)
+  // Deduplicate by timestamp+objective
+  const seen = new Set<string>()
+  const unique = all.filter(e => {
+    const key = `${e.timestamp}:${e.objective}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+  return unique.slice(-5)
+}
+
+// ---------------------------------------------------------------------------
+// Archive / Restore
+// ---------------------------------------------------------------------------
+
+/** Archive an agent's memory to a per-agent file and remove from active store */
+export async function archiveAgentMemory(
+  agentName: string,
+  lastDirective?: string,
+): Promise<void> {
+  return withWriteLock(async () => {
+    const store = await loadBrainMemory()
+    const archive: AgentMemoryArchive = {
+      agentName,
+      archivedAt: Date.now(),
+      behavioralNotes: store.behavioralNotes?.[agentName] ?? [],
+      projectNotes: store.projectNotes[agentName] ?? [],
+      sessionSummaries: store.agentEntries?.[agentName] ?? [],
+      lastDirective,
+    }
+    // Only write archive if there's something to save
+    if (archive.behavioralNotes.length || archive.projectNotes.length || archive.sessionSummaries.length) {
+      ensureArchiveDir()
+      await writeJsonFile(archivePath(agentName), archive)
+    }
+    // Remove agent data from active store
+    const { [agentName]: _bn, ...restBehavioral } = store.behavioralNotes ?? {}
+    const { [agentName]: _pn, ...restProject } = store.projectNotes
+    const { [agentName]: _ae, ...restEntries } = store.agentEntries ?? {}
+    const cleaned: BrainMemoryStore = {
+      entries: store.entries,
+      agentEntries: restEntries,
+      projectNotes: restProject,
+      behavioralNotes: restBehavioral,
+    }
+    await saveBrainMemory(cleaned)
+  })
+}
+
+/** Load an agent's archive. Returns null if none exists. */
+export async function loadAgentArchive(agentName: string): Promise<AgentMemoryArchive | null> {
+  const content = await readFileOrNull(archivePath(agentName))
+  if (!content) return null
+  try {
+    const archive = JSON.parse(content) as AgentMemoryArchive
+    if (!archive.agentName || !Array.isArray(archive.behavioralNotes)) return null
+    return archive
+  } catch {
+    return null
+  }
+}
+
+/** Check if an agent has an archived memory file */
+export async function hasAgentArchive(agentName: string): Promise<boolean> {
+  return (await loadAgentArchive(agentName)) !== null
+}
+
+/** Restore an agent's archived memory back into the active store and delete the archive file */
+export async function restoreAgentMemory(agentName: string): Promise<boolean> {
+  const archive = await loadAgentArchive(agentName)
+  if (!archive) return false
+  return withWriteLock(async () => {
+    const store = await loadBrainMemory()
+    const result: BrainMemoryStore = {
+      entries: store.entries,
+      agentEntries: {
+        ...(store.agentEntries ?? {}),
+        [agentName]: [...(store.agentEntries?.[agentName] ?? []), ...archive.sessionSummaries].slice(-20),
+      },
+      projectNotes: {
+        ...store.projectNotes,
+        [agentName]: [...(store.projectNotes[agentName] ?? []), ...archive.projectNotes].slice(-20),
+      },
+      behavioralNotes: {
+        ...(store.behavioralNotes ?? {}),
+        [agentName]: [...(store.behavioralNotes?.[agentName] ?? []), ...archive.behavioralNotes].slice(-10),
+      },
+    }
+    await saveBrainMemory(result)
+    // Delete the archive file after successful restore
+    try { const { unlinkSync } = await import("fs"); unlinkSync(archivePath(agentName)) } catch {}
+    return true
+  })
+}
+
+/** List all available archives */
+export async function listArchives(): Promise<Array<{ agentName: string; archivedAt: number; lastDirective?: string }>> {
+  try {
+    const { readdirSync } = await import("fs")
+    const files = readdirSync(getArchiveDir()).filter(f => f.endsWith(".json"))
+    const results: Array<{ agentName: string; archivedAt: number; lastDirective?: string }> = []
+    for (const file of files) {
+      const content = await readFileOrNull(resolve(getArchiveDir(), file))
+      if (!content) continue
+      try {
+        const archive = JSON.parse(content) as AgentMemoryArchive
+        results.push({ agentName: archive.agentName, archivedAt: archive.archivedAt, lastDirective: archive.lastDirective })
+      } catch {}
+    }
+    return results
+  } catch {
+    return []
+  }
 }

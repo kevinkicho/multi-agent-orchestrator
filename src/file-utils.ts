@@ -2,14 +2,20 @@ import { resolve, dirname } from "path"
 import { existsSync, mkdirSync, renameSync, unlinkSync } from "fs"
 
 /** Atomically write a file by writing to a temp path then renaming.
- *  Prevents corruption if the process crashes mid-write. */
+ *  Prevents corruption if the process crashes mid-write.
+ *  On Windows, renameSync fails if the target exists (unlike POSIX),
+ *  so we delete the target first. The window between unlink and rename
+ *  is unavoidable on Windows but is very short (~microseconds). */
 export async function atomicWrite(filePath: string, content: string): Promise<void> {
   const dir = dirname(filePath)
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
 
-  const tmpPath = filePath + `.tmp.${Date.now()}`
+  const tmpPath = filePath + `.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`
   try {
     await Bun.write(tmpPath, content)
+    // On Windows, rename over an existing file throws EPERM/EEXIST.
+    // Remove the target first so rename succeeds on all platforms.
+    try { unlinkSync(filePath) } catch {}
     renameSync(tmpPath, filePath)
   } catch (err) {
     // Clean up temp file on failure

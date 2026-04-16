@@ -7,11 +7,20 @@ import {
   formatMemoryForPrompt,
 } from "./brain-memory"
 import { extractLastAssistantText, formatRecentMessages, trimConversation } from "./message-utils"
+import { recordPrompt } from "./prompt-ledger"
+import { llmCall, parseModelRef, type LLMResponse } from "./providers"
+import {
+  type NudgeState, type CircuitBreakerState,
+  createNudgeState, resetNudge, createCircuitBreaker,
+  recordFailure, recordSuccess,
+  buildEmptyNudge, buildNoParseNudge, fuzzyExtractCommands,
+  BRAIN_COMMANDS, BRAIN_DEFAULT_CMD,
+} from "./command-recovery"
 
 export type BrainConfig = {
-  /** Ollama API base URL */
+  /** Ollama API base URL (legacy — used when model has no provider prefix) */
   ollamaUrl: string
-  /** Model to use for the orchestrator brain */
+  /** Model to use for the orchestrator brain. Can be "provider:model" or just "model" (defaults to ollama) */
   model: string
   /** The high-level objective the orchestrator should pursue */
   objective: string
@@ -53,6 +62,46 @@ Rules:
 - You may be given context from previous sessions — use it to avoid repeating work.
 `
 
+// ---------------------------------------------------------------------------
+// Model warmup — preload weights to avoid cold-start latency
+// ---------------------------------------------------------------------------
+
+const warmedModels = new Set<string>()
+
+/** Warm up an Ollama model by sending a minimal request to preload weights.
+ *  No-op if model was already warmed this session or if it's a cloud provider. */
+export async function warmupModel(ollamaUrl: string, model: string): Promise<void> {
+  const ref = parseModelRef(model)
+  if (ref.provider !== "ollama") return // only Ollama needs warmup
+  if (warmedModels.has(ref.model)) return
+
+  try {
+    // Use the /api/generate endpoint with a tiny prompt — this loads the model into memory
+    const res = await fetch(`${ollamaUrl}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: ref.model,
+        prompt: "hi",
+        stream: false,
+        options: { num_predict: 1 }, // generate exactly 1 token
+      }),
+      signal: AbortSignal.timeout(60_000), // 60s timeout for model loading
+    })
+    if (res.ok) {
+      warmedModels.add(ref.model)
+    }
+  } catch {
+    // Warmup failure is non-fatal — first real call will just be slower
+  }
+}
+
+/** Check if a model has been warmed up this session */
+export function isModelWarmed(model: string): boolean {
+  const ref = parseModelRef(model)
+  return warmedModels.has(ref.model)
+}
+
 // Cache model context sizes to avoid repeated API calls
 const modelInfoCache = new Map<string, { contextSize: number; fetchedAt: number }>()
 
@@ -91,31 +140,82 @@ async function getModelContextSize(ollamaUrl: string, model: string): Promise<nu
   return 0 // unknown
 }
 
+export type TokenUsage = { promptTokens?: number; completionTokens?: number; totalTokens?: number }
+
 export async function chatCompletion(
   ollamaUrl: string,
   model: string,
   messages: Message[],
+  opts?: { temperature?: number; maxTokens?: number; jsonMode?: boolean },
 ): Promise<string> {
-  // Adapt max_tokens based on model's context size
-  const contextSize = await getModelContextSize(ollamaUrl, model)
-  // Use ~1/4 of context for output, capped at 16384
-  const maxTokens = contextSize > 0 ? Math.min(Math.floor(contextSize / 4), 16384) : 16384
+  const result = await chatCompletionWithUsage(ollamaUrl, model, messages, opts)
+  return result.content
+}
 
-  // 5-minute timeout — prevents indefinite hangs if Ollama stalls mid-generation
+/** Like chatCompletion but also returns token usage stats */
+export async function chatCompletionWithUsage(
+  ollamaUrl: string,
+  model: string,
+  messages: Message[],
+  opts?: { temperature?: number; maxTokens?: number; jsonMode?: boolean },
+): Promise<{ content: string; usage?: TokenUsage }> {
+  const ref = parseModelRef(model)
+
+  // For Ollama provider, try dynamic context size detection
+  if (ref.provider === "ollama") {
+    const contextSize = await getModelContextSize(ollamaUrl, ref.model)
+    const maxTokens = opts?.maxTokens ?? (contextSize > 0 ? Math.min(Math.floor(contextSize / 4), 16384) : 16384)
+
+    try {
+      const result = await llmCall({
+        provider: ref.provider,
+        model: ref.model,
+        messages,
+        temperature: opts?.temperature,
+        maxTokens,
+        jsonMode: opts?.jsonMode,
+      })
+      return { content: result.content, usage: result.usage }
+    } catch (err) {
+      // Fallback: direct Ollama call if provider system fails (e.g., first run before providers.json exists)
+      const content = await directOllamaCall(ollamaUrl, ref.model, messages, opts?.temperature ?? 0.3, maxTokens, opts?.jsonMode)
+      return { content }
+    }
+  }
+
+  // Cloud provider — route through provider system
+  const result = await llmCall({
+    provider: ref.provider,
+    model: ref.model,
+    messages,
+    temperature: opts?.temperature,
+    maxTokens: opts?.maxTokens,
+    jsonMode: opts?.jsonMode,
+  })
+  return { content: result.content, usage: result.usage }
+}
+
+/** Direct Ollama call — fallback when provider system is unavailable */
+async function directOllamaCall(
+  ollamaUrl: string,
+  model: string,
+  messages: Message[],
+  temperature: number,
+  maxTokens: number,
+  jsonMode?: boolean,
+): Promise<string> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 300_000)
+
+  const body: Record<string, unknown> = { model, messages, temperature, max_tokens: maxTokens }
+  if (jsonMode) body.format = "json"
 
   let response: Response
   try {
     response = await fetch(`${ollamaUrl}/v1/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: 0.3,
-        max_tokens: maxTokens,
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     })
   } catch (err) {
@@ -128,18 +228,14 @@ export async function chatCompletion(
   clearTimeout(timeout)
 
   if (!response.ok) {
-    throw new Error(`Ollama API error: ${response.status} ${await response.text()}`)
+    const body = await response.text()
+    const err = new Error(`Ollama API error: ${response.status} ${body}`) as Error & { statusCode?: number }
+    err.statusCode = response.status
+    throw err
   }
 
-  type OllamaChatResponse = {
-    choices?: Array<{ message?: { content?: string } }>
-  }
-  let data: OllamaChatResponse
-  try {
-    data = await response.json() as OllamaChatResponse
-  } catch {
-    throw new Error(`Ollama returned invalid JSON (status ${response.status})`)
-  }
+  type OllamaChatResponse = { choices?: Array<{ message?: { content?: string } }> }
+  const data = await response.json() as OllamaChatResponse
   const content = data.choices?.[0]?.message?.content
   if (typeof content !== "string") {
     throw new Error(`Ollama returned unexpected response shape: ${JSON.stringify(data).slice(0, 200)}`)
@@ -235,6 +331,9 @@ export async function runBrain(
     { role: "user", content: initialContent },
   ]
 
+  // Warm up the model before first call
+  warmupModel(config.ollamaUrl, config.model).catch(() => {})
+
   config.onThinking?.(
     memoryContext
       ? "Brain started with memory from previous sessions. Thinking about initial plan..."
@@ -242,15 +341,30 @@ export async function runBrain(
   )
 
   let consecutiveLlmFailures = 0
+  const nudge = createNudgeState()
+  const circuitBreaker = createCircuitBreaker(5) // stop brain after 5 consecutive parse failures
 
   for (let round = 0; round < maxRounds; round++) {
     // Get LLM decision
     trimConversation(messages)
 
     let response: string
+    // Ledger: record brain outbound prompt
+    const lastMsg = messages[messages.length - 1]
+    if (lastMsg) {
+      recordPrompt({
+        source: "brain", target: "llm", direction: "outbound",
+        model: config.model, content: lastMsg.content,
+      }).catch(() => {})
+    }
     try {
       response = await chatCompletion(config.ollamaUrl, config.model, messages)
       consecutiveLlmFailures = 0
+      // Ledger: record brain inbound response
+      recordPrompt({
+        source: "brain", target: "brain", direction: "inbound",
+        model: config.model, content: response,
+      }).catch(() => {})
     } catch (err) {
       consecutiveLlmFailures++
       const retryDelay = Math.min(5000 * Math.pow(2, consecutiveLlmFailures - 1), 60_000)
@@ -261,19 +375,31 @@ export async function runBrain(
         response = await chatCompletion(config.ollamaUrl, config.model, messages)
         consecutiveLlmFailures = 0
       } catch (retryErr) {
-        config.onThinking?.(`LLM retry failed — stopping brain: ${retryErr}`)
+        config.onThinking?.(`LLM retry failed (failure #${consecutiveLlmFailures}): ${retryErr}`)
         if (consecutiveLlmFailures >= 3) {
-          config.onThinking?.(`Ollama persistently unreachable (${consecutiveLlmFailures} failures) — stopping brain`)
+          // Escalating backoff like supervisor: pause before next round
+          const pauseMs = Math.min(30_000 * consecutiveLlmFailures, 300_000)
+          config.onThinking?.(`Ollama persistently unreachable (${consecutiveLlmFailures} failures) — pausing ${pauseMs / 1000}s`)
+          await new Promise(r => setTimeout(r, pauseMs))
         }
-        break
+        if (consecutiveLlmFailures >= 5) {
+          config.onThinking?.(`Circuit breaker: ${consecutiveLlmFailures} consecutive LLM failures — stopping brain`)
+          break
+        }
+        continue // try again next round instead of hard-stopping
       }
     }
 
     if (!response) {
+      config.onThinking?.(`Brain empty response (round ${round + 1}), nudge level ${nudge.consecutiveEmpty + 1}`)
       messages.push({
         role: "user",
-        content: "Your previous response was empty. Please issue commands in a ```commands code block.",
+        content: buildEmptyNudge(nudge, BRAIN_COMMANDS, BRAIN_DEFAULT_CMD),
       })
+      if (recordFailure(circuitBreaker)) {
+        config.onThinking?.(`Circuit breaker: ${circuitBreaker.consecutiveFailures} consecutive empty/unparseable responses — stopping brain`)
+        break
+      }
       continue
     }
 
@@ -282,15 +408,36 @@ export async function runBrain(
     config.onThinking?.(`\n--- Brain (round ${round + 1}) ---\n${response}\n`)
 
     // Parse and execute commands
-    const commands = parseCommands(response)
+    let commands = parseCommands(response)
+
+    // Fuzzy recovery: try extracting commands from prose
     if (commands.length === 0) {
-      // LLM didn't issue commands — nudge it
+      const fuzzyLines = fuzzyExtractCommands(response, BRAIN_COMMANDS)
+      if (fuzzyLines.length > 0) {
+        const wrapped = "```commands\n" + fuzzyLines.join("\n") + "\n```"
+        commands = parseCommands(wrapped)
+        if (commands.length > 0) {
+          config.onThinking?.(`Recovered ${commands.length} command(s) from prose`)
+        }
+      }
+    }
+
+    if (commands.length === 0) {
+      config.onThinking?.(`Brain no-parse (round ${round + 1}), nudge level ${nudge.consecutiveNoParse + 1}`)
       messages.push({
         role: "user",
-        content: "Please issue commands in a ```commands code block. What would you like to do next?",
+        content: buildNoParseNudge(nudge, response, BRAIN_COMMANDS, BRAIN_DEFAULT_CMD),
       })
+      if (recordFailure(circuitBreaker)) {
+        config.onThinking?.(`Circuit breaker: ${circuitBreaker.consecutiveFailures} consecutive unparseable responses — stopping brain`)
+        break
+      }
       continue
     }
+
+    // Successful parse — reset escalation
+    resetNudge(nudge)
+    recordSuccess(circuitBreaker)
 
     const results: string[] = []
     let shouldWait = false
@@ -314,6 +461,11 @@ export async function runBrain(
             config.dashboardLog?.push({ type: "agent-prompt", agent: cmd.agent, text: cmd.message })
             await orchestrator.prompt(cmd.agent, cmd.message)
             results.push(`Sent to ${cmd.agent}: "${cmd.message.slice(0, 100)}..."`)
+            recordPrompt({
+              source: "brain", target: cmd.agent, direction: "outbound",
+              agentName: cmd.agent, model: config.model,
+              content: cmd.message,
+            }).catch(() => {})
           } catch (err) {
             results.push(`Error sending to ${cmd.agent}: ${err}`)
           }

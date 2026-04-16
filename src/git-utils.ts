@@ -1,0 +1,129 @@
+/**
+ * Shared git utilities — used by analytics (A/B testing), project-manager (branch isolation),
+ * and supervisor (false progress detection, resource contention).
+ */
+
+// ---------------------------------------------------------------------------
+// Core exec helper
+// ---------------------------------------------------------------------------
+
+export async function gitExec(cwd: string, ...args: string[]): Promise<string> {
+  // Flatten so callers can pass "status --porcelain" or "status", "--porcelain"
+  const flatArgs = args.flatMap(a => a.split(" ").filter(Boolean))
+  const proc = Bun.spawn(["git", ...flatArgs], { cwd, stdout: "pipe", stderr: "pipe" })
+  // Read stdout and stderr concurrently before awaiting exit
+  const [out, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ])
+  const code = await proc.exited
+  if (code !== 0) {
+    throw new Error(`git ${flatArgs[0]} failed (code ${code}): ${stderr.trim()}`)
+  }
+  return out.trim()
+}
+
+// ---------------------------------------------------------------------------
+// Diff helpers
+// ---------------------------------------------------------------------------
+
+export type GitDiffStat = {
+  filesChanged: string[]
+  summary: string
+  isEmpty: boolean
+}
+
+/** Get diff stat for uncommitted changes (staged + unstaged) */
+export async function gitDiffStat(cwd: string): Promise<GitDiffStat> {
+  // Check both staged and unstaged changes
+  const [unstaged, staged] = await Promise.all([
+    gitExec(cwd, "diff", "--stat").catch(() => ""),
+    gitExec(cwd, "diff", "--cached", "--stat").catch(() => ""),
+  ])
+  const summary = [unstaged, staged].filter(Boolean).join("\n")
+  const filesChanged: string[] = []
+
+  // Parse file names from --stat output (lines like " src/foo.ts | 5 +++--")
+  for (const line of summary.split("\n")) {
+    const match = line.match(/^\s*(.+?)\s*\|/)
+    if (match && match[1]) filesChanged.push(match[1].trim())
+  }
+
+  return { filesChanged, summary, isEmpty: filesChanged.length === 0 }
+}
+
+/** Get list of changed file paths (uncommitted: staged + unstaged) */
+export async function gitDiffNameOnly(cwd: string, base?: string): Promise<string[]> {
+  const args = base ? ["diff", "--name-only", base] : ["diff", "--name-only", "HEAD"]
+  let output: string
+  try {
+    output = await gitExec(cwd, ...args)
+  } catch {
+    // HEAD may not exist (first commit) — try without it
+    output = await gitExec(cwd, "diff", "--name-only")
+  }
+  // Also include staged changes
+  const staged = await gitExec(cwd, "diff", "--cached", "--name-only").catch(() => "")
+  const all = [output, staged].filter(Boolean).join("\n")
+  return all.split("\n").map(f => f.trim()).filter(Boolean)
+}
+
+// ---------------------------------------------------------------------------
+// Branch helpers
+// ---------------------------------------------------------------------------
+
+/** Get current branch name */
+export async function gitCurrentBranch(cwd: string): Promise<string> {
+  return gitExec(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+}
+
+/** Create and checkout a new branch */
+export async function gitCreateBranch(cwd: string, branchName: string, from?: string): Promise<void> {
+  if (from) {
+    await gitExec(cwd, "checkout", "-b", branchName, from)
+  } else {
+    await gitExec(cwd, "checkout", "-b", branchName)
+  }
+}
+
+/** Checkout an existing branch */
+export async function gitCheckout(cwd: string, branch: string): Promise<void> {
+  await gitExec(cwd, "checkout", branch)
+}
+
+/** Merge a branch into the current branch. Returns success status and output. */
+export async function gitMerge(cwd: string, branch: string): Promise<{ success: boolean; output: string }> {
+  try {
+    const output = await gitExec(cwd, "merge", branch)
+    return { success: true, output }
+  } catch (err) {
+    // Merge conflicts — abort the merge so the repo isn't left in a dirty state
+    await gitExec(cwd, "merge", "--abort").catch(() => {})
+    return { success: false, output: String(err) }
+  }
+}
+
+/** Delete a local branch (non-force — will fail if unmerged) */
+export async function gitDeleteBranch(cwd: string, branch: string): Promise<void> {
+  await gitExec(cwd, "branch", "-d", branch)
+}
+
+/** Force-delete a local branch (for cleanup) */
+export async function gitForceDeleteBranch(cwd: string, branch: string): Promise<void> {
+  await gitExec(cwd, "branch", "-D", branch)
+}
+
+// ---------------------------------------------------------------------------
+// Info helpers
+// ---------------------------------------------------------------------------
+
+/** Get latest commit as one-line summary */
+export async function gitLatestCommit(cwd: string): Promise<string> {
+  return gitExec(cwd, "log", "--oneline", "-1")
+}
+
+/** Check if working tree is clean (no uncommitted changes) */
+export async function gitIsClean(cwd: string): Promise<boolean> {
+  const output = await gitExec(cwd, "status", "--porcelain")
+  return output === ""
+}

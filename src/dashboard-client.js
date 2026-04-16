@@ -1855,6 +1855,8 @@ async function pollEvents() {
 pollEvents()
 
 // ---- LLM Providers ----
+var ollamaAvailableModels = [] // cached from /api/ollama-models
+
 async function refreshProviders() {
   try {
     const res = await apiFetch('/api/providers')
@@ -1864,25 +1866,59 @@ async function refreshProviders() {
       container.innerHTML = '<em style="color:#555;">No providers configured</em>'
       return
     }
+    // Pre-fetch Ollama models for the picker
+    try {
+      var modelsRes = await apiFetch('/api/ollama-models')
+      var modelsData = await modelsRes.json()
+      ollamaAvailableModels = (modelsData.models || []).map(function(m) { return m.name })
+    } catch (e) { ollamaAvailableModels = [] }
+
     const rows = data.providers.map(function(p) {
       var statusColor = p.enabled ? '#10b981' : '#666'
       var statusText = p.enabled ? 'ON' : 'OFF'
       var keyStatus = p.hasKey ? '<span style="color:#10b981;">key set</span>' : '<span style="color:#ef4444;">no key</span>'
-      if (p.id === 'ollama') keyStatus = '<span style="color:#888;">n/a</span>'
-      var models = p.models.length > 0 ? p.models.slice(0, 4).join(', ') + (p.models.length > 4 ? '...' : '') : '(none)'
-      return '<div style="padding:6px 0;border-bottom:1px solid #1a1a2e;display:flex;align-items:center;gap:8px;">' +
+      if (p.id === 'ollama') keyStatus = '<span style="color:#888;">local</span>'
+      var models = p.models.length > 0 ? p.models.join(', ') : '(none)'
+      var urlLabel = p.baseUrl ? '<span style="color:#555;font-size:9px;" title="' + escapeHtml(p.baseUrl) + '">' + escapeHtml(p.baseUrl.replace(/^https?:\/\//, '').replace(/\/$/, '')) + '</span>' : ''
+      // For Ollama: show a select dropdown; for others: text prompt
+      var addModelBtn = p.id === 'ollama'
+        ? '<select id="ollama-model-picker" onchange="addOllamaModel(this)" style="background:#0f0f1a;border:1px solid #666;color:#888;padding:1px 4px;font-size:9px;border-radius:3px;cursor:pointer;max-width:120px;">' +
+          '<option value="">+Model</option>' +
+          ollamaAvailableModels.filter(function(m) { return p.models.indexOf(m) === -1 }).map(function(m) {
+            return '<option value="' + escapeHtml(m) + '">' + escapeHtml(m) + '</option>'
+          }).join('') +
+          '</select>'
+        : '<button onclick="promptAddModel(\'' + p.id + '\')" style="background:none;border:1px solid #666;color:#888;padding:1px 6px;font-size:9px;border-radius:3px;cursor:pointer;">+Model</button>'
+      return '<div style="padding:6px 0;border-bottom:1px solid #1a1a2e;">' +
+        '<div style="display:flex;align-items:center;gap:8px;">' +
         '<button onclick="toggleProvider(\'' + p.id + '\',' + !p.enabled + ')" style="background:none;border:1px solid ' + statusColor + ';color:' + statusColor + ';padding:1px 6px;font-size:9px;border-radius:3px;cursor:pointer;min-width:28px;">' + statusText + '</button>' +
-        '<span style="color:#06b6d4;font-weight:bold;min-width:80px;">' + p.name + '</span>' +
+        '<span style="color:#06b6d4;font-weight:bold;min-width:80px;">' + escapeHtml(p.name) + '</span>' +
+        urlLabel +
         '<span style="color:#888;font-size:10px;">' + keyStatus + '</span>' +
-        '<span style="color:#aaa;font-size:10px;flex:1;">' + models + '</span>' +
         (p.id !== 'ollama' ? '<button onclick="promptApiKey(\'' + p.id + '\',\'' + p.name + '\')" style="background:none;border:1px solid #666;color:#888;padding:1px 6px;font-size:9px;border-radius:3px;cursor:pointer;">Key</button>' : '') +
-        '<button onclick="promptAddModel(\'' + p.id + '\')" style="background:none;border:1px solid #666;color:#888;padding:1px 6px;font-size:9px;border-radius:3px;cursor:pointer;">+Model</button>' +
+        addModelBtn +
+        '</div>' +
+        '<div style="color:#aaa;font-size:10px;margin-top:2px;padding-left:36px;">' + escapeHtml(models) + '</div>' +
         '</div>'
     }).join('')
     container.innerHTML = rows
   } catch (err) {
     document.getElementById('providers-list').innerHTML = '<em style="color:#ef4444;">Error: ' + err + '</em>'
   }
+}
+
+async function addOllamaModel(selectEl) {
+  var model = selectEl.value
+  if (!model) return
+  selectEl.value = '' // reset dropdown
+  try {
+    await apiFetch('/api/providers/ollama/models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: model })
+    })
+    refreshProviders()
+  } catch (err) { alert('Error: ' + err) }
 }
 
 async function toggleProvider(id, enabled) {

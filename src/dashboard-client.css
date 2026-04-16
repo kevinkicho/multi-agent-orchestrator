@@ -746,6 +746,7 @@ body.light .toast-info { background: #eff6ff; color: #2563eb; border-color: #256
 .brain-body {
   display: none;
   height: 180px;
+  overflow-y: auto;
 }
 .brain-section.open .brain-body { display: block; }
 .brain-log {

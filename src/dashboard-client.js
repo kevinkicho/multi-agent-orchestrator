@@ -13,14 +13,46 @@ function apiFetch(url, opts) {
 
 // Sidebar navigation
 function scrollToSection(id) {
-  const el = document.getElementById(id)
+  var el = document.getElementById(id)
   if (!el) return
-  // Open the section if it's collapsed
+  // If target is inside the admin drawer, open the drawer first
+  var drawer = document.getElementById('admin-drawer')
+  if (drawer && drawer.contains(el)) {
+    openAdminDrawer()
+    // Open the section if collapsed
+    if (el.classList.contains('brain-section') && !el.classList.contains('open')) {
+      el.classList.add('open')
+    }
+    setTimeout(function() { el.scrollIntoView({ behavior: 'smooth', block: 'start' }) }, 280)
+    return
+  }
+  // For projects-container or other main content
   if (el.classList.contains('brain-section') && !el.classList.contains('open')) {
     el.classList.add('open')
   }
   el.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
+
+function openAdminDrawer() {
+  document.getElementById('admin-drawer').classList.add('open')
+  document.getElementById('admin-drawer-overlay').classList.add('open')
+}
+
+function closeAdminDrawer() {
+  document.getElementById('admin-drawer').classList.remove('open')
+  document.getElementById('admin-drawer-overlay').classList.remove('open')
+}
+
+// Escape key closes drawer
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') {
+    var drawer = document.getElementById('admin-drawer')
+    if (drawer && drawer.classList.contains('open')) {
+      closeAdminDrawer()
+      e.stopPropagation()
+    }
+  }
+})
 
 // Track project rows and their agent data
 const projectRows = {}  // keyed by agent name

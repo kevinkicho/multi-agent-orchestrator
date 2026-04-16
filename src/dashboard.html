@@ -67,8 +67,15 @@
     </div>
   </div>
 
-  <div class="resize-handle" id="resize-handle"></div>
-  <div class="brain-section open" id="brain-section" role="region" aria-label="Brain orchestrator">
+  <div class="admin-drawer-overlay" id="admin-drawer-overlay" onclick="closeAdminDrawer()"></div>
+  <div class="admin-drawer" id="admin-drawer">
+    <div class="admin-drawer-header">
+      <span style="color:#8b8bff;font-weight:600;font-size:13px;">Admin Panels</span>
+      <button onclick="closeAdminDrawer()" style="background:none;border:none;color:#888;cursor:pointer;font-size:18px;line-height:1;" title="Close drawer (Esc)">&times;</button>
+    </div>
+    <div class="admin-drawer-body">
+
+  <div class="brain-section" id="brain-section" role="region" aria-label="Brain orchestrator">
     <div class="brain-header" onclick="document.getElementById('brain-section').classList.toggle('open')" role="button" tabindex="0" aria-expanded="true" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click()}">
       <h2><span class="brain-arrow" aria-hidden="true">&#9654;</span> Orchestrator Log</h2>
       <div style="display:flex;align-items:center;gap:8px;" onclick="event.stopPropagation()">
@@ -164,7 +171,7 @@
       <h2><span class="brain-arrow" aria-hidden="true">&#9654;</span> LLM Providers</h2>
       <button class="toolbar-btn" onclick="event.stopPropagation();refreshProviders()" style="font-size:10px;">Refresh</button>
     </div>
-    <div class="brain-body" style="height:auto;max-height:400px;">
+    <div class="brain-body">
       <div style="padding:8px 12px;">
         <div id="providers-list" style="font-size:11px;color:#aaa;">
           <em style="color:#555;">Click Refresh to load providers</em>
@@ -292,6 +299,9 @@
       </div>
     </div>
   </div>
+
+    </div><!-- end admin-drawer-body -->
+  </div><!-- end admin-drawer -->
 
   <!-- A/B Test Modal -->
   <div id="ab-test-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:1000;align-items:center;justify-content:center;">

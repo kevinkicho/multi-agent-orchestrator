@@ -260,10 +260,10 @@ body.light .sidebar-link { color: #666; }
 body.light .sidebar-link:hover { background: #ddd; color: #222; }
 
 /* Offset main content for sidebar */
-header, .projects-container, .brain-section, .resize-handle, .cmd-bar, .cmd-palette { margin-left: 44px; }
+header, .projects-container, .resize-handle, .cmd-bar, .cmd-palette { margin-left: 44px; }
 @media (max-width: 600px) {
   .sidebar { display: none; }
-  header, .projects-container, .brain-section, .resize-handle, .cmd-bar, .cmd-palette { margin-left: 0; }
+  header, .projects-container, .resize-handle, .cmd-bar, .cmd-palette { margin-left: 0; }
 }
 
 /* Annotation feedback popup */
@@ -713,7 +713,47 @@ body.light .toast-info { background: #eff6ff; color: #2563eb; border-color: #256
 .perm-deny:hover { background: #4a2a2a; }
 .perm-resolved-text { font-size: 11px; font-weight: 600; }
 
-/* Brain panel — collapsible at bottom */
+/* Admin drawer — slides from right, contains all admin panels */
+.admin-drawer-overlay {
+  display: none;
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.4);
+  z-index: 900;
+}
+.admin-drawer-overlay.open { display: block; }
+.admin-drawer {
+  position: fixed;
+  top: 0; right: 0; bottom: 0;
+  width: 480px;
+  max-width: 90vw;
+  background: #0d0d16;
+  border-left: 2px solid #2a2a3a;
+  z-index: 901;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.25s ease;
+}
+.admin-drawer.open { transform: translateX(0); }
+.admin-drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid #2a2a3a;
+  background: #12121a;
+  flex-shrink: 0;
+}
+.admin-drawer-body {
+  flex: 1;
+  overflow-y: auto;
+}
+body.light .admin-drawer { background: #f5f5fa; border-color: #ccc; }
+body.light .admin-drawer-header { background: #eee; border-color: #ccc; }
+body.light .admin-drawer-overlay.open { background: rgba(0,0,0,0.2); }
+
+/* Brain panel — collapsible sections inside admin drawer */
 .brain-section {
   flex-shrink: 0;
   border-top: 2px solid #8b8bff;
@@ -745,7 +785,7 @@ body.light .toast-info { background: #eff6ff; color: #2563eb; border-color: #256
 .brain-section.open .brain-arrow { transform: rotate(90deg); }
 .brain-body {
   display: none;
-  height: 180px;
+  max-height: 400px;
   overflow-y: auto;
 }
 .brain-section.open .brain-body { display: block; }
@@ -1073,7 +1113,7 @@ body.light .toast-info { background: #eff6ff; color: #2563eb; border-color: #256
   .agent-badge { font-size: 8px; padding: 1px 5px; }
   .project-row-remove { font-size: 9px; padding: 2px 6px; }
   .panel-log { font-size: 11px; padding: 4px 6px; }
-  .brain-body { height: 120px !important; }
+  .brain-body { max-height: 300px !important; }
   .brain-log { font-size: 11px; }
   .cmd-bar { padding: 0 8px; gap: 4px; }
   .cmd-bar input { font-size: 12px; }

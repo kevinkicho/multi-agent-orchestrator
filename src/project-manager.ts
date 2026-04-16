@@ -1,7 +1,7 @@
 import { spawn, type Subprocess } from "bun"
 import { existsSync, readdirSync, statSync } from "fs"
 import { resolve, basename } from "path"
-import { homedir } from "os"
+import { homedir, platform } from "os"
 import type { Orchestrator } from "./orchestrator"
 import type { DashboardLog } from "./dashboard"
 import { runAgentSupervisor, type ValidationPreset } from "./supervisor"
@@ -12,6 +12,30 @@ import { gitExec, gitCurrentBranch, gitCreateBranch, gitCheckout, gitMerge, gitD
 import type { EventBus } from "./event-bus"
 import type { ResourceManager } from "./resource-manager"
 import { archiveAgentMemory, hasAgentArchive, restoreAgentMemory } from "./brain-memory"
+
+// ---------------------------------------------------------------------------
+// Process tree cleanup — kills a process and all its descendants
+// ---------------------------------------------------------------------------
+
+async function killProcessTree(pid: number): Promise<void> {
+  try {
+    if (platform() === "win32") {
+      // taskkill /T kills the entire process tree on Windows
+      const proc = spawn(["taskkill", "/F", "/T", "/PID", String(pid)], {
+        stdout: "ignore", stderr: "ignore",
+      })
+      await proc.exited
+    } else {
+      // On Unix, kill the process group (negative PID)
+      try { process.kill(-pid, "SIGKILL") } catch {
+        // Fallback: just kill the process itself
+        try { process.kill(pid, "SIGKILL") } catch {}
+      }
+    }
+  } catch {
+    // Process may already be dead — that's fine
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -344,7 +368,7 @@ export class ProjectManager {
       this.dashLog.push({ type: "brain-thinking", text: `Error adding ${projectName}: ${err}` })
       // Clean up
       const proc = this.processes.get(id)
-      if (proc) { proc.kill(); this.processes.delete(id) }
+      if (proc) { killProcessTree(proc.pid).catch(() => {}); this.processes.delete(id) }
       usedPorts.delete(port)
       throw err
     }
@@ -534,10 +558,10 @@ export class ProjectManager {
     // Remove from orchestrator
     this.orchestrator.removeAgent(project.agentName)
 
-    // Kill process and wait for it to actually exit so the port is released
+    // Kill process tree (agent + any child processes it spawned, e.g. dev servers)
     const proc = this.processes.get(projectId)
     if (proc) {
-      proc.kill()
+      await killProcessTree(proc.pid)
       // Give the process up to 5s to exit and release its port
       await Promise.race([proc.exited, new Promise((r) => setTimeout(r, 5_000))])
       this.processes.delete(projectId)
@@ -826,7 +850,7 @@ export class ProjectManager {
     this.autoRestartTimers.clear()
     this.hardStopAll()
     for (const proc of this.processes.values()) {
-      try { proc.kill() } catch {}
+      killProcessTree(proc.pid).catch(() => {})
     }
     this.processes.clear()
     usedPorts.clear()

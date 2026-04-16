@@ -142,6 +142,18 @@ async function getModelContextSize(ollamaUrl: string, model: string): Promise<nu
 
 export type TokenUsage = { promptTokens?: number; completionTokens?: number; totalTokens?: number }
 
+/**
+ * Strip reasoning/think tags that some models (e.g. glm-5.1) leak into output.
+ * Removes the tags and any content wrapped inside <think>...</think> blocks.
+ */
+function stripThinkTags(text: string): string {
+  // First remove <think>...</think> blocks (reasoning content)
+  let cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, "")
+  // Then strip any orphaned opening/closing tags
+  cleaned = cleaned.replace(/<\/?think>/gi, "")
+  return cleaned.trim()
+}
+
 export async function chatCompletion(
   ollamaUrl: string,
   model: string,
@@ -149,7 +161,7 @@ export async function chatCompletion(
   opts?: { temperature?: number; maxTokens?: number; jsonMode?: boolean },
 ): Promise<string> {
   const result = await chatCompletionWithUsage(ollamaUrl, model, messages, opts)
-  return result.content
+  return stripThinkTags(result.content)
 }
 
 /** Like chatCompletion but also returns token usage stats */

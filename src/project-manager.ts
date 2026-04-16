@@ -1,6 +1,7 @@
 import { spawn, type Subprocess } from "bun"
 import { existsSync, readdirSync, statSync } from "fs"
 import { resolve, basename } from "path"
+import { homedir } from "os"
 import type { Orchestrator } from "./orchestrator"
 import type { DashboardLog } from "./dashboard"
 import { runAgentSupervisor, type ValidationPreset } from "./supervisor"
@@ -142,10 +143,21 @@ export function listDirectories(dirPath: string): Array<{ name: string; path: st
 // ProjectManager
 // ---------------------------------------------------------------------------
 
-// Resolve opencode location — override with OPENCODE_DIR env var if the monorepo layout differs
-const OPENCODE_DIR = process.env.OPENCODE_DIR
-  ? resolve(process.env.OPENCODE_DIR)
-  : resolve(import.meta.dirname, "..", "..", "opencode")
+// Resolve opencode location — override with OPENCODE_DIR env var, or auto-detect from common locations
+function findOpencodeDir(): string {
+  if (process.env.OPENCODE_DIR) return resolve(process.env.OPENCODE_DIR)
+  const candidates = [
+    resolve(import.meta.dirname, "..", "..", "opencode"),                          // sibling to orchestrator
+    resolve(import.meta.dirname, "..", "..", "opencode", "packages", "opencode"),  // monorepo layout
+    resolve(homedir(), "Desktop", "opencode", "packages", "opencode"),            // Desktop monorepo
+    resolve(homedir(), "Desktop", "opencode"),                                     // Desktop flat
+  ]
+  for (const dir of candidates) {
+    if (existsSync(resolve(dir, "src", "index.ts"))) return dir
+  }
+  return candidates[0]! // fall back to sibling (will error with clear message later)
+}
+const OPENCODE_DIR = findOpencodeDir()
 const OPENCODE_ENTRY = resolve(OPENCODE_DIR, "src", "index.ts")
 const PROJECTS_FILE = "orchestrator-projects.json"
 
@@ -807,18 +819,6 @@ export class ProjectManager {
   }
 
   /** Load previously saved projects (for restore on startup) */
-  async loadSavedProjects(): Promise<Array<{ name: string; directory: string; directive: string; model?: string; directiveHistory?: DirectiveHistoryEntry[] }>> {
-    const paths = [
-      resolve(process.cwd(), PROJECTS_FILE),
-      resolve(import.meta.dirname, "..", PROJECTS_FILE),
-    ]
-    for (const p of paths) {
-      const data = await readJsonFile<SavedProjects | null>(p, null)
-      if (data) return data.projects ?? []
-    }
-    return []
-  }
-
   /** Shut down everything — kills all child processes and waits for port release */
   shutdown() {
     // Cancel all pending auto-restart timers

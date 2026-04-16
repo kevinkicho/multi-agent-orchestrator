@@ -1625,13 +1625,8 @@ async function loadBrowse(path) {
   }
 }
 
-// Check for crash info and saved projects on startup
-let savedProjectsCache = []
-let crashInfo = null
-
-// Fetch crash info first, then saved projects
+// Check for crash info on startup
 fetch('/api/crash-info').then(r => r.ok ? r.json() : null).then(data => {
-  crashInfo = data
   if (data && data.crashed && data.state) {
     const sv = data.state.supervisors || {}
     const svNames = Object.keys(sv)
@@ -1660,7 +1655,6 @@ fetch('/api/crash-info').then(r => r.ok ? r.json() : null).then(data => {
       }
     }
     html += '</div>'
-    html += '<div style="margin-top:8px;"><span style="cursor:pointer;color:#8b8bff;text-decoration:underline;font-weight:600;font-size:11px;" onclick="openRestoreModal()">Restore projects to resume</span></div>'
     banner.innerHTML = html
     appendToLog(brainLog, banner)
     // Open brain panel so the crash banner is visible
@@ -1669,102 +1663,6 @@ fetch('/api/crash-info').then(r => r.ok ? r.json() : null).then(data => {
     }
   }
 }).catch(() => {})
-
-fetch('/api/saved-projects').then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json() }).then(saved => {
-  savedProjectsCache = saved || []
-  if (savedProjectsCache.length > 0) {
-    // Show restore buttons
-    const restoreBtn = document.getElementById('restore-btn')
-    if (restoreBtn) restoreBtn.style.display = ''
-    const emptyRestoreBtn = document.getElementById('empty-restore-btn')
-    if (emptyRestoreBtn) emptyRestoreBtn.style.display = ''
-    // Also show a note in the brain log (only if no crash banner already shown)
-    if (Object.keys(projectRows).length === 0 && !crashInfo?.crashed) {
-      const entry = document.createElement('div')
-      entry.style.color = '#8b8bff'
-      entry.innerHTML = savedProjectsCache.length + ' saved project(s) found from previous session. <span style="cursor:pointer;text-decoration:underline;font-weight:600" onclick="openRestoreModal()">Click to restore</span>'
-      appendToLog(brainLog, entry)
-    }
-  }
-}).catch(() => {})
-
-const restoreModal = document.getElementById('restore-modal')
-window.openRestoreModal = async function() {
-  // Refresh saved projects list
-  try {
-    const res = await fetch('/api/saved-projects')
-    if (!res.ok) throw new Error('HTTP ' + res.status)
-    savedProjectsCache = await res.json() || []
-  } catch {}
-  const list = document.getElementById('restore-list')
-  if (savedProjectsCache.length === 0) {
-    list.innerHTML = '<div style="color:#888;padding:12px;">No saved projects found.</div>'
-    restoreModal.classList.add('open')
-    return
-  }
-  // Build checklist with project details — show missing directories
-  list.innerHTML = savedProjectsCache.map((p, i) => {
-    const dirShort = (p.directory || '').replace(/\\/g, '/').split('/').slice(-2).join('/')
-    const exists = p.directoryExists !== false
-    const disabledAttr = exists ? '' : ' disabled'
-    const checkedAttr = exists ? ' checked' : ''
-    const opacity = exists ? '' : 'opacity:0.5;'
-    return '<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 8px;border-bottom:1px solid #1a1a2a;cursor:pointer;' + opacity + '" onclick="this.querySelector(&#39;input&#39;).click()">'
-      + '<input type="checkbox"' + checkedAttr + disabledAttr + ' class="restore-check" data-idx="' + i + '" style="margin-top:3px;accent-color:#6366f1;" onclick="event.stopPropagation()">'
-      + '<div style="flex:1;min-width:0;">'
-      + '<div style="font-weight:600;color:#e0e0e0;">' + escapeHtml(p.name || dirShort)
-      + (exists ? '' : ' <span style="color:#ef4444;font-size:9px;font-weight:600;">DIRECTORY MISSING</span>') + '</div>'
-      + '<div style="font-size:10px;color:#666;margin-top:2px;word-break:break-all;">' + escapeHtml(p.directory) + '</div>'
-      + (p.directive ? '<div style="font-size:10px;color:#888;margin-top:4px;max-height:40px;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(p.directive.slice(0, 200)) + (p.directive.length > 200 ? '...' : '') + '</div>' : '')
-      + (p.model ? '<div style="font-size:10px;color:#6366f1;margin-top:2px;">Model: ' + escapeHtml(p.model) + '</div>' : '')
-      + '</div></label>'
-  }).join('')
-  restoreModal.classList.add('open')
-}
-window.closeRestoreModal = function() {
-  restoreModal.classList.remove('open')
-}
-window.selectAllRestore = function() {
-  const checks = document.querySelectorAll('.restore-check')
-  const allChecked = Array.from(checks).every(c => c.checked)
-  checks.forEach(c => { c.checked = !allChecked })
-}
-window.restoreSelected = async function() {
-  const checks = document.querySelectorAll('.restore-check')
-  const selected = Array.from(checks).filter(c => c.checked).map(c => savedProjectsCache[parseInt(c.dataset.idx)])
-  if (selected.length === 0) { alert('No projects selected.'); return }
-  const btn = document.getElementById('restore-submit')
-  btn.disabled = true
-  btn.textContent = 'Restoring ' + selected.length + '...'
-  removedAgents.clear()
-  let restored = 0
-  for (const proj of selected) {
-    try {
-      const res = await fetch('/api/projects', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(proj),
-      })
-      if (!res.ok) continue
-      const data = await res.json()
-      if (data.ok) restored++
-    } catch {}
-  }
-  btn.disabled = false
-  btn.textContent = 'Restore Selected'
-  closeRestoreModal()
-  checkEmptyState()
-  if (restored > 0) {
-    addLogEntry(brainLog, 'status', 'Restored ' + restored + ' project(s) from saved session.')
-  }
-  if (restored < selected.length) {
-    alert((selected.length - restored) + ' project(s) failed to restore. Check if the directories still exist.')
-  }
-}
-// Close modal on overlay click
-restoreModal.addEventListener('click', function(e) {
-  if (e.target === restoreModal) closeRestoreModal()
-})
 
 // Enter key in modal inputs submits the form
 document.getElementById('proj-dir').addEventListener('keydown', (e) => {

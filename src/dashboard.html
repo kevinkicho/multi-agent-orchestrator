@@ -27,7 +27,6 @@
     <div style="display:flex;align-items:center;gap:16px;">
       <h1>OpenCode Orchestrator</h1>
       <button class="add-project-btn" onclick="openAddProject()" aria-label="Add new project">+ Add Project</button>
-      <button class="add-project-btn" id="restore-btn" onclick="openRestoreModal()" style="background:#1a1a3a;border-color:#6366f1;color:#8b8bff;display:none;" aria-label="Restore saved projects">Restore Saved</button>
       <div class="status-bar" id="status-bar" role="status" aria-live="polite" aria-label="Agent status indicators"></div>
     </div>
     <nav class="toolbar" role="toolbar" aria-label="Dashboard controls">
@@ -44,7 +43,6 @@
       <h2>No projects yet</h2>
       <p>Add a project folder to get started. The orchestrator will spawn a worker agent and supervisor for each project automatically.</p>
       <button onclick="openAddProject()">+ Add Project</button>
-      <button id="empty-restore-btn" onclick="openRestoreModal()" style="margin-top:8px;background:#1a1a3a;border:1px solid #6366f1;color:#8b8bff;padding:8px 20px;border-radius:6px;cursor:pointer;display:none;">Restore Previous Session</button>
     </div>
   </div>
 
@@ -65,20 +63,6 @@
       <div class="modal-actions">
         <button class="modal-btn" onclick="closeAddProject()">Cancel</button>
         <button class="modal-btn primary" id="proj-submit" onclick="submitProject()">Add Project</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Restore Projects Modal -->
-  <div class="modal-overlay" id="restore-modal" role="dialog" aria-modal="true" aria-label="Restore saved projects">
-    <div class="modal" style="max-width:600px;">
-      <h2>Restore Saved Projects</h2>
-      <p style="font-size:11px;color:#888;margin-bottom:12px;">Select projects to restore from your last session. Directives and model settings are preserved.</p>
-      <div id="restore-list" style="max-height:400px;overflow-y:auto;"></div>
-      <div class="modal-actions" style="margin-top:12px;">
-        <button class="modal-btn" onclick="closeRestoreModal()">Cancel</button>
-        <button class="modal-btn" onclick="selectAllRestore()" style="color:#8b8bff;border-color:#6366f1;">Select All</button>
-        <button class="modal-btn primary" id="restore-submit" onclick="restoreSelected()">Restore Selected</button>
       </div>
     </div>
   </div>

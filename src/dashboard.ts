@@ -590,17 +590,6 @@ export async function startDashboard(
         return Response.json({ current: resolved, directories: dirs }, { headers: corsHeaders })
       }
 
-      // Saved projects (for restore) — includes directory existence check
-      if (url.pathname === "/api/saved-projects" && req.method === "GET") {
-        const pm = opts?.projectManager
-        if (!pm) return Response.json([], { headers: corsHeaders })
-        const { existsSync } = await import("fs")
-        const saved = (await pm.loadSavedProjects()).map(p => ({
-          ...p,
-          directoryExists: existsSync(p.directory),
-        }))
-        return Response.json(saved, { headers: corsHeaders })
-      }
 
       // --- Memory archive endpoints ---
 

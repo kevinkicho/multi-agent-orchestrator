@@ -203,6 +203,12 @@ IMPORTANT — CYCLE_DONE and STOP summaries must be specific and actionable:
 - GOOD: "Fixed SSRF vulnerability in ai-brief route. Agent now working on P1 test failures. 63/297 tests passing."
 - Include: what was accomplished, what's in progress, what's next
 
+IMPORTANT — Background processes and port management:
+- NEVER tell the agent to start servers with "&" (background). Background processes become zombies that leak ports.
+- Instead, tell the agent to start the server and run tests in ONE command, e.g.: "node server.js & sleep 2 && npx playwright test; kill %1"
+- Or use a test framework's built-in server startup (e.g., Playwright's webServer config)
+- If tests fail with ERR_CONNECTION_REFUSED, check if a server is already running before starting another
+
 Guidelines:
 - Be a thorough code reviewer — your agent is capable but benefits from oversight
 - Give specific feedback: file paths, function names, line numbers, code snippets
@@ -252,10 +258,14 @@ function isCommandLine(trimmed: string): boolean {
 function parseSupervisorCommands(response: string): SupervisorCommand[] {
   const commands: SupervisorCommand[] = []
 
-  const codeBlockMatch = response.match(/```commands?\n([\s\S]*?)```/)
+  // Strip LLM reasoning/think tags that some models (e.g. glm-5.1) leak into output.
+  // These tags appear mid-line and corrupt command parsing.
+  const cleaned = response.replace(/<\/?think>/gi, "\n")
+
+  const codeBlockMatch = cleaned.match(/```commands?\n([\s\S]*?)```/)
   const lines = codeBlockMatch
     ? codeBlockMatch[1]!.split("\n")
-    : response.split("\n")
+    : cleaned.split("\n")
 
   // Track the last PROMPT command so continuation lines can be appended
   let lastPrompt: { type: "prompt"; message: string } | null = null

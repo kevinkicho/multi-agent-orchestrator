@@ -26,8 +26,9 @@ const COMMAND_PREFIXES = [
 
 function parseSupervisorCommands(response: string): SupervisorCommand[] {
   const commands: SupervisorCommand[] = []
-  const codeBlockMatch = response.match(/```commands?\n([\s\S]*?)```/)
-  const lines = codeBlockMatch ? codeBlockMatch[1]!.split("\n") : response.split("\n")
+  const cleaned = response.replace(/<\/?think>/gi, "\n")
+  const codeBlockMatch = cleaned.match(/```commands?\n([\s\S]*?)```/)
+  const lines = codeBlockMatch ? codeBlockMatch[1]!.split("\n") : cleaned.split("\n")
 
   let lastPrompt: { type: "prompt"; message: string } | null = null
 
@@ -260,6 +261,55 @@ some random text
 WAIT`
     const cmds = parseSupervisorCommands(response)
     // "some random text" should be ignored, not appended to MESSAGES
+    expect(cmds).toHaveLength(2)
+    expect(cmds[0]!.type).toBe("messages")
+    expect(cmds[1]!.type).toBe("wait")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Think-tag stripping tests (LLM reasoning leaks)
+// ---------------------------------------------------------------------------
+
+describe("think-tag stripping", () => {
+  test("strips </think> tags between commands on same line", () => {
+    const cmds = parseSupervisorCommands("MESSAGES</think>PROMPT Do the thing</think>WAIT")
+    expect(cmds).toHaveLength(3)
+    expect(cmds[0]!.type).toBe("messages")
+    expect(cmds[1]!.type).toBe("prompt")
+    expect((cmds[1] as { type: "prompt"; message: string }).message).toBe("Do the thing")
+    expect(cmds[2]!.type).toBe("wait")
+  })
+
+  test("strips <think> and </think> wrapping reasoning text", () => {
+    const response = `<think>Let me analyze this</think>MESSAGES
+<think>The agent needs a restart</think>RESTART`
+    const cmds = parseSupervisorCommands(response)
+    expect(cmds).toHaveLength(2)
+    expect(cmds[0]!.type).toBe("messages")
+    expect(cmds[1]!.type).toBe("restart")
+  })
+
+  test("handles multiple </think> tags in complex LLM output", () => {
+    const response = `I'll check the agent.</think>MESSAGES</think>Let me review.</think>PROMPT List all files</think>WAIT`
+    const cmds = parseSupervisorCommands(response)
+    expect(cmds).toHaveLength(3)
+    expect(cmds[0]!.type).toBe("messages")
+    expect(cmds[1]!.type).toBe("prompt")
+    expect(cmds[2]!.type).toBe("wait")
+  })
+
+  test("think tags inside code block are also stripped", () => {
+    const response = "```commands\nMESSAGES</think>PROMPT Fix it\nWAIT\n```"
+    const cmds = parseSupervisorCommands(response)
+    expect(cmds).toHaveLength(3)
+    expect(cmds[0]!.type).toBe("messages")
+    expect(cmds[1]!.type).toBe("prompt")
+    expect(cmds[2]!.type).toBe("wait")
+  })
+
+  test("case-insensitive think tag stripping", () => {
+    const cmds = parseSupervisorCommands("MESSAGES</Think></THINK>WAIT")
     expect(cmds).toHaveLength(2)
     expect(cmds[0]!.type).toBe("messages")
     expect(cmds[1]!.type).toBe("wait")

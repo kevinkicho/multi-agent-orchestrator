@@ -9,8 +9,10 @@ import {
   agentListPermissions,
   agentReplyPermission,
   agentHealthCheck,
+  agentAbort,
 } from "./agent"
 import { subscribeToAgentEvents, type AgentEvent } from "./events"
+import { extractLastAssistantText } from "./message-utils"
 
 /** Events that are too noisy to surface by default */
 const FILTERED_EVENTS = new Set([
@@ -38,6 +40,8 @@ export type OrchestratorConfig = {
   pollInterval?: number
   /** Auto-approve all permission requests. Default: false */
   autoApprove?: boolean
+  /** Max time (ms) an agent can be busy before it's considered stuck. Default: 300000 (5 min) */
+  stuckThresholdMs?: number
   /** Callback when an agent needs a decision from the orchestrator */
   onPermissionRequest?: (agentName: string, permission: unknown) => Promise<"approve" | "deny">
   /** Callback for notable events only (filtered, no spam) */
@@ -48,6 +52,8 @@ export type OrchestratorConfig = {
   onStatusChange?: (agentName: string, status: string, detail?: string) => void
   /** Callback when an agent finishes processing and returns to idle */
   onAgentComplete?: (agentName: string, messages: unknown[]) => void
+  /** Callback when an agent is detected as stuck (busy too long with no progress) */
+  onAgentStuck?: (agentName: string, busyDurationMs: number) => void
 }
 
 export type Orchestrator = {
@@ -64,6 +70,10 @@ export type Orchestrator = {
   addAgent: (agentConfig: AgentConfig) => Promise<void>
   /** Remove an agent at runtime */
   removeAgent: (name: string) => void
+  /** Abort the current run on an agent (cancel whatever it's doing) */
+  abortAgent: (agentName: string) => Promise<void>
+  /** Restart an agent's session (abort + create fresh session) */
+  restartAgent: (agentName: string) => Promise<string>
   /** Gracefully shut down all connections */
   shutdown: () => void
 }
@@ -275,6 +285,51 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
     }
   }, healthInterval)
 
+  // Stuck agent detection — check every 30s for agents that have been busy too long
+  const stuckThreshold = config.stuckThresholdMs ?? 300_000 // 5 minutes default
+  let stuckTimer: ReturnType<typeof setInterval> | null = null
+  // Track last known message count per agent to detect "busy but no progress"
+  const lastMessageCounts = new Map<string, number>()
+  // Track consecutive empty responses per agent
+  const emptyResponseCounts = new Map<string, number>()
+
+  stuckTimer = setInterval(async () => {
+    for (const [name, agent] of agents) {
+      if (agent.status !== "busy" || !agent.busyStartTime) continue
+      const elapsed = Date.now() - agent.busyStartTime
+      if (elapsed < stuckThreshold) continue
+
+      // Check if agent has produced any new messages since last check
+      try {
+        const msgs = await agentGetMessages(agent)
+        const currentCount = msgs.length
+        const lastCount = lastMessageCounts.get(name) ?? currentCount
+        lastMessageCounts.set(name, currentCount)
+
+        if (currentCount === lastCount) {
+          // No new messages at all — classic stuck
+          config.onStatusChange?.(name, "stuck", `Busy for ${Math.round(elapsed / 1000)}s with no new messages`)
+          config.onAgentStuck?.(name, elapsed)
+        } else {
+          // Messages increased — but check if they're empty (agent responding with no content)
+          const lastText = extractLastAssistantText(msgs)
+          if (!lastText || lastText.trim().length === 0) {
+            const emptyCount = (emptyResponseCounts.get(name) ?? 0) + 1
+            emptyResponseCounts.set(name, emptyCount)
+            if (emptyCount >= 2) {
+              config.onStatusChange?.(name, "stuck", `Agent producing empty responses (${emptyCount} consecutive)`)
+              config.onAgentStuck?.(name, elapsed)
+            }
+          } else {
+            emptyResponseCounts.set(name, 0)
+          }
+        }
+      } catch {
+        // agent might be unreachable
+      }
+    }
+  }, 30_000)
+
   // Poll for pending permissions (backup for any missed SSE events)
   const pollInterval = config.pollInterval ?? 2000
   pollTimer = setInterval(async () => {
@@ -362,14 +417,41 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
       // Abort SSE subscription for this agent
       const sub = eventAborts.get(name)
       if (sub) { sub.abort(); eventAborts.delete(name) }
-      // Clean up prompt queue
+      // Clean up prompt queue and stuck tracking
       promptQueues.delete(name)
+      lastMessageCounts.delete(name)
+      emptyResponseCounts.delete(name)
       config.onStatusChange?.(name, "disconnected", "Removed")
+    },
+
+    async abortAgent(agentName) {
+      const agent = agents.get(agentName)
+      if (!agent) throw new Error(`Unknown agent: ${agentName}`)
+      await agentAbort(agent)
+      agent.busyStartTime = null
+      lastMessageCounts.delete(agentName)
+      emptyResponseCounts.delete(agentName)
+      config.onStatusChange?.(agentName, "idle", "Aborted")
+    },
+
+    async restartAgent(agentName) {
+      const agent = agents.get(agentName)
+      if (!agent) throw new Error(`Unknown agent: ${agentName}`)
+      // Abort current work
+      try { await agentAbort(agent) } catch {}
+      agent.busyStartTime = null
+      lastMessageCounts.delete(agentName)
+      emptyResponseCounts.delete(agentName)
+      // Create fresh session
+      const sessionID = await agentCreateSession(agent)
+      config.onStatusChange?.(agentName, "idle", `Restarted, new session: ${sessionID}`)
+      return sessionID
     },
 
     shutdown() {
       if (pollTimer) clearInterval(pollTimer)
       if (healthTimer) clearInterval(healthTimer)
+      if (stuckTimer) clearInterval(stuckTimer)
       for (const sub of eventAborts.values()) sub.abort()
       eventAborts.clear()
       console.log("[orchestrator] Shut down")

@@ -15,7 +15,7 @@ export function extractLastAssistantText(messages: unknown[]): string | null {
 }
 
 /** Format recent messages into a readable summary for LLM context */
-export function formatRecentMessages(messages: unknown[], count = 4, maxLen = 1500): string[] {
+export function formatRecentMessages(messages: unknown[], count = 6, maxLen = 3000): string[] {
   const recent = messages.slice(-count)
   const formatted: string[] = []
   for (const msg of recent) {

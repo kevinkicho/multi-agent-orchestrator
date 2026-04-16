@@ -6,3 +6,5 @@ nul/
 .orchestrator-memory.json
 orchestrator-projects.json
 orchestrator-tasks.json
+orchestrator-performance.json
+orchestrator-performance-archive/

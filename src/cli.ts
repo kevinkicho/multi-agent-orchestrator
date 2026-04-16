@@ -223,9 +223,40 @@ async function main() {
       console.log(`\n[PERM] ${agentName} requests permission:`, JSON.stringify(permission, null, 2))
       return "approve"
     },
+
+    onAgentStuck(agentName, busyDurationMs) {
+      const mins = Math.round(busyDurationMs / 60_000)
+      console.log(`\n[STUCK] ${agentName} has been busy for ${mins}min with no new messages`)
+      dashLog.push({
+        type: "agent-status",
+        agent: agentName,
+        status: "stuck",
+        detail: `Busy for ${mins}min with no progress`,
+      })
+      // Auto-fetch latest messages for debugging (orchestrator is available via closure after init)
+      if (lazyOrchestrator) {
+        ;(async () => {
+          try {
+            const msgs = await lazyOrchestrator!.getMessages(agentName)
+            const lastText = extractLastAssistantText(msgs)
+            if (lastText) {
+              dashLog.push({
+                type: "agent-response",
+                agent: agentName,
+                text: `[AUTO-CAPTURED — agent stuck] ${lastText.slice(0, 2000)}`,
+              })
+            }
+          } catch {}
+        })()
+      }
+    },
   }
 
+  // Lazy ref so onAgentStuck can access the orchestrator after initialization
+  let lazyOrchestrator: Awaited<ReturnType<typeof createOrchestrator>> | null = null
+
   const orchestrator = await createOrchestrator(config)
+  lazyOrchestrator = orchestrator
 
   // ProjectManager — handles dynamic agent provisioning from the dashboard
   const projectManager = new ProjectManager(orchestrator, dashLog, brainConfig)

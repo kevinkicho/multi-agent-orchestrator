@@ -5,9 +5,11 @@ import {
   loadBrainMemory,
   addMemoryEntry,
   addProjectNote,
+  addBehavioralNote,
   formatMemoryForPrompt,
 } from "./brain-memory"
 import { extractLastAssistantText, formatRecentMessages } from "./message-utils"
+import { logPerformance } from "./performance-log"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -46,6 +48,12 @@ export type AgentSupervisorConfig = {
   signal?: AbortSignal
   /** Mutable soft-stop flag */
   softStop?: { requested: boolean }
+  /** Callback when supervisor updates the directive */
+  onDirectiveUpdate?: (newDirective: string) => void
+  /** Callback when supervisor stops with a failure (for escalation) */
+  onSupervisorStop?: (agentName: string, summary: string, isFailure: boolean) => void
+  /** Callback to get unread user comments on the directive */
+  getUnreadComments?: () => string[]
 }
 
 export type ParallelSupervisorsConfig = {
@@ -67,22 +75,30 @@ export type ParallelSupervisorsConfig = {
 // System prompt — focused on a single agent/project
 // ---------------------------------------------------------------------------
 
-function buildSupervisorPrompt(agentName: string, directory: string, reviewEnabled: boolean, hasReviewer: boolean): string {
+function buildSupervisorPrompt(agentName: string, directory: string, reviewEnabled: boolean, hasReviewer: boolean, behavioralNotes: string[]): string {
   const reviewCmd = reviewEnabled
     ? `  REVIEW                    — ${hasReviewer ? "Send work to the dedicated reviewer agent" : "Ask your agent to critically self-review its recent changes"}\n`
+    : ""
+
+  const behavioralSection = behavioralNotes.length > 0
+    ? `\n## IMPORTANT — Agent Behavioral Notes (from previous cycles)\n${behavioralNotes.map(n => `- ${n}`).join("\n")}\nApply these lessons when interacting with your agent.\n`
     : ""
 
   return `You are a dedicated supervisor for a single AI coding agent working on a software project.
 
 Agent: ${agentName}
 Project: ${directory}
-
+${behavioralSection}
 You can issue these commands (one per line, in a \`\`\`commands code block):
 
   PROMPT <message>          — Send a task, question, or feedback to your agent
   WAIT                      — Wait for your agent to finish its current work
   MESSAGES                  — Read your agent's recent conversation
-${reviewCmd}  NOTE <text>               — Save a persistent note about this project
+${reviewCmd}  RESTART                   — Restart the agent's session (use when agent is stuck, unresponsive, or in a bad state)
+  ABORT                     — Cancel whatever the agent is currently doing
+  NOTE <text>               — Save a persistent note about this project
+  NOTE_BEHAVIOR <text>      — Save a behavioral note about how this agent works best (injected into future system prompts)
+  DIRECTIVE <text>          — Update the project directive (evolves as project progresses)
   CYCLE_DONE <summary>      — End this supervision cycle (a new one starts after a pause)
   STOP <summary>            — Permanently stop supervising this agent
 
@@ -94,13 +110,27 @@ Each cycle you should:
 ${reviewEnabled ? "5. Use REVIEW after significant changes to catch issues the agent may have missed\n" : ""}6. Save NOTEs about important project state for future cycles
 7. Issue CYCLE_DONE with a summary when you've reviewed everything and the agent has direction
 
+IMPORTANT — if the agent appears stuck (busy for a long time with no output, or not executing commands):
+- First try ABORT to cancel its current work
+- If still unresponsive after a new PROMPT, use RESTART to get a fresh session
+- Save a NOTE_BEHAVIOR about what caused the agent to get stuck so future cycles avoid it
+- Do NOT issue 5+ prompts to a stuck agent — escalate with RESTART after 2-3 failed attempts
+
+IMPORTANT — CYCLE_DONE and STOP summaries must be specific and actionable:
+- BAD: "Cycle completed." / "Done." / "ANALYZING AND START FIXING"
+- GOOD: "Fixed SSRF vulnerability in ai-brief route. Agent now working on P1 test failures. 63/297 tests passing."
+- Include: what was accomplished, what's in progress, what's next
+
 Guidelines:
 - Be a thorough code reviewer — your agent is capable but benefits from oversight
 - Give specific feedback: file paths, function names, line numbers, code snippets
 - Don't micromanage — describe WHAT needs to happen, let the agent decide HOW
-- If the agent is stuck or producing poor results, try rephrasing the task
+- If the agent is stuck or producing poor results, try ABORT then rephrase the task
+- If the agent is completely unresponsive, use RESTART — don't keep prompting a dead agent
 - Prioritize: bugs > missing features > code quality > polish
 - Track project progress with NOTEs so you remember across cycles
+- Use NOTE_BEHAVIOR for agent-specific lessons (e.g., "keep prompts to one action at a time")
+- Use DIRECTIVE to update the project direction as phases complete
 - You manage ONLY this one agent — focus all your attention on this project
 `
 }
@@ -114,7 +144,11 @@ type SupervisorCommand =
   | { type: "wait" }
   | { type: "messages" }
   | { type: "review" }
+  | { type: "restart" }
+  | { type: "abort" }
   | { type: "note"; text: string }
+  | { type: "note_behavior"; text: string }
+  | { type: "directive"; text: string }
   | { type: "cycle_done"; summary: string }
   | { type: "stop"; summary: string }
 
@@ -138,8 +172,16 @@ function parseSupervisorCommands(response: string): SupervisorCommand[] {
       commands.push({ type: "messages" })
     } else if (trimmed === "REVIEW") {
       commands.push({ type: "review" })
+    } else if (trimmed === "RESTART") {
+      commands.push({ type: "restart" })
+    } else if (trimmed === "ABORT") {
+      commands.push({ type: "abort" })
+    } else if (trimmed.startsWith("NOTE_BEHAVIOR ")) {
+      commands.push({ type: "note_behavior", text: trimmed.slice(14) })
     } else if (trimmed.startsWith("NOTE ")) {
       commands.push({ type: "note", text: trimmed.slice(5) })
+    } else if (trimmed.startsWith("DIRECTIVE ")) {
+      commands.push({ type: "directive", text: trimmed.slice(10) })
     } else if (trimmed.startsWith("CYCLE_DONE")) {
       commands.push({ type: "cycle_done", summary: trimmed.slice(10).trim() || "Cycle completed." })
     } else if (trimmed.startsWith("STOP")) {
@@ -157,7 +199,7 @@ function parseSupervisorCommands(response: string): SupervisorCommand[] {
 /** Trim conversation to stay within model context limits.
  *  Keeps the system prompt (index 0) and the most recent messages.
  *  Inserts a summary marker so the LLM knows context was trimmed. */
-function trimConversation(messages: Message[], maxMessages = 40): void {
+function trimConversation(messages: Message[], maxMessages = 60): void {
   if (messages.length <= maxMessages) return
   // Keep system prompt + last (maxMessages - 2) messages + a summary marker
   const keep = maxMessages - 2
@@ -208,16 +250,19 @@ export async function runAgentSupervisor(
   const {
     agentName,
     directory,
-    directive,
     ollamaUrl,
     model,
     reviewEnabled = true,
     reviewerAgent,
   } = config
-  const cyclePause = (config.cyclePauseSeconds ?? 30) * 1000
+  let directive = config.directive
+  const baseCyclePause = (config.cyclePauseSeconds ?? 30) * 1000
+  let cyclePause = baseCyclePause
   const maxRoundsPerCycle = config.maxRoundsPerCycle ?? 30
   const hasReviewer = !!reviewerAgent
   let cycleCount = 0
+  let consecutiveEmptyResponses = 0
+  let consecutiveIdleCycles = 0 // tracks cycles where agent was idle/no work done
 
   const emit = (text: string) => {
     config.onThinking?.(text)
@@ -230,13 +275,18 @@ export async function runAgentSupervisor(
 
   emit(`Supervisor started for ${agentName}. Directive: "${directive}"`)
   emitStatus("running")
+  logPerformance({ timestamp: Date.now(), projectName: directory, agentName, model, event: "supervisor_start" })
 
   while (!config.signal?.aborted) {
     cycleCount++
+    const cycleStartTime = Date.now()
     emit(`\n===== ${agentName} — CYCLE ${cycleCount} =====\n`)
 
     let memory = loadBrainMemory()
     const memoryContext = formatMemoryForPrompt(memory)
+
+    // Extract behavioral notes for this agent to inject into system prompt
+    const behavioralNotes = (memory.behavioralNotes?.[agentName] ?? []).slice(-10)
 
     // Get agent status
     const statuses = await orchestrator.status()
@@ -245,14 +295,31 @@ export async function runAgentSupervisor(
       ? `Agent status: ${agentStatus.status} (session: ${agentStatus.sessionID ?? "none"})`
       : "Agent status: unknown"
 
+    // On first cycle, add resume context so the supervisor orients the agent
+    const projectNotes = memory.projectNotes[agentName] ?? []
+    const isResume = cycleCount === 1 && (projectNotes.length > 0 || memory.entries.length > 0)
+    const resumeBlock = isResume
+      ? `\n## RESUMING FROM PREVIOUS SESSION\nThis project was previously worked on. Before assigning new tasks:\n1. Use MESSAGES to check the agent's current state\n2. Review project notes below for context on what was done\n3. Ask the agent to run \`git status\` and \`git log --oneline -5\` to understand current state\n4. Orient the agent on where to pick up — don't repeat completed work\n${projectNotes.length > 0 ? `\nLatest project notes:\n${projectNotes.slice(-5).map(n => `- ${n}`).join("\n")}` : ""}`
+      : ""
+
+    // Check for unread user comments on the directive
+    const unreadComments = config.getUnreadComments?.() ?? []
+    const commentBlock = unreadComments.length > 0
+      ? `\n## User Feedback on Directive\nThe human user has left comments for you to review:\n${unreadComments.map(c => `> "${c}"`).join("\n")}\nPlease acknowledge this feedback and adjust your approach accordingly.`
+      : ""
+
     const initialContent = [
       statusLine,
       memoryContext ? `\n## Memory from Previous Cycles\n${memoryContext}` : "",
+      resumeBlock,
+      commentBlock,
       `\nDirective: ${directive}`,
-      `\nThis is supervision cycle #${cycleCount}. Check in with your agent, review their work, and keep them productive.`,
+      isResume
+        ? `\nThis is supervision cycle #${cycleCount} (resuming). Check the agent's current state before assigning work.`
+        : `\nThis is supervision cycle #${cycleCount}. Check in with your agent, review their work, and keep them productive.`,
     ].filter(Boolean).join("\n")
 
-    const systemPrompt = buildSupervisorPrompt(agentName, directory, reviewEnabled, hasReviewer)
+    const systemPrompt = buildSupervisorPrompt(agentName, directory, reviewEnabled, hasReviewer, behavioralNotes)
     const messages: Message[] = [
       { role: "system", content: systemPrompt },
       { role: "user", content: initialContent },
@@ -277,6 +344,10 @@ export async function runAgentSupervisor(
           response = await chatCompletion(ollamaUrl, model, messages)
         } catch (retryErr) {
           emit(`LLM retry failed — skipping to next cycle: ${retryErr}`)
+          logPerformance({
+            timestamp: Date.now(), projectName: directory, agentName, model,
+            event: "cycle_error", cycleNumber: cycleCount, details: String(retryErr),
+          })
           break
         }
       }
@@ -331,7 +402,7 @@ export async function runAgentSupervisor(
           case "messages": {
             try {
               const msgs = await orchestrator.getMessages(agentName)
-              const formatted = formatRecentMessages(msgs, 4, 1500)
+              const formatted = formatRecentMessages(msgs, 6, 3000)
               results.push(`Recent messages from ${agentName}:\n${formatted.join("\n\n")}`)
             } catch (err) {
               results.push(`Error reading messages: ${err}`)
@@ -388,13 +459,40 @@ Be specific with file paths, line numbers, and code snippets.`
             const reviewMsgs = await orchestrator.getMessages(targetAgent)
             const reviewText = extractLastAssistantText(reviewMsgs)
             if (reviewText) {
-              const truncated = reviewText.slice(0, 3000)
+              const truncated = reviewText.slice(0, 5000)
               results.push(`Review results from ${targetAgent}:\n${truncated}`)
               config.dashboardLog?.push({ type: "agent-response", agent: targetAgent, text: reviewText })
             } else {
               results.push("Review produced no output.")
             }
             emitStatus("running")
+            break
+          }
+
+          case "restart": {
+            emit(`Restarting ${agentName} session...`)
+            try {
+              const newSession = await orchestrator.restartAgent(agentName)
+              results.push(`Agent ${agentName} restarted successfully. New session: ${newSession}`)
+              emit(`Agent restarted. New session: ${newSession}`)
+              logPerformance({
+                timestamp: Date.now(), projectName: directory, agentName, model,
+                event: "restart", cycleNumber: cycleCount,
+              })
+            } catch (err) {
+              results.push(`Error restarting ${agentName}: ${err}`)
+            }
+            break
+          }
+
+          case "abort": {
+            emit(`Aborting ${agentName} current work...`)
+            try {
+              await orchestrator.abortAgent(agentName)
+              results.push(`Agent ${agentName} aborted. It is now idle.`)
+            } catch (err) {
+              results.push(`Error aborting ${agentName}: ${err}`)
+            }
             break
           }
 
@@ -405,7 +503,28 @@ Be specific with file paths, line numbers, and code snippets.`
             break
           }
 
+          case "note_behavior": {
+            memory = await addBehavioralNote(memory, agentName, cmd.text)
+            results.push(`Saved behavioral note: "${cmd.text}" — this will be injected into future system prompts.`)
+            emit(`Behavioral note saved: ${cmd.text}`)
+            break
+          }
+
+          case "directive": {
+            directive = cmd.text
+            config.onDirectiveUpdate?.(cmd.text)
+            results.push(`Directive updated to: "${cmd.text.slice(0, 150)}..."`)
+            emit(`Directive updated: ${cmd.text}`)
+            break
+          }
+
           case "cycle_done": {
+            // Summary validation — reject garbage summaries
+            if (cmd.summary.length < 20 || /^(cycle|done|completed|analyzing|working|start)/i.test(cmd.summary.trim())) {
+              results.push(`Your CYCLE_DONE summary is too vague: "${cmd.summary}". Please provide a specific summary: what was accomplished, what's in progress, what's next.`)
+              // Don't end the cycle — ask for a better summary
+              break
+            }
             cycleDone = true
             await addMemoryEntry(memory, {
               timestamp: Date.now(),
@@ -420,11 +539,23 @@ Be specific with file paths, line numbers, and code snippets.`
               agent: agentName,
               summary: cmd.summary,
             })
+            logPerformance({
+              timestamp: Date.now(), projectName: directory, agentName, model,
+              event: "cycle_complete", cycleNumber: cycleCount,
+              durationMs: Date.now() - cycleStartTime, summary: cmd.summary,
+            })
             break
           }
 
           case "stop": {
+            // Summary validation for STOP too
+            if (cmd.summary.length < 20) {
+              results.push(`Your STOP summary is too vague. Please explain why you are stopping and what needs to happen next.`)
+              break
+            }
             stopped = true
+            // Detect if this is a failure stop (mentions non-responsive, stuck, failure, cannot, etc.)
+            const isFailure = /non-responsive|stuck|fail|cannot|unable|broken|crash|unresponsive|dead/i.test(cmd.summary)
             await addMemoryEntry(memory, {
               timestamp: Date.now(),
               objective: `${agentName} supervisor: ${directive}`,
@@ -438,6 +569,20 @@ Be specific with file paths, line numbers, and code snippets.`
               agent: agentName,
               summary: `[FINAL] ${cmd.summary}`,
             })
+            // Escalate to project manager
+            config.onSupervisorStop?.(agentName, cmd.summary, isFailure)
+            logPerformance({
+              timestamp: Date.now(), projectName: directory, agentName, model,
+              event: "supervisor_stop", cycleNumber: cycleCount,
+              summary: cmd.summary, details: isFailure ? "failure" : "normal",
+            })
+            if (isFailure) {
+              config.dashboardLog?.push({
+                type: "supervisor-alert",
+                agent: agentName,
+                text: `SUPERVISOR STOPPED (failure): ${cmd.summary}`,
+              } as any)
+            }
             break
           }
         }
@@ -456,8 +601,42 @@ Be specific with file paths, line numbers, and code snippets.`
           const newMsgs = msgs.slice(messageCountBefore)
           const lastText = extractLastAssistantText(newMsgs)
           if (lastText) {
-            results.push(`${agentName} response:\n${lastText.slice(0, 2500)}`)
+            consecutiveEmptyResponses = 0
+            results.push(`${agentName} response:\n${lastText.slice(0, 5000)}`)
             config.dashboardLog?.push({ type: "agent-response", agent: agentName, text: lastText })
+          } else {
+            // Agent responded with empty content — track and escalate
+            consecutiveEmptyResponses++
+            emit(`WARNING: ${agentName} returned empty response (${consecutiveEmptyResponses} consecutive)`)
+
+            if (consecutiveEmptyResponses >= 3) {
+              // After 3 empties, restart the agent session
+              const emptyCount = consecutiveEmptyResponses
+              emit(`Agent ${agentName} has returned ${emptyCount} consecutive empty responses — restarting session...`)
+              try {
+                const newSession = await orchestrator.restartAgent(agentName)
+                consecutiveEmptyResponses = 0
+                results.push(`Agent was non-responsive (${emptyCount} empty responses). Session restarted: ${newSession}. Re-send your last task.`)
+                logPerformance({
+                  timestamp: Date.now(), projectName: directory, agentName, model,
+                  event: "restart", cycleNumber: cycleCount, details: "empty-response escalation",
+                })
+                await addBehavioralNote(memory, agentName, `Agent went non-responsive with empty outputs. Had to restart session. Consider simpler, single-action prompts.`)
+              } catch (err) {
+                results.push(`Agent non-responsive and restart failed: ${err}`)
+              }
+            } else if (consecutiveEmptyResponses >= 2) {
+              // After 2 empties, abort and retry
+              emit(`Aborting ${agentName} and retrying...`)
+              try {
+                await orchestrator.abortAgent(agentName)
+                results.push(`Agent returned empty. Aborted current work. Try rephrasing with a simpler, single-step command.`)
+              } catch (err) {
+                results.push(`Agent returned empty. Abort failed: ${err}`)
+              }
+            } else {
+              results.push(`Agent returned an empty response. This may indicate the agent is struggling with the task. Try breaking it into smaller steps or rephrasing.`)
+            }
           }
         } catch { /* ignore */ }
       }
@@ -469,6 +648,18 @@ Be specific with file paths, line numbers, and code snippets.`
     }
 
     if (stopped || config.signal?.aborted) break
+
+    // Dynamic cycle pause — adjust based on agent activity
+    if (consecutiveEmptyResponses > 0) {
+      // Agent struggling — back off to give it more time
+      consecutiveIdleCycles++
+      cyclePause = Math.min(baseCyclePause * Math.min(consecutiveIdleCycles + 1, 4), 120_000)
+      emit(`Agent responsiveness low — next cycle pause: ${Math.round(cyclePause / 1000)}s`)
+    } else {
+      // Agent productive — use shorter pause to keep momentum
+      consecutiveIdleCycles = 0
+      cyclePause = baseCyclePause
+    }
 
     // Check soft stop
     if (config.softStop?.requested) {

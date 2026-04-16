@@ -243,7 +243,7 @@ export async function startDashboard(
         const pm = opts?.projectManager
         if (!pm) return Response.json({ error: "Project manager not available" }, { status: 500, headers: corsHeaders })
         try {
-          const body = await req.json() as { directory: string; directive?: string; name?: string }
+          const body = await req.json() as { directory: string; directive?: string; name?: string; directiveHistory?: any[] }
           if (!body.directory?.trim()) {
             return Response.json({ error: "Directory is required" }, { status: 400, headers: corsHeaders })
           }
@@ -251,6 +251,7 @@ export async function startDashboard(
             body.directory.trim(),
             body.directive?.trim() || "Work on this project. Review the codebase, fix bugs, add features, and improve code quality.",
             body.name?.trim() || undefined,
+            body.directiveHistory || undefined,
           )
           return Response.json({ ok: true, project }, { headers: corsHeaders })
         } catch (err) {
@@ -270,6 +271,123 @@ export async function startDashboard(
         }
       }
 
+      // Update project directive
+      if (url.pathname.match(/^\/api\/projects\/[^/]+\/directive$/) && req.method === "PUT") {
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Project manager not available" }, { status: 500, headers: corsHeaders })
+        const projectId = url.pathname.split("/")[3]!
+        try {
+          const body = await req.json() as { directive: string }
+          if (!body.directive?.trim()) {
+            return Response.json({ error: "Directive is required" }, { status: 400, headers: corsHeaders })
+          }
+          pm.updateDirective(projectId, body.directive.trim())
+          // Restart supervisor with new directive
+          pm.restartSupervisor(projectId, body.directive.trim())
+          return Response.json({ ok: true }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ ok: false, error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // Get directive history for a project
+      if (url.pathname.match(/^\/api\/projects\/[^/]+\/directive-history$/) && req.method === "GET") {
+        const pm = opts?.projectManager
+        if (!pm) return Response.json([], { headers: corsHeaders })
+        const projectId = url.pathname.split("/")[3]!
+        return Response.json(pm.getDirectiveHistory(projectId), { headers: corsHeaders })
+      }
+
+      // Add a user comment on the directive (optionally on a specific history entry)
+      if (url.pathname.match(/^\/api\/projects\/[^/]+\/directive-comment$/) && req.method === "POST") {
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Project manager not available" }, { status: 500, headers: corsHeaders })
+        const projectId = url.pathname.split("/")[3]!
+        try {
+          const body = await req.json() as { comment: string; historyIndex?: number }
+          if (!body.comment?.trim()) {
+            return Response.json({ error: "Comment is required" }, { status: 400, headers: corsHeaders })
+          }
+          pm.addDirectiveComment(projectId, body.comment.trim(), body.historyIndex)
+          return Response.json({ ok: true }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ ok: false, error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // Restart an agent's session
+      if (url.pathname.match(/^\/api\/agents\/[^/]+\/restart$/) && req.method === "POST") {
+        const agentName = url.pathname.split("/")[3]!
+        try {
+          const newSession = await orchestrator.restartAgent(agentName)
+          return Response.json({ ok: true, sessionID: newSession }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ ok: false, error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // Abort an agent's current work
+      if (url.pathname.match(/^\/api\/agents\/[^/]+\/abort$/) && req.method === "POST") {
+        const agentName = url.pathname.split("/")[3]!
+        try {
+          await orchestrator.abortAgent(agentName)
+          return Response.json({ ok: true }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ ok: false, error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // Update project model
+      if (url.pathname.match(/^\/api\/projects\/[^/]+\/model$/) && req.method === "PUT") {
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Project manager not available" }, { status: 500, headers: corsHeaders })
+        const projectId = url.pathname.split("/")[3]!
+        try {
+          const body = await req.json() as { model: string }
+          if (!body.model?.trim()) {
+            return Response.json({ error: "Model name is required" }, { status: 400, headers: corsHeaders })
+          }
+          pm.updateModel(projectId, body.model.trim())
+          // Restart supervisor with new model
+          pm.restartSupervisor(projectId)
+          return Response.json({ ok: true }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ ok: false, error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // Fetch available Ollama models (proxy to Ollama API)
+      if (url.pathname === "/api/ollama-models") {
+        const pm = opts?.projectManager
+        const ollamaUrl = pm?.getOllamaUrl() ?? "http://127.0.0.1:11434"
+        try {
+          const res = await fetch(`${ollamaUrl}/api/tags`)
+          if (!res.ok) return Response.json({ models: [] }, { headers: corsHeaders })
+          const data = await res.json() as { models?: Array<{ name: string; size: number; modified_at: string; details?: { parameter_size?: string; family?: string; quantization_level?: string } }> }
+          const models = (data.models ?? []).map(m => ({
+            name: m.name,
+            size: m.size,
+            modified: m.modified_at,
+            parameterSize: m.details?.parameter_size ?? null,
+            family: m.details?.family ?? null,
+            quantization: m.details?.quantization_level ?? null,
+          }))
+          return Response.json({ models }, { headers: corsHeaders })
+        } catch {
+          return Response.json({ models: [] }, { headers: corsHeaders })
+        }
+      }
+
+      // Performance log endpoint
+      if (url.pathname === "/api/performance" && req.method === "GET") {
+        try {
+          const { loadPerformanceLog } = await import("./performance-log")
+          return Response.json(loadPerformanceLog(), { headers: corsHeaders })
+        } catch {
+          return Response.json({ entries: [] }, { headers: corsHeaders })
+        }
+      }
+
       // Directory browser for folder picker
       if (url.pathname === "/api/browse") {
         const dirPath = url.searchParams.get("path") || (process.platform === "win32" ? "C:\\Users" : "/")
@@ -277,11 +395,16 @@ export async function startDashboard(
         return Response.json({ current: dirPath, directories: dirs }, { headers: corsHeaders })
       }
 
-      // Saved projects (for restore)
+      // Saved projects (for restore) — includes directory existence check
       if (url.pathname === "/api/saved-projects" && req.method === "GET") {
         const pm = opts?.projectManager
         if (!pm) return Response.json([], { headers: corsHeaders })
-        return Response.json(pm.loadSavedProjects(), { headers: corsHeaders })
+        const { existsSync } = await import("fs")
+        const saved = pm.loadSavedProjects().map(p => ({
+          ...p,
+          directoryExists: existsSync(p.directory),
+        }))
+        return Response.json(saved, { headers: corsHeaders })
       }
 
       // Soft stop endpoint
@@ -500,11 +623,74 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       text-transform: uppercase;
     }
     .badge-idle { background: #1a3a2a; color: #4ade80; }
-    .badge-busy { background: #3a3a1a; color: #facc15; }
+    .badge-busy { background: #3a3a1a; color: #facc15; animation: blink 1.2s ease-in-out infinite; }
     .badge-done { background: #1a2a3a; color: #60a5fa; }
-    .badge-disconnected { background: #3a1a1a; color: #ef4444; }
-    .badge-supervising { background: #7c3aed; color: #fff; animation: pulse 1.5s infinite; }
-    .badge-reviewing { background: #d946ef; color: #fff; animation: pulse 1.5s infinite; }
+    .badge-disconnected { background: #3a1a1a; color: #ef4444; animation: blink 2s ease-in-out infinite; }
+    .badge-error { background: #3a1a1a; color: #ef4444; animation: blink 0.8s ease-in-out infinite; }
+    .badge-stuck { background: #4a2a0a; color: #fb923c; animation: blink 0.6s ease-in-out infinite; }
+    .badge-supervising { background: #7c3aed; color: #fff; animation: blink 1.5s ease-in-out infinite; }
+    .badge-reviewing { background: #d946ef; color: #fff; animation: blink 1.5s ease-in-out infinite; }
+    .badge-running { background: #1a3a2a; color: #4ade80; animation: blink 1.5s ease-in-out infinite; }
+    .badge-starting { background: #3a3a1a; color: #facc15; animation: blink 1s ease-in-out infinite; }
+    .badge-connected { background: #1a3a2a; color: #4ade80; }
+    .badge-stopped { background: #1a2a3a; color: #60a5fa; }
+
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    /* Directive section */
+    .directive-section {
+      padding: 0 12px 8px;
+      background: #111122;
+      border-bottom: 1px solid #2a2a3a;
+    }
+    .directive-toggle {
+      font-size: 10px;
+      color: #8b8bff;
+      cursor: pointer;
+      padding: 2px 0;
+      user-select: none;
+    }
+    .directive-toggle:hover { text-decoration: underline; }
+    .directive-content {
+      display: none;
+      margin-top: 4px;
+    }
+    .directive-content.open { display: block; }
+    .directive-text {
+      width: 100%;
+      min-height: 60px;
+      max-height: 150px;
+      background: #0a0a14;
+      color: #c0c0c0;
+      border: 1px solid #2a2a3a;
+      border-radius: 4px;
+      padding: 6px 8px;
+      font-family: inherit;
+      font-size: 11px;
+      line-height: 1.4;
+      resize: vertical;
+    }
+    .directive-text:focus { outline: none; border-color: #8b8bff; }
+    .directive-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .directive-save {
+      font-size: 10px;
+      padding: 3px 12px;
+      border: 1px solid #3a5a3a;
+      border-radius: 4px;
+      background: #1a2a1a;
+      color: #4ade80;
+      cursor: pointer;
+      font-family: inherit;
+      font-weight: 600;
+    }
+    .directive-save:hover { background: #2a3a2a; }
 
     .panel-log {
       flex: 1;
@@ -1097,6 +1283,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     body.light .browse-panel { background: #f5f5f5; border-color: #ccc; }
     body.light .browse-item { color: #5b4bdf; border-color: #eee; }
     body.light .browse-item:hover { background: #eeeeff; }
+    body.light .badge-stopped { background: #dbeafe; color: #2563eb; }
     body.light .empty-state h2 { color: #5b4bdf; }
     body.light .empty-state button { background: #5b4bdf; }
   </style>
@@ -1106,6 +1293,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <div style="display:flex;align-items:center;gap:16px;">
       <h1>OpenCode Orchestrator</h1>
       <button class="add-project-btn" onclick="openAddProject()">+ Add Project</button>
+      <button class="add-project-btn" id="restore-btn" onclick="openRestoreModal()" style="background:#1a1a3a;border-color:#6366f1;color:#8b8bff;display:none;">Restore Saved</button>
       <div class="status-bar" id="status-bar"></div>
     </div>
     <div class="toolbar">
@@ -1120,6 +1308,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <h2>No projects yet</h2>
       <p>Add a project folder to get started. The orchestrator will spawn a worker agent and supervisor for each project automatically.</p>
       <button onclick="openAddProject()">+ Add Project</button>
+      <button id="empty-restore-btn" onclick="openRestoreModal()" style="margin-top:8px;background:#1a1a3a;border:1px solid #6366f1;color:#8b8bff;padding:8px 20px;border-radius:6px;cursor:pointer;display:none;">Restore Previous Session</button>
     </div>
   </div>
 
@@ -1144,6 +1333,20 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Restore Projects Modal -->
+  <div class="modal-overlay" id="restore-modal">
+    <div class="modal" style="max-width:600px;">
+      <h2>Restore Saved Projects</h2>
+      <p style="font-size:11px;color:#888;margin-bottom:12px;">Select projects to restore from your last session. Directives and model settings are preserved.</p>
+      <div id="restore-list" style="max-height:400px;overflow-y:auto;"></div>
+      <div class="modal-actions" style="margin-top:12px;">
+        <button class="modal-btn" onclick="closeRestoreModal()">Cancel</button>
+        <button class="modal-btn" onclick="selectAllRestore()" style="color:#8b8bff;border-color:#6366f1;">Select All</button>
+        <button class="modal-btn primary" id="restore-submit" onclick="restoreSelected()">Restore Selected</button>
+      </div>
+    </div>
+  </div>
+
   <div class="resize-handle" id="resize-handle"></div>
   <div class="brain-section open" id="brain-section">
     <div class="brain-header" onclick="document.getElementById('brain-section').classList.toggle('open')">
@@ -1155,6 +1358,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     </div>
     <div class="brain-body">
       <div class="brain-log" id="brain-log"></div>
+    </div>
+  </div>
+
+  <div class="brain-section" id="perf-section" style="border-color:#fb923c;">
+    <div class="brain-header" onclick="document.getElementById('perf-section').classList.toggle('open')" style="border-color:#fb923c;">
+      <h2><span class="brain-arrow">&#9654;</span> Model Performance</h2>
+      <button class="toolbar-btn" onclick="event.stopPropagation();refreshPerformance()" style="font-size:10px;">Refresh</button>
+    </div>
+    <div class="brain-body">
+      <div id="perf-content" style="padding:8px 12px;font-size:12px;color:#aaa;">Click refresh to load performance data.</div>
     </div>
   </div>
 
@@ -1207,7 +1420,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       return agentName.replace(/-/g, ' ').replace(/\\b\\w/g, c => c.toUpperCase())
     }
 
+    // Track recently removed agents so polling/events don't re-create their rows
+    const removedAgents = new Set()
+
     function ensureAgent(name) {
+      if (removedAgents.has(name)) return null
       if (projectRows[name]) return projectRows[name]
 
       const row = document.createElement('div')
@@ -1220,11 +1437,37 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           <span class="project-row-name">\${escapeHtml(projectLabel(name))}</span>
           <span class="project-row-dir" id="dir-\${name}"></span>
           <div class="project-row-badges">
+            <span class="agent-badge badge-starting" id="projstatus-\${name}" style="margin-right:8px;">STARTING</span>
             <span style="font-size:10px;color:#666;">Worker:</span>
             <span class="agent-badge badge-idle" id="wbadge-\${name}">IDLE</span>
             <span style="font-size:10px;color:#666;margin-left:4px;">Supervisor:</span>
             <span class="agent-badge badge-idle" id="sbadge-\${name}">IDLE</span>
             <button class="project-row-remove" onclick="event.stopPropagation();removeProject('\${name}')" title="Remove project">Remove</button>
+          </div>
+        </div>
+        <div class="directive-section" onclick="event.stopPropagation()">
+          <div class="directive-toggle" onclick="this.nextElementSibling.classList.toggle('open')">&#9660; Settings</div>
+          <div class="directive-content" id="dcontent-\${name}">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+              <span style="font-size:10px;color:#888;min-width:40px;">Model:</span>
+              <select class="directive-text" id="msel-\${name}" style="min-height:auto;height:26px;padding:2px 6px;flex:1;max-width:300px;">
+                <option value="">(global default)</option>
+              </select>
+              <button class="directive-save" onclick="saveModel('\${name}')" style="white-space:nowrap;">Change Model</button>
+            </div>
+            <div style="margin-bottom:4px;font-size:10px;color:#888;">Directive:</div>
+            <textarea class="directive-text" id="dtxt-\${name}" rows="3"></textarea>
+            <div class="directive-actions">
+              <button class="directive-save" onclick="saveDirective('\${name}')">Save Directive &amp; Restart Supervisor</button>
+            </div>
+            <div style="margin-top:8px;display:flex;gap:6px;align-items:center;">
+              <input type="text" class="directive-text" id="dcmt-\${name}" placeholder="Leave feedback for supervisor..." style="min-height:auto;height:26px;padding:2px 8px;flex:1;">
+              <button class="directive-save" onclick="sendComment('\${name}')" style="white-space:nowrap;">Send Comment</button>
+            </div>
+            <div style="margin-top:8px;">
+              <div class="directive-toggle" onclick="toggleHistory('\${name}')" id="dhist-toggle-\${name}">&#9654; Directive History</div>
+              <div id="dhist-\${name}" style="display:none;margin-top:4px;max-height:250px;overflow-y:auto;"></div>
+            </div>
           </div>
         </div>
         <div class="project-row-body">
@@ -1267,16 +1510,25 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         supervisorBadge: row.querySelector('#svbadge-' + name),
         rowWorkerBadge: row.querySelector('#wbadge-' + name),
         rowSupervisorBadge: row.querySelector('#sbadge-' + name),
+        projStatusBadge: row.querySelector('#projstatus-' + name),
         dirLabel: row.querySelector('#dir-' + name),
+        directiveText: row.querySelector('#dtxt-' + name),
+        modelSelect: row.querySelector('#msel-' + name),
         link: row.querySelector('#link-' + name),
         chatInput: row.querySelector('#chat-' + name),
         chatBtn: row.querySelector('.agent-chatbox button'),
+        projectId: null,
         // Aliases for backward compat with handleEvent/sendPrompt
         get log() { return this.workerLog },
         get badge() { return this.workerBadge },
         project: row.querySelector('#dir-' + name),
         status: 'idle',
         supervisorStatus: 'idle',
+      }
+
+      // Track when user starts editing the directive
+      if (data.directiveText) {
+        data.directiveText.addEventListener('input', function() { this._userEdited = true })
       }
 
       projectRows[name] = data
@@ -1327,11 +1579,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         idle: ['IDLE', 'badge-idle'],
         busy: ['BUSY', 'badge-busy'],
         completed: ['DONE', 'badge-done'],
-        connected: ['OK', 'badge-idle'],
+        connected: ['OK', 'badge-connected'],
         disconnected: ['DOWN', 'badge-disconnected'],
-        error: ['ERROR', 'badge-disconnected'],
+        error: ['ERROR', 'badge-error'],
+        stuck: ['STUCK', 'badge-stuck'],
         supervising: ['SUPERVISING', 'badge-supervising'],
         reviewing: ['REVIEWING', 'badge-reviewing'],
+        running: ['RUNNING', 'badge-running'],
+        starting: ['STARTING', 'badge-starting'],
       }
       const [text, cls] = map[status] || [status.toUpperCase(), 'badge-idle']
       badge.textContent = text
@@ -1360,6 +1615,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
       if (event.type === 'agent-status') {
         const agent = ensureAgent(event.agent)
+        if (!agent) return
         agent.status = event.status
         setBadge(agent.workerBadge, event.status)
         setBadge(agent.rowWorkerBadge, event.status)
@@ -1371,23 +1627,27 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         }
         if (event.status === 'error' || event.status === 'disconnected') {
           notify(event.agent + ' ' + event.status, detail || '')
+          if (agent.projStatusBadge) setProjectStatus(agent.projStatusBadge, 'error')
         }
       }
 
       if (event.type === 'agent-prompt') {
         const agent = ensureAgent(event.agent)
+        if (!agent) return
         const header = 'PROMPT: ' + makeHeader(event.text, 80)
         addCollapsible(agent.workerLog, 'prompt', header, event.text, false)
       }
 
       if (event.type === 'agent-response') {
         const agent = ensureAgent(event.agent)
+        if (!agent) return
         const header = 'RESPONSE: ' + makeHeader(event.text, 80)
         addCollapsible(agent.workerLog, 'response', header, event.text, false)
       }
 
       if (event.type === 'cycle-summary') {
         const agent = ensureAgent(event.agent)
+        if (!agent) return
         addCycleSummary(agent.workerLog, event.cycle, event.summary)
       }
 
@@ -1395,6 +1655,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         const t = event.event?.type || ''
         if (['session.idle', 'session.error', 'permission.request'].includes(t)) {
           const agent = ensureAgent(event.agent)
+          if (!agent) return
           addLogEntry(agent.workerLog, 'status', escapeHtml(t))
         }
       }
@@ -1402,6 +1663,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       if (event.type === 'permission-request') {
         notify(event.agent + ' needs permission', event.description || 'Review required')
         const agent = ensureAgent(event.agent)
+        if (!agent) return
         const id = 'perm-' + event.requestID.replace(/[^a-zA-Z0-9]/g, '_')
         const desc = event.description || JSON.stringify(event.properties, null, 2)
         const html = '<div class="perm-request" id="' + id + '">'
@@ -1432,6 +1694,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
       if (event.type === 'supervisor-thinking') {
         const agent = ensureAgent(event.agent)
+        if (!agent) return
         const entry = document.createElement('div')
         entry.className = 'supervisor-entry'
         if (event.text.includes('=====') || event.text.startsWith('Supervisor started') || event.text.startsWith('Cycle ')) {
@@ -1444,9 +1707,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
       if (event.type === 'supervisor-status') {
         const agent = ensureAgent(event.agent)
+        if (!agent) return
         if (event.status === 'running') {
           setBadge(agent.supervisorBadge, 'supervising')
           setBadge(agent.rowSupervisorBadge, 'supervising')
+          if (agent.projStatusBadge) setProjectStatus(agent.projStatusBadge, 'supervising')
           agent.supervisorStatus = 'busy'
         } else if (event.status === 'reviewing') {
           setBadge(agent.supervisorBadge, 'reviewing')
@@ -1455,10 +1720,12 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         } else if (event.status === 'done') {
           setBadge(agent.supervisorBadge, 'completed')
           setBadge(agent.rowSupervisorBadge, 'completed')
+          if (agent.projStatusBadge) setProjectStatus(agent.projStatusBadge, 'stopped')
           agent.supervisorStatus = 'completed'
         } else {
           setBadge(agent.supervisorBadge, 'idle')
           setBadge(agent.rowSupervisorBadge, 'idle')
+          if (agent.projStatusBadge) setProjectStatus(agent.projStatusBadge, 'running')
           agent.supervisorStatus = 'idle'
         }
         updateStatusBar()
@@ -1492,6 +1759,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     function applyStatusData(data) {
       for (const [name, info] of Object.entries(data)) {
         const agent = ensureAgent(name)
+        if (!agent) continue
         const dirParts = (info.directory || '').replace(/\\\\\\\\/g, '/').split('/')
         const dirName = dirParts[dirParts.length - 1] || ''
         agent.dirLabel.textContent = info.directory || ''
@@ -1503,12 +1771,317 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       updateStatusBar()
     }
 
+    // Fetch and apply project data (directives, projectIds, project status)
+    function applyProjectData(projects) {
+      for (const proj of projects) {
+        const agent = projectRows[proj.agentName]
+        if (!agent) continue
+        agent.projectId = proj.id
+        if (agent.directiveText && !agent.directiveText._userEdited) {
+          agent.directiveText.value = proj.directive || ''
+        }
+        if (agent.modelSelect && proj.model) {
+          agent.modelSelect.value = proj.model
+        }
+        // Update project-level status badge
+        if (agent.projStatusBadge && proj.status) {
+          setProjectStatus(agent.projStatusBadge, proj.status)
+        }
+      }
+    }
+
+    function setProjectStatus(badge, status) {
+      const map = {
+        starting: ['STARTING', 'badge-starting'],
+        running: ['RUNNING', 'badge-running'],
+        supervising: ['SUPERVISING', 'badge-supervising'],
+        stopped: ['FINISHED', 'badge-stopped'],
+        error: ['ERROR', 'badge-error'],
+      }
+      const [text, cls] = map[status] || [status.toUpperCase(), 'badge-idle']
+      badge.textContent = text
+      badge.className = 'agent-badge ' + cls
+    }
+
+    // Save directive handler
+    window.saveDirective = async function(agentName) {
+      const agent = projectRows[agentName]
+      if (!agent || !agent.projectId) {
+        alert('Project not found for ' + agentName)
+        return
+      }
+      const text = agent.directiveText.value.trim()
+      if (!text) { alert('Directive cannot be empty'); return }
+      try {
+        const res = await fetch('/api/projects/' + agent.projectId + '/directive', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ directive: text }),
+        })
+        const data = await res.json()
+        if (data.ok) {
+          agent.directiveText._userEdited = false
+          addLogEntry(agent.supervisorLog, 'status', 'Directive updated. Supervisor restarting...')
+        } else {
+          alert('Failed to save directive: ' + (data.error || 'Unknown error'))
+        }
+      } catch (err) {
+        alert('Error saving directive: ' + err)
+      }
+    }
+
+    // Save model handler
+    window.saveModel = async function(agentName) {
+      const agent = projectRows[agentName]
+      if (!agent || !agent.projectId) {
+        alert('Project not found for ' + agentName)
+        return
+      }
+      const model = agent.modelSelect.value
+      try {
+        const res = await fetch('/api/projects/' + agent.projectId + '/model', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: model || 'default' }),
+        })
+        const data = await res.json()
+        if (data.ok) {
+          addLogEntry(agent.supervisorLog, 'status', 'Model changed to: ' + (model || '(global default)') + '. Supervisor restarting...')
+        } else {
+          alert('Failed to change model: ' + (data.error || 'Unknown error'))
+        }
+      } catch (err) {
+        alert('Error changing model: ' + err)
+      }
+    }
+
+    // Send a comment on the directive for the supervisor to read
+    window.sendComment = async function(agentName) {
+      const agent = projectRows[agentName]
+      if (!agent || !agent.projectId) { alert('Project not found'); return }
+      const input = document.getElementById('dcmt-' + agentName)
+      const comment = input.value.trim()
+      if (!comment) { alert('Please enter a comment.'); return }
+      try {
+        const res = await fetch('/api/projects/' + agent.projectId + '/directive-comment', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ comment }),
+        })
+        const data = await res.json()
+        if (data.ok) {
+          input.value = ''
+          addLogEntry(agent.supervisorLog, 'status', 'Comment sent to supervisor: "' + comment.slice(0, 80) + '"')
+          // Refresh history if open
+          const histEl = document.getElementById('dhist-' + agentName)
+          if (histEl && histEl.style.display !== 'none') loadHistory(agentName)
+        } else {
+          alert('Failed: ' + (data.error || 'Unknown error'))
+        }
+      } catch (err) {
+        alert('Error: ' + err)
+      }
+    }
+
+    // Toggle and load directive history
+    window.toggleHistory = function(agentName) {
+      const histEl = document.getElementById('dhist-' + agentName)
+      const toggle = document.getElementById('dhist-toggle-' + agentName)
+      if (!histEl) return
+      if (histEl.style.display === 'none') {
+        histEl.style.display = 'block'
+        toggle.innerHTML = '&#9660; Directive History'
+        loadHistory(agentName)
+      } else {
+        histEl.style.display = 'none'
+        toggle.innerHTML = '&#9654; Directive History'
+      }
+    }
+
+    async function loadHistory(agentName) {
+      const agent = projectRows[agentName]
+      if (!agent || !agent.projectId) return
+      const histEl = document.getElementById('dhist-' + agentName)
+      if (!histEl) return
+      histEl.innerHTML = '<div style="color:#666;font-size:10px;">Loading...</div>'
+      try {
+        const res = await fetch('/api/projects/' + agent.projectId + '/directive-history')
+        const history = await res.json()
+        if (!history || history.length === 0) {
+          histEl.innerHTML = '<div style="color:#666;font-size:10px;">No history yet.</div>'
+          return
+        }
+        // Render timeline (newest first)
+        const reversed = [...history].reverse()
+        let html = ''
+        for (let i = 0; i < reversed.length; i++) {
+          const entry = reversed[i]
+          const isLatest = i === 0
+          const date = new Date(entry.timestamp)
+          const timeStr = date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          const sourceColor = entry.source === 'user' ? '#8b8bff' : '#fb923c'
+          const sourceLabel = entry.source === 'user' ? 'USER' : 'SUPERVISOR'
+          const borderColor = isLatest ? '#4ade80' : '#2a2a3a'
+          html += '<div style="border-left:2px solid ' + borderColor + ';padding:4px 0 8px 10px;margin-left:6px;font-size:10px;'
+            + (isLatest ? '' : 'opacity:0.7;') + '">'
+          html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px;">'
+          html += '<span style="color:' + sourceColor + ';font-weight:600;font-size:9px;text-transform:uppercase;">' + sourceLabel + '</span>'
+          html += '<span style="color:#555;">' + timeStr + '</span>'
+          if (isLatest) html += '<span style="color:#4ade80;font-size:9px;font-weight:600;">CURRENT</span>'
+          html += '</div>'
+          html += '<div style="color:#c0c0c0;line-height:1.4;white-space:pre-wrap;max-height:80px;overflow:hidden;">' + escapeHtml(entry.text.slice(0, 300)) + (entry.text.length > 300 ? '...' : '') + '</div>'
+          if (entry.comment) {
+            html += '<div style="margin-top:3px;padding:3px 6px;background:#1a1a2a;border-radius:3px;color:#8b8bff;font-style:italic;">'
+            html += '&#128172; ' + escapeHtml(entry.comment)
+            if (entry.commentRead) html += ' <span style="color:#4ade80;font-size:9px;">(read by supervisor)</span>'
+            else html += ' <span style="color:#facc15;font-size:9px;">(pending)</span>'
+            html += '</div>'
+          }
+          if (!isLatest) {
+            const origIdx = history.length - 1 - i
+            html += '<div style="margin-top:3px;display:flex;gap:8px;align-items:center;">'
+            html += '<span style="cursor:pointer;color:#6366f1;text-decoration:underline;font-size:9px;" onclick="revertDirective(\\'' + agentName + '\\', ' + origIdx + ')">Revert to this version</span>'
+            html += '<input type="text" id="hcmt-' + agentName + '-' + origIdx + '" placeholder="Add comment..." style="flex:1;font-size:9px;padding:2px 6px;background:#0a0a14;border:1px solid #2a2a3a;border-radius:3px;color:#c0c0c0;font-family:inherit;" onclick="event.stopPropagation()">'
+            html += '<span style="cursor:pointer;color:#4ade80;font-size:9px;font-weight:600;" onclick="sendHistoryComment(\\'' + agentName + '\\', ' + origIdx + ')">Send</span>'
+            html += '</div>'
+          }
+          html += '</div>'
+        }
+        histEl.innerHTML = html
+      } catch (err) {
+        histEl.innerHTML = '<div style="color:#ef4444;font-size:10px;">Error loading history: ' + err + '</div>'
+      }
+    }
+
+    // Revert directive to a historical version
+    window.revertDirective = function(agentName, historyIndex) {
+      const agent = projectRows[agentName]
+      if (!agent || !agent.projectId) return
+      fetch('/api/projects/' + agent.projectId + '/directive-history').then(r => r.json()).then(history => {
+        if (!history[historyIndex]) return
+        const text = history[historyIndex].text
+        if (!confirm('Revert directive to:\\n\\n"' + text.slice(0, 200) + '"\\n\\nThis will restart the supervisor.')) return
+        agent.directiveText.value = text
+        agent.directiveText._userEdited = true
+        saveDirective(agentName)
+      })
+    }
+
+    // Send comment on a specific directive history entry
+    window.sendHistoryComment = async function(agentName, historyIndex) {
+      const agent = projectRows[agentName]
+      if (!agent || !agent.projectId) { alert('Project not found'); return }
+      const input = document.getElementById('hcmt-' + agentName + '-' + historyIndex)
+      if (!input) return
+      const comment = input.value.trim()
+      if (!comment) { alert('Please enter a comment.'); return }
+      try {
+        const res = await fetch('/api/projects/' + agent.projectId + '/directive-comment', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ comment, historyIndex }),
+        })
+        const data = await res.json()
+        if (data.ok) {
+          input.value = ''
+          addLogEntry(agent.supervisorLog, 'status', 'Comment sent on historical directive entry.')
+          loadHistory(agentName) // refresh
+        } else {
+          alert('Failed: ' + (data.error || 'Unknown error'))
+        }
+      } catch (err) {
+        alert('Error: ' + err)
+      }
+    }
+
+    // Fetch available Ollama models and populate selects
+    let ollamaModels = []
+    async function refreshOllamaModels() {
+      try {
+        const res = await fetch('/api/ollama-models')
+        const data = await res.json()
+        ollamaModels = data.models || []
+        // Update all model selects
+        for (const [name, agent] of Object.entries(projectRows)) {
+          if (!agent.modelSelect) continue
+          const current = agent.modelSelect.value
+          // Clear options except first
+          while (agent.modelSelect.options.length > 1) agent.modelSelect.remove(1)
+          for (const m of ollamaModels) {
+            const opt = document.createElement('option')
+            opt.value = m.name
+            const params = m.parameterSize || ''
+            const quant = m.quantization || ''
+            const detail = [params, quant].filter(Boolean).join(', ')
+            opt.textContent = m.name + (detail ? ' (' + detail + ')' : '')
+            agent.modelSelect.appendChild(opt)
+          }
+          // Restore selection
+          if (current) agent.modelSelect.value = current
+        }
+      } catch {}
+    }
+    refreshOllamaModels()
+    // Refresh model list every 60s
+    setInterval(refreshOllamaModels, 60000)
+
+    // Performance comparison
+    window.refreshPerformance = async function() {
+      const el = document.getElementById('perf-content')
+      el.innerHTML = 'Loading...'
+      try {
+        const res = await fetch('/api/performance')
+        const log = await res.json()
+        const entries = log.entries || []
+        if (entries.length === 0) {
+          el.innerHTML = 'No performance data yet. Data is logged as supervisors run cycles.'
+          return
+        }
+        // Aggregate by model
+        const stats = {}
+        for (const e of entries) {
+          if (!stats[e.model]) stats[e.model] = { cycles: 0, errors: 0, restarts: 0, stuck: 0, stops: 0, durations: [], projects: new Set() }
+          const s = stats[e.model]
+          s.projects.add(e.projectName || e.agentName)
+          if (e.event === 'cycle_complete') { s.cycles++; if (e.durationMs) s.durations.push(e.durationMs) }
+          if (e.event === 'cycle_error') s.errors++
+          if (e.event === 'restart') s.restarts++
+          if (e.event === 'stuck') s.stuck++
+          if (e.event === 'supervisor_stop') s.stops++
+        }
+        let html = '<table style="width:100%;border-collapse:collapse;font-size:11px;">'
+        html += '<tr style="border-bottom:1px solid #2a2a3a;color:#888;text-align:left;">'
+        html += '<th style="padding:4px 8px;">Model</th><th>Cycles</th><th>Errors</th><th>Restarts</th><th>Stuck</th><th>Stops</th><th>Avg Cycle</th><th>Projects</th></tr>'
+        for (const [model, s] of Object.entries(stats)) {
+          const avg = s.durations.length > 0 ? Math.round(s.durations.reduce((a,b) => a+b, 0) / s.durations.length / 1000) + 's' : '-'
+          const errRate = s.cycles > 0 ? Math.round(s.errors / (s.cycles + s.errors) * 100) + '%' : '-'
+          html += '<tr style="border-bottom:1px solid #1a1a2a;">'
+          html += '<td style="padding:4px 8px;color:#e0e0e0;font-weight:600;">' + escapeHtml(model) + '</td>'
+          html += '<td style="color:#4ade80;">' + s.cycles + '</td>'
+          html += '<td style="color:' + (s.errors > 0 ? '#ef4444' : '#666') + ';">' + s.errors + ' (' + errRate + ')</td>'
+          html += '<td style="color:' + (s.restarts > 0 ? '#fb923c' : '#666') + ';">' + s.restarts + '</td>'
+          html += '<td style="color:' + (s.stuck > 0 ? '#fb923c' : '#666') + ';">' + s.stuck + '</td>'
+          html += '<td style="color:' + (s.stops > 0 ? '#facc15' : '#666') + ';">' + s.stops + '</td>'
+          html += '<td>' + avg + '</td>'
+          html += '<td style="color:#888;font-size:10px;">' + Array.from(s.projects).join(', ') + '</td>'
+          html += '</tr>'
+        }
+        html += '</table>'
+        html += '<div style="margin-top:8px;font-size:10px;color:#555;">Total entries: ' + entries.length + '</div>'
+        el.innerHTML = html
+      } catch (err) {
+        el.innerHTML = 'Error loading: ' + err
+      }
+    }
+
     // Fetch initial status
     fetch('/api/status').then(r => r.json()).then(data => { applyStatusData(data); checkEmptyState() })
+    fetch('/api/projects').then(r => r.json()).then(applyProjectData).catch(() => {})
 
     // Poll backend every 10s to keep status in sync
     setInterval(() => {
       fetch('/api/status').then(r => r.json()).then(applyStatusData).catch(() => {})
+      fetch('/api/projects').then(r => r.json()).then(applyProjectData).catch(() => {})
     }, 10000)
 
     // Soft stop
@@ -1643,6 +2216,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           alert('Could not find project for agent: ' + agentName)
           return
         }
+        // Mark as removed so polling/events don't re-create the row
+        removedAgents.add(agentName)
         // Remove the row from DOM
         const row = document.getElementById('row-' + agentName)
         if (row) row.remove()
@@ -1751,6 +2326,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           document.getElementById('proj-dir').value = ''
           document.getElementById('proj-name').value = ''
           document.getElementById('proj-directive').value = ''
+          // Clear removed-agents guard so new/re-added projects can appear
+          removedAgents.clear()
           checkEmptyState()
         } else {
           alert('Failed to add project: ' + (data.error || 'Unknown error'))
@@ -1801,34 +2378,101 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       }
     }
 
-    // Load saved projects on startup (show restore option)
+    // Check for saved projects on startup — show restore buttons if available
+    let savedProjectsCache = []
     fetch('/api/saved-projects').then(r => r.json()).then(saved => {
-      if (saved && saved.length > 0 && Object.keys(projectRows).length === 0) {
-        const entry = document.createElement('div')
-        entry.style.color = '#8b8bff'
-        entry.innerHTML = 'Previous projects found: ' + saved.map(p => p.name).join(', ') + '. <span style="cursor:pointer;text-decoration:underline" onclick="restoreSavedProjects()">Click to restore</span>'
-        brainLog.appendChild(entry)
+      savedProjectsCache = saved || []
+      if (savedProjectsCache.length > 0) {
+        // Show restore buttons
+        const restoreBtn = document.getElementById('restore-btn')
+        if (restoreBtn) restoreBtn.style.display = ''
+        const emptyRestoreBtn = document.getElementById('empty-restore-btn')
+        if (emptyRestoreBtn) emptyRestoreBtn.style.display = ''
+        // Also show a note in the brain log
+        if (Object.keys(projectRows).length === 0) {
+          const entry = document.createElement('div')
+          entry.style.color = '#8b8bff'
+          entry.innerHTML = savedProjectsCache.length + ' saved project(s) found from previous session. <span style="cursor:pointer;text-decoration:underline;font-weight:600" onclick="openRestoreModal()">Click to restore</span>'
+          brainLog.appendChild(entry)
+        }
       }
     }).catch(() => {})
 
-    async function restoreSavedProjects() {
+    const restoreModal = document.getElementById('restore-modal')
+    window.openRestoreModal = async function() {
+      // Refresh saved projects list
       try {
         const res = await fetch('/api/saved-projects')
-        const saved = await res.json()
-        for (const proj of saved) {
-          try {
-            await fetch('/api/projects', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(proj),
-            })
-          } catch {}
-        }
-        checkEmptyState()
-      } catch (err) {
-        alert('Restore failed: ' + err)
+        savedProjectsCache = await res.json() || []
+      } catch {}
+      const list = document.getElementById('restore-list')
+      if (savedProjectsCache.length === 0) {
+        list.innerHTML = '<div style="color:#888;padding:12px;">No saved projects found.</div>'
+        restoreModal.classList.add('open')
+        return
+      }
+      // Build checklist with project details — show missing directories
+      list.innerHTML = savedProjectsCache.map((p, i) => {
+        const dirShort = (p.directory || '').replace(/\\\\/g, '/').split('/').slice(-2).join('/')
+        const exists = p.directoryExists !== false
+        const disabledAttr = exists ? '' : ' disabled'
+        const checkedAttr = exists ? ' checked' : ''
+        const opacity = exists ? '' : 'opacity:0.5;'
+        return '<label style="display:flex;align-items:flex-start;gap:10px;padding:10px 8px;border-bottom:1px solid #1a1a2a;cursor:pointer;' + opacity + '" onclick="this.querySelector(\\'input\\').click()">'
+          + '<input type="checkbox"' + checkedAttr + disabledAttr + ' class="restore-check" data-idx="' + i + '" style="margin-top:3px;accent-color:#6366f1;" onclick="event.stopPropagation()">'
+          + '<div style="flex:1;min-width:0;">'
+          + '<div style="font-weight:600;color:#e0e0e0;">' + escapeHtml(p.name || dirShort)
+          + (exists ? '' : ' <span style="color:#ef4444;font-size:9px;font-weight:600;">DIRECTORY MISSING</span>') + '</div>'
+          + '<div style="font-size:10px;color:#666;margin-top:2px;word-break:break-all;">' + escapeHtml(p.directory) + '</div>'
+          + (p.directive ? '<div style="font-size:10px;color:#888;margin-top:4px;max-height:40px;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(p.directive.slice(0, 200)) + (p.directive.length > 200 ? '...' : '') + '</div>' : '')
+          + (p.model ? '<div style="font-size:10px;color:#6366f1;margin-top:2px;">Model: ' + escapeHtml(p.model) + '</div>' : '')
+          + '</div></label>'
+      }).join('')
+      restoreModal.classList.add('open')
+    }
+    window.closeRestoreModal = function() {
+      restoreModal.classList.remove('open')
+    }
+    window.selectAllRestore = function() {
+      const checks = document.querySelectorAll('.restore-check')
+      const allChecked = Array.from(checks).every(c => c.checked)
+      checks.forEach(c => { c.checked = !allChecked })
+    }
+    window.restoreSelected = async function() {
+      const checks = document.querySelectorAll('.restore-check')
+      const selected = Array.from(checks).filter(c => c.checked).map(c => savedProjectsCache[parseInt(c.dataset.idx)])
+      if (selected.length === 0) { alert('No projects selected.'); return }
+      const btn = document.getElementById('restore-submit')
+      btn.disabled = true
+      btn.textContent = 'Restoring ' + selected.length + '...'
+      removedAgents.clear()
+      let restored = 0
+      for (const proj of selected) {
+        try {
+          const res = await fetch('/api/projects', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(proj),
+          })
+          const data = await res.json()
+          if (data.ok) restored++
+        } catch {}
+      }
+      btn.disabled = false
+      btn.textContent = 'Restore Selected'
+      closeRestoreModal()
+      checkEmptyState()
+      if (restored > 0) {
+        addLogEntry(brainLog, 'status', 'Restored ' + restored + ' project(s) from saved session.')
+      }
+      if (restored < selected.length) {
+        alert((selected.length - restored) + ' project(s) failed to restore. Check if the directories still exist.')
       }
     }
+    // Close modal on overlay click
+    restoreModal.addEventListener('click', function(e) {
+      if (e.target === restoreModal) closeRestoreModal()
+    })
 
     // Enter key in modal inputs submits the form
     document.getElementById('proj-dir').addEventListener('keydown', (e) => {

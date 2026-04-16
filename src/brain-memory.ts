@@ -12,6 +12,8 @@ export type BrainMemoryStore = {
   entries: BrainMemoryEntry[]
   /** Persistent notes the brain has accumulated about the projects */
   projectNotes: Record<string, string[]>
+  /** Behavioral notes about how agents work best (injected into supervisor system prompts) */
+  behavioralNotes?: Record<string, string[]>
 }
 
 const DEFAULT_STORE: BrainMemoryStore = {
@@ -79,6 +81,41 @@ export async function addProjectNote(
       projectNotes: {
         ...fresh.projectNotes,
         [agentName]: [...notes, note].slice(-20), // keep last 20 notes per agent
+      },
+    }
+    saveBrainMemory(result)
+    return result
+  })
+}
+
+/** Simple similarity check — returns true if two notes share enough keywords to be duplicates */
+function isSimilarNote(a: string, b: string, threshold = 0.6): boolean {
+  const wordsA = new Set(a.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(w => w.length > 3))
+  const wordsB = new Set(b.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(w => w.length > 3))
+  if (wordsA.size === 0 || wordsB.size === 0) return false
+  let overlap = 0
+  for (const w of wordsA) { if (wordsB.has(w)) overlap++ }
+  const similarity = overlap / Math.min(wordsA.size, wordsB.size)
+  return similarity >= threshold
+}
+
+export async function addBehavioralNote(
+  _store: BrainMemoryStore,
+  agentName: string,
+  note: string,
+): Promise<BrainMemoryStore> {
+  return withWriteLock(() => {
+    const fresh = loadBrainMemory()
+    const notes = fresh.behavioralNotes?.[agentName] ?? []
+    // Deduplicate — skip if a similar note already exists
+    if (notes.some(existing => isSimilarNote(existing, note))) {
+      return fresh
+    }
+    const result: BrainMemoryStore = {
+      ...fresh,
+      behavioralNotes: {
+        ...(fresh.behavioralNotes ?? {}),
+        [agentName]: [...notes, note].slice(-10),
       },
     }
     saveBrainMemory(result)

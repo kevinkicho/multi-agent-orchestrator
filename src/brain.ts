@@ -53,11 +53,53 @@ Rules:
 - You may be given context from previous sessions — use it to avoid repeating work.
 `
 
+// Cache model context sizes to avoid repeated API calls
+const modelInfoCache = new Map<string, { contextSize: number; fetchedAt: number }>()
+
+/** Fetch model info from Ollama to get context size */
+async function getModelContextSize(ollamaUrl: string, model: string): Promise<number> {
+  const cached = modelInfoCache.get(model)
+  if (cached && Date.now() - cached.fetchedAt < 300_000) return cached.contextSize // 5 min cache
+
+  try {
+    const res = await fetch(`${ollamaUrl}/api/show`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: model }),
+    })
+    if (res.ok) {
+      const data = await res.json() as any
+      // Ollama prefixes context_length with the model architecture (e.g. "qwen2.context_length", "llama.context_length")
+      // Scan all model_info keys for one ending in ".context_length" or "context_length" exactly
+      let ctx = 0
+      const mi = data.model_info
+      if (mi && typeof mi === "object") {
+        for (const key of Object.keys(mi)) {
+          if (key === "context_length" || key.endsWith(".context_length")) {
+            const val = mi[key]
+            if (typeof val === "number" && val > 0) { ctx = val; break }
+          }
+        }
+      }
+      if (ctx > 0) {
+        modelInfoCache.set(model, { contextSize: ctx, fetchedAt: Date.now() })
+        return ctx
+      }
+    }
+  } catch {}
+  return 0 // unknown
+}
+
 export async function chatCompletion(
   ollamaUrl: string,
   model: string,
   messages: Message[],
 ): Promise<string> {
+  // Adapt max_tokens based on model's context size
+  const contextSize = await getModelContextSize(ollamaUrl, model)
+  // Use ~1/4 of context for output, capped at 16384
+  const maxTokens = contextSize > 0 ? Math.min(Math.floor(contextSize / 4), 16384) : 16384
+
   const response = await fetch(`${ollamaUrl}/v1/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -65,7 +107,7 @@ export async function chatCompletion(
       model,
       messages,
       temperature: 0.3,
-      max_tokens: 4096,
+      max_tokens: maxTokens,
     }),
   })
 
@@ -87,7 +129,7 @@ export async function chatCompletion(
 }
 
 /** Trim conversation to stay within model context limits. */
-function trimConversation(messages: Message[], maxMessages = 40): void {
+function trimConversation(messages: Message[], maxMessages = 60): void {
   if (messages.length <= maxMessages) return
   const keep = maxMessages - 2
   const trimmed = messages.splice(1, messages.length - 1 - keep)

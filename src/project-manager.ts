@@ -9,6 +9,16 @@ import { runAgentSupervisor } from "./supervisor"
 // Types
 // ---------------------------------------------------------------------------
 
+export type DirectiveHistoryEntry = {
+  timestamp: number
+  text: string
+  source: "user" | "supervisor"
+  /** Optional user comment/feedback for the supervisor to read */
+  comment?: string
+  /** Whether the supervisor has read this comment */
+  commentRead?: boolean
+}
+
 export type ProjectState = {
   id: string
   name: string
@@ -16,13 +26,25 @@ export type ProjectState = {
   directive: string
   workerPort: number
   agentName: string
+  /** Ollama model for this project's supervisor. Falls back to global config. */
+  model?: string
+  /** History of directive changes with source tracking and user comments */
+  directiveHistory: DirectiveHistoryEntry[]
+  /** Fast-access queue for unread comments (avoids iterating full history) */
+  pendingComments: string[]
   status: "starting" | "running" | "supervising" | "stopped" | "error"
   addedAt: number
   error?: string
 }
 
 type SavedProjects = {
-  projects: Array<{ name: string; directory: string; directive: string }>
+  projects: Array<{
+    name: string
+    directory: string
+    directive: string
+    model?: string
+    directiveHistory?: DirectiveHistoryEntry[]
+  }>
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +151,7 @@ export class ProjectManager {
 
   /** Add a project: spawns a worker agent and starts its supervisor.
    *  Uses a promise-chain mutex so concurrent calls queue up instead of racing. */
-  async addProject(directory: string, directive: string, name?: string): Promise<ProjectState> {
+  async addProject(directory: string, directive: string, name?: string, restoreHistory?: DirectiveHistoryEntry[]): Promise<ProjectState> {
     let resolve!: () => void
     const nextLock = new Promise<void>(r => { resolve = r })
     const prev = this.addLock
@@ -139,13 +161,13 @@ export class ProjectManager {
     await prev
 
     try {
-      return await this._addProjectInner(directory, directive, name)
+      return await this._addProjectInner(directory, directive, name, restoreHistory)
     } finally {
       resolve()
     }
   }
 
-  private async _addProjectInner(directory: string, directive: string, name?: string): Promise<ProjectState> {
+  private async _addProjectInner(directory: string, directive: string, name?: string, restoreHistory?: DirectiveHistoryEntry[]): Promise<ProjectState> {
     const resolvedDir = resolve(directory)
     if (!existsSync(resolvedDir)) {
       throw new Error(`Directory does not exist: ${resolvedDir}`)
@@ -179,6 +201,8 @@ export class ProjectManager {
       directive,
       workerPort: port,
       agentName,
+      directiveHistory: restoreHistory ?? [{ timestamp: Date.now(), text: directive, source: "user" as const }],
+      pendingComments: [],
       status: "starting",
       addedAt: Date.now(),
     }
@@ -267,7 +291,7 @@ export class ProjectManager {
       try {
         await runAgentSupervisor(this.orchestrator, {
           ollamaUrl: this.brainConfig.ollamaUrl,
-          model: this.brainConfig.model,
+          model: project.model || this.brainConfig.model,
           agentName: project.agentName,
           directory: project.directory,
           directive: project.directive,
@@ -279,6 +303,30 @@ export class ProjectManager {
           softStop,
           onThinking: (thought) => {
             console.log(`[${project.agentName}] ${thought}`)
+          },
+          onDirectiveUpdate: (newDirective) => {
+            this.updateDirective(project.id, newDirective, "supervisor")
+          },
+          getUnreadComments: () => {
+            return this.getUnreadComments(project.agentName)
+          },
+          onSupervisorStop: (agentName, summary, isFailure) => {
+            if (isFailure) {
+              console.error(`[${agentName}] SUPERVISOR STOPPED (failure): ${summary}`)
+              this.dashLog.push({
+                type: "brain-thinking",
+                text: `ALERT: ${project.name} supervisor stopped due to failure: ${summary}. Consider restarting the project.`,
+              })
+              // Auto-restart supervisor after a delay if the agent process is still alive
+              setTimeout(() => {
+                const p = this.projects.get(projectId)
+                if (p && p.status !== "stopped" && this.processes.has(projectId)) {
+                  console.log(`[${agentName}] Auto-restarting supervisor after failure...`)
+                  this.dashLog.push({ type: "brain-thinking", text: `Auto-restarting ${project.name} supervisor after failure...` })
+                  this.restartSupervisor(projectId)
+                }
+              }, 10_000) // 10s delay before auto-restart
+            }
           },
         })
       } catch (err) {
@@ -382,6 +430,83 @@ export class ProjectManager {
     }, 500)
   }
 
+  /** Update a project's directive (from dashboard or supervisor) */
+  updateDirective(projectId: string, directive: string, source: "user" | "supervisor" = "user") {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    project.directive = directive
+    project.directiveHistory.push({ timestamp: Date.now(), text: directive, source })
+    // Keep last 20 entries
+    if (project.directiveHistory.length > 20) {
+      project.directiveHistory = project.directiveHistory.slice(-20)
+    }
+    this.saveProjects()
+    this.dashLog.push({ type: "brain-thinking", text: `${project.name} directive updated by ${source}.` })
+  }
+
+  /** Add a user comment on a directive entry for the supervisor to read.
+   *  If historyIndex is provided, comments on that specific entry; otherwise on the latest. */
+  addDirectiveComment(projectId: string, comment: string, historyIndex?: number) {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    const target = historyIndex !== undefined
+      ? project.directiveHistory[historyIndex]
+      : project.directiveHistory[project.directiveHistory.length - 1]
+    if (target) {
+      if (target.comment && !target.commentRead) {
+        target.comment = target.comment + "\n" + comment
+      } else {
+        target.comment = comment
+      }
+      target.commentRead = false
+    }
+    // Push to fast-access queue so supervisor doesn't iterate full history
+    project.pendingComments.push(comment)
+    this.saveProjects()
+    this.dashLog.push({ type: "brain-thinking", text: `${project.name}: user commented on directive — "${comment.slice(0, 80)}..."` })
+  }
+
+  /** Get unread directive comments for a project's agent, marking them as read */
+  getUnreadComments(agentName: string): string[] {
+    for (const project of this.projects.values()) {
+      if (project.agentName !== agentName) continue
+      // Use the fast queue
+      if (project.pendingComments.length === 0) return []
+      const comments = [...project.pendingComments]
+      project.pendingComments = []
+      // Also mark history entries as read
+      for (const entry of project.directiveHistory) {
+        if (entry.comment && !entry.commentRead) {
+          entry.commentRead = true
+        }
+      }
+      this.saveProjects()
+      return comments
+    }
+    return []
+  }
+
+  /** Get directive history for a project */
+  getDirectiveHistory(projectId: string): DirectiveHistoryEntry[] {
+    const project = this.projects.get(projectId)
+    if (!project) return []
+    return project.directiveHistory
+  }
+
+  /** Update a project's supervisor model */
+  updateModel(projectId: string, model: string) {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    project.model = model
+    this.saveProjects()
+    this.dashLog.push({ type: "brain-thinking", text: `${project.name} model changed to: ${model}` })
+  }
+
+  /** Get the Ollama URL for fetching available models */
+  getOllamaUrl(): string {
+    return this.brainConfig.ollamaUrl
+  }
+
   listProjects(): ProjectState[] {
     return Array.from(this.projects.values())
   }
@@ -395,7 +520,11 @@ export class ProjectManager {
     const data: SavedProjects = {
       projects: this.listProjects()
         .filter(p => p.status !== "stopped")
-        .map(p => ({ name: p.name, directory: p.directory, directive: p.directive })),
+        .map(p => ({
+          name: p.name, directory: p.directory, directive: p.directive,
+          ...(p.model ? { model: p.model } : {}),
+          ...(p.directiveHistory.length > 1 ? { directiveHistory: p.directiveHistory } : {}),
+        })),
     }
     try {
       writeFileSync(resolve(process.cwd(), PROJECTS_FILE), JSON.stringify(data, null, 2))
@@ -405,7 +534,7 @@ export class ProjectManager {
   }
 
   /** Load previously saved projects (for restore on startup) */
-  loadSavedProjects(): Array<{ name: string; directory: string; directive: string }> {
+  loadSavedProjects(): Array<{ name: string; directory: string; directive: string; model?: string; directiveHistory?: DirectiveHistoryEntry[] }> {
     const paths = [
       resolve(process.cwd(), PROJECTS_FILE),
       resolve(import.meta.dirname, "..", PROJECTS_FILE),

@@ -913,8 +913,12 @@ async function main() {
         for (const name of agentNames) {
           dashLog.push({ type: "agent-prompt", agent: name, text: prompt })
         }
-        await orchestrator.promptAll(agentNames.map(name => ({ agentName: name, text: prompt })))
-        return { ok: true, output: `Sent to all ${agentNames.length} agents.` }
+        const result = await orchestrator.promptAll(agentNames.map(name => ({ agentName: name, text: prompt })))
+        if (result.failed.length > 0) {
+          const failures = result.failed.map(f => `${f.agent}: ${f.error}`).join("; ")
+          return { ok: true, output: `Sent to ${result.succeeded.length}/${agentNames.length} agents. Failed: ${failures}` }
+        }
+        return { ok: true, output: `Sent to all ${result.succeeded.length} agents.` }
       } else {
         if (!orchestrator.agents.has(target)) {
           return { ok: false, error: `Unknown agent: ${target}` }

@@ -31,7 +31,7 @@ function createMockOrchestrator(): Orchestrator {
   return {
     agents,
     async prompt() {},
-    async promptAll() {},
+    async promptAll() { return { succeeded: [], failed: [] } },
     async getMessages() { return [{ role: "assistant", content: "hello" }] },
     async status() {
       return new Map([["test-agent", { status: "idle", sessionID: "sess-1", lastActivity: Date.now(), lastEventAt: Date.now() }]])

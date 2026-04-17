@@ -62,8 +62,8 @@ export type Orchestrator = {
   agents: Map<string, AgentState>
   /** Send a prompt to a specific agent */
   prompt: (agentName: string, text: string) => Promise<void>
-  /** Send prompts to all agents simultaneously */
-  promptAll: (prompts: { agentName: string; text: string }[]) => Promise<void>
+  /** Send prompts to all agents simultaneously. Returns partial results so callers can handle failures individually. */
+  promptAll: (prompts: { agentName: string; text: string }[]) => Promise<{ succeeded: string[]; failed: Array<{ agent: string; error: string }> }>
   /** Get the latest messages from an agent's session */
   getMessages: (agentName: string) => Promise<unknown[]>
   /** Get status overview of all agents */
@@ -389,15 +389,20 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
 
     async promptAll(prompts) {
       const results = await Promise.allSettled(prompts.map(({ agentName, text }) => enqueuePrompt(agentName, text)))
-      // Report any failures but don't throw — partial success is better than total failure
-      const failures = results
-        .map((r, i) => r.status === "rejected" ? `${prompts[i]!.agentName}: ${r.reason}` : null)
-        .filter(Boolean)
-      if (failures.length > 0) {
-        const err = new Error(`Some prompts failed: ${failures.join("; ")}`)
-        console.error(`[orchestrator] promptAll partial failure: ${err.message}`)
-        if (failures.length === prompts.length) throw err // all failed
+      const succeeded: string[] = []
+      const failed: Array<{ agent: string; error: string }> = []
+      for (let i = 0; i < results.length; i++) {
+        const r = results[i]!
+        const name = prompts[i]!.agentName
+        if (r.status === "fulfilled") {
+          succeeded.push(name)
+        } else {
+          const error = r.reason instanceof Error ? r.reason.message : String(r.reason)
+          failed.push({ agent: name, error })
+          console.error(`[orchestrator] promptAll failed for ${name}: ${error}`)
+        }
       }
+      return { succeeded, failed }
     },
 
     async getMessages(agentName) {

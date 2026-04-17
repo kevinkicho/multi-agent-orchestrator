@@ -493,8 +493,17 @@ export async function runBrain(
           for (const n of names) {
             config.dashboardLog?.push({ type: "agent-prompt", agent: n, text: cmd.message })
           }
-          await orchestrator.promptAll(names.map((n) => ({ agentName: n, text: cmd.message })))
-          results.push(`Sent to all agents: "${cmd.message.slice(0, 100)}..."`)
+          try {
+            const result = await orchestrator.promptAll(names.map((n) => ({ agentName: n, text: cmd.message })))
+            if (result.failed.length > 0) {
+              const failureDetails = result.failed.map(f => `${f.agent}: ${f.error}`).join("; ")
+              results.push(`Sent to ${result.succeeded.length}/${names.length} agents. Failed: ${failureDetails}. Consider retrying failed agents individually with PROMPT.`)
+            } else {
+              results.push(`Sent to all ${result.succeeded.length} agents: "${cmd.message.slice(0, 100)}..."`)
+            }
+          } catch (err) {
+            results.push(`Failed to send to all agents: ${err}. Try sending prompts individually with PROMPT.`)
+          }
           break
         }
         case "status": {

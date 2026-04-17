@@ -38,13 +38,15 @@ Changes to behavior that fix these limitations should reference the relevant sec
 
 ---
 
-## 4. No Per-Agent Failure Isolation
+## 4. Per-Agent Failure Isolation
 
-**What:** `promptAll` in `brain.ts` (line ~491) calls `orchestrator.promptAll` without per-agent error handling. If any single agent prompt fails, the entire `PROMPT_ALL` command fails. Similarly, the `runAllParallel` function uses `Promise.allSettled` which logs failures but doesn't attempt recovery or retry for failed agents.
+**Status: Addressed (Cycle 2).** `promptAll` now returns `{ succeeded: string[], failed: Array<{agent, error}> }` instead of `void`. The brain's `prompt_all` handler surfaces partial failures to the LLM with actionable guidance (e.g., "Sent to 2/3 agents. Failed: broken: Unknown agent. Consider retrying failed agents individually with PROMPT."). The CLI also displays partial results. Tests cover all-success, partial-failure, and all-failure cases.
 
-**Why:** All-or-nothing semantics are simpler to reason about and implement. Partial success requires defining what "partially succeeded" means, how to report it back to the LLM, and how the brain should react — all of which add significant complexity.
+**What (original issue):** `promptAll` in `brain.ts` (line ~491) called `orchestrator.promptAll` without per-agent error handling. If any single agent prompt failed, the entire `PROMPT_ALL` command failed. Similarly, the `runAllParallel` function used `Promise.allSettled` which logged failures but didn't surface them to callers.
 
-**Ruled out:** Per-agent try/catch with partial success aggregation (for now). This could be added later, but the LLM would need to be taught how to interpret partial results, and the dashboard would need to show per-agent success/failure states from a single command. The current failure mode (one bad agent poisons the batch) is acceptable because the brain re-evaluates each round and can address failures individually in subsequent rounds.
+**Why (original):** All-or-nothing semantics were simpler to reason about and implement. Partial success requires defining what "partially succeeded" means, how to report it back to the LLM, and how the brain should react — all of which add significant complexity.
+
+**Ruled out:** Automatic retry within `promptAll` — the brain should decide whether to retry, not the orchestrator. The orchestrator reports what happened; the brain decides next steps.
 
 ---
 

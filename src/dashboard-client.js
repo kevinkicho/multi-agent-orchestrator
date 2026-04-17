@@ -496,7 +496,7 @@ function effectiveStatus(a) {
   // Combined project status: supervisor state takes priority over momentary worker idle
   if (a.supervisorStatus === 'paused') return 'paused'
   if (a.supervisorStatus === 'completed') return 'completed'
-  if (a.status === 'error' || a.status === 'disconnected') return a.status
+  if (a.status === 'error' || a.status === 'disconnected' || a.status === 'stuck') return a.status
   if (a.supervisorStatus === 'busy') return 'busy'
   return a.status
 }
@@ -2479,7 +2479,10 @@ async function pollEvents() {
       console.error('[orchestrator-dashboard] Poll event error:', err)
       // If handleEvent threw, cursor hasn't advanced — skip stale events by advancing cursor
       // so we don't get stuck in a loop crashing on the same bad event
-      if (cursor === 0) cursor = Date.now()
+      if (cursor === 0) {
+        cursor = Date.now()
+        showNotification('Live events may have been skipped during connection recovery', 'warning', 8000)
+      }
       await new Promise(r => setTimeout(r, 2000))
     }
   }

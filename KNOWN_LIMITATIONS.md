@@ -217,7 +217,7 @@ Changes to behavior that fix these limitations should reference the relevant sec
 
 ### 15f. Initial Load Failure State Never Clears on Recovery
 
-**Status: Fixed.** The original empty-state HTML is now saved on page load. When the poll loop successfully recovers after an initial failure, `restoreEmptyState()` resets the error message to the original content.
+**Status: Fixed.** The original empty-state HTML is now saved on page load. When the poll loop successfully recovers after an initial failure, `restoreEmptyState()` resets the error message to the original content. Additionally, when the poll loop encounters an error during initial cursor setup (`cursor === 0`), it shows a toast notification that live events may have been skipped.
 
 **What (original issue):** If `/api/status` failed on initial page load, the empty-state div was overwritten with "Unable to connect" text that persisted even after the server came back.
 

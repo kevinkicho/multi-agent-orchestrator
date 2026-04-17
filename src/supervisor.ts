@@ -1731,6 +1731,9 @@ Be specific with file paths, line numbers, and code snippets.`
       const rateLimitPause = Math.min(60_000 * consecutive429s, 300_000) // 60s, 120s, ... up to 5min
       cyclePause = Math.max(rateLimitPause, baseCyclePause)
       emit(`Rate-limited (${consecutive429s} consecutive 429s) — next cycle pause: ${Math.round(cyclePause / 1000)}s`)
+      // Reset 429 counter after applying the pause — we've already backed off, and if the API
+      // is still rate-limiting, the next 429 will re-increment the counter.
+      consecutive429s = 0
       // Don't increment consecutiveIdleCycles — this isn't the agent's fault
     } else if (consecutiveEmptyResponses > 0 || cycleRestartCount > 0) {
       // Agent genuinely struggling — exponential backoff
@@ -1741,7 +1744,6 @@ Be specific with file paths, line numbers, and code snippets.`
     } else if (cycleHadProgress) {
       // Agent productive — reset backoff
       consecutiveIdleCycles = 0
-      consecutive429s = 0
       cyclePause = baseCyclePause
     }
 
@@ -1893,6 +1895,11 @@ async function runSequential(
 ): Promise<void> {
   const concurrency = config.concurrency ?? 1
   const cyclesPerRotation = config.cyclesPerRotation ?? 2
+
+  if (agents.length === 0) {
+    config.dashboardLog?.push({ type: "brain-thinking", text: "[sequential] No agents to supervise — exiting." })
+    return
+  }
 
   config.dashboardLog?.push({
     type: "brain-thinking",

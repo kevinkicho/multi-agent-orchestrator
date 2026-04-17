@@ -303,4 +303,97 @@ With 5 agents running for 2+ hours:
 - **Polling rate:** 3 fixed intervals (10s status, 60s models, 30s admin panels) + 1 persistent long-poll + 1 persistent SSE. Does NOT scale with agent count.
 - **Remaining concern:** The `renderEntry()` function creates a new DOM node for every log entry. During active bursts, this can create 75-150 DOM nodes per cycle. With MAX_RENDERED=200 cap per panel, old nodes are removed, but creation cost scales with event frequency.
 
-**Fix:** Cap `cmdHistory` at 100 entries. Keep `removedAgents` as-is (its semantics require remembering removals).
+---
+
+## 17. SSE vs Poll Architecture Decision
+
+**What:** The dashboard runs both an SSE stream (`/api/events/stream`) and a long-poll loop (`/api/events`) simultaneously. The SSE stream delivers `BusEvent` objects (cross-agent notifications like intent-conflict, resource-contention, directive-updated) to the admin drawer's live event stream. The poll loop delivers `DashboardEvent` objects (agent-status, supervisor-thinking, agent-prompt, etc.) to agent log panels via `handleEvent()`.
+
+**No duplication:** These are two different event channels (EventBus vs DashboardLog) feeding two different UI regions. The poll and SSE do NOT deliver the same events to the same panels. The only overlap is `directive-updated` events, which are handled by the SSE handler to update the directive textarea — but these are BusEvents not DashboardEvents, so the poll loop never delivers them.
+
+**Why:** SSE provides lower-latency real-time updates. The poll loop provides a reliable fallback and delivers the detailed per-agent data that populates the main UI. Running both ensures responsiveness even when SSE reconnects.
+
+**Tradeoff:** The poll loop fetches events that SSE may have already delivered conceptually (e.g., a cycle-completion BusEvent and a cycle-summary DashboardEvent describe the same occurrence). This is redundant network traffic but does NOT cause visual duplication since they target different UI panels.
+
+---
+
+## 18. Stuck Status Priority Tradeoff
+
+**What:** The `effectiveStatus()` function determines what dot color an agent shows in the status bar. It resolves conflicts between the worker's status (idle, busy, stuck, error, disconnected) and the supervisor's status (busy, paused, completed, reviewing). The priority order is:
+
+1. `paused` (supervisor) — always wins
+2. `completed` (supervisor) — always wins
+3. `error`, `disconnected`, `stuck` (worker) — wins over supervisor `busy`
+4. `busy` (supervisor) — wins over worker `idle`
+5. `idle` (worker) — fallback
+
+**Why:** Originally, `stuck` was not in the priority list at all — it fell through to the default which returned `a.status`. But when the supervisor was `busy` (supervising the stuck agent), `effectiveStatus` would return `'busy'` instead of `'stuck'`, making the orange pulsing dot invisible at the exact moment it's most needed.
+
+**Tradeoff:** Showing `stuck` instead of `busy` means a supervisor actively working on the stuck agent will show as "stuck" rather than "busy." This is correct because the stuck state is more actionable than the busy state — the user needs to know something is wrong, not just that work is happening.
+
+---
+
+## 19. Dashboard Scroll Batching Tradeoff
+
+**What:** The `pushEntry()` function defers `scrollTop` writes to `requestAnimationFrame`. This batches layout reads/writes during active event bursts, eliminating layout thrashing. However, it introduces a 1-frame delay (up to 16ms) before a newly appended entry scrolls into view.
+
+**Why:** Without batching, every `pushEntry` call forced 1-2 synchronous layout computations via `offsetParent` and `scrollHeight`. During bursts of 5+ active agents generating 75+ events per cycle, this caused 20-30 forced layouts per second, leading to dropped frames and jank.
+
+**Tradeoff:** The 1-frame delay is imperceptible to users (16ms vs the 100-300ms event processing time), but it means the scroll position may lag slightly behind the actual content height. If a user manually scrolls during an active burst, the deferred rAF may race with their scroll gesture. The `store.pinned` flag mitigates this — if the user has scrolled up (unpinned), no scroll-to-bottom is attempted, so the rAF is a no-op.
+
+---
+
+## 20. Server-Side Memory and Growth Characteristics
+
+### 20a. DashboardLog Ring Buffer
+
+The `DashboardLog` class (`dashboard.ts:34-80`) maintains a `history` array capped at 500 entries. When it exceeds 500, it trims via `this.history = this.history.slice(trimCount)`, which creates a new array. This is an O(n) copy that happens roughly every time the buffer fills (every ~200-400 events, depending on how many agents generate how many events per cycle). The cost is negligible at 500 entries.
+
+### 20b. EventBus Ring Buffer
+
+The `EventBus` class (`event-bus.ts:38-76`) uses a `buffer` array capped at 200 entries. It uses `this.buffer.shift()` to trim, which is O(n) for 200 elements — negligible, but worth noting that a proper circular buffer would be O(1).
+
+### 20c. Performance Log Archive Files — Unbounded Disk Growth
+
+**This is the only server-side unbounded growth issue.** The `performance-log.ts` module (`src/performance-log.ts`) archives performance entries to daily files under `.orchestrator-performance-archive/`. Active entries are capped at 500, and entries older than 7 days are archived. But **archive files are never cleaned up** — they accumulate indefinitely at one file per day.
+
+**Risk:** Low in practice (one small JSON file per day, typically <100KB each), but over months of continuous operation, this directory grows without bound.
+
+**Recommended fix:** Add a cleanup step that deletes archive files older than 30 days.
+
+### 20d. pendingComments Array — No Hard Cap
+
+The `pendingComments` array in `ProjectState` (`project-manager.ts:66`) has no maximum size. Comments accumulate between supervisor reads. The supervisor drains the array each cycle via `getUnreadComments()`, so in practice it rarely holds more than a few entries. But there's no safety net if a user rapidly submits many comments before the supervisor reads them.
+
+**Recommended fix:** Cap at 50 entries, dropping the oldest when exceeded.
+
+### 20e. Memory Estimate for 5 Agents Over 8 Hours
+
+| Component | Per Agent | 5 Agents × 8 Hours | Notes |
+|-----------|----------|-------------------|-------|
+| Supervisor messages | ~60 entries (trimmed each cycle) | In-memory, GC'd each cycle | Local variable |
+| DashboardLog history | Fixed 500 entries | ~500 entries shared | Ring buffer, server-side |
+| EventBus buffer | Fixed 200 entries | ~200 entries shared | Ring buffer, server-side |
+| Brain memory (per agent) | 20 entries + 20 notes + 10 behavioral | 150 entries total | Capped, written to disk |
+| Performance log | Fixed 500 entries | ~500 entries active + archive files | Archived to disk |
+| Project state (per project) | ~1KB each | ~5KB total | Fixed per project |
+| **Total server-side memory** | | **~2MB** | Well within limits |
+
+| Client-side (browser) | Per Panel | 11 Panels Total | Notes |
+|------------------------|----------|----------------|-------|
+| Backing arrays (MAX_BACKING=5100) | ~5100 × 350 bytes | ~19.6 MB | Bounded, batch-trimmed |
+| DOM nodes (MAX_RENDERED=200) | ~200 per panel | ~2,200 nodes | Bounded |
+| Other JS state | ~5KB per agent | ~25KB | projectRows, agents, etc |
+| **Total client-side memory** | | **~20 MB** | Acceptable for modern browsers |
+
+### 20f. What Breaks First
+
+**If pushed beyond 8 hours with 5+ agents:**
+
+1. **Client-side: Backing array trim latency** — After panels fill to MAX_BACKING+TRIM_BATCH (5100 entries), the batch trim of 100 entries happens every ~100 events. With 5 agents generating 10+ events per cycle and cycles every 60-90 seconds, a panel fills in ~4-6 hours. After filling, the trim happens infrequently enough (once per 100 events) that the amortized cost is negligible.
+
+2. **Client-side: DOM creation during bursts** — `renderEntry()` creates new DOM nodes for every log entry. During a burst of 5 agents cycling simultaneously, 75-150 DOM node creations happen in rapid succession. The MAX_RENDERED=200 cap per panel prevents unbounded DOM growth, but the creation cost scales with event frequency. This is the most likely source of perceived lag.
+
+3. **Server-side: Performance archive files** — One file per day, never cleaned up. After months of operation, this directory could accumulate hundreds of files. Not a memory issue, but an unbounded disk concern.
+
+4. **Network: Poll loop HTTP requests** — 2 requests every 10 seconds (status + projects) plus 1 long-poll connection. This does NOT scale with agent count and is negligible for any reasonable deployment.

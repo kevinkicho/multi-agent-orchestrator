@@ -136,7 +136,7 @@ async function getModelContextSize(ollamaUrl: string, model: string): Promise<nu
         return ctx
       }
     }
-  } catch {}
+  } catch {} // Intentionally silent: best-effort context size detection
   return 0 // unknown
 }
 
@@ -158,7 +158,7 @@ export async function chatCompletion(
   ollamaUrl: string,
   model: string,
   messages: Message[],
-  opts?: { temperature?: number; maxTokens?: number; jsonMode?: boolean },
+  opts?: { temperature?: number; maxTokens?: number; jsonMode?: boolean; timeoutMs?: number },
 ): Promise<string> {
   const result = await chatCompletionWithUsage(ollamaUrl, model, messages, opts)
   return stripThinkTags(result.content)
@@ -169,9 +169,10 @@ export async function chatCompletionWithUsage(
   ollamaUrl: string,
   model: string,
   messages: Message[],
-  opts?: { temperature?: number; maxTokens?: number; jsonMode?: boolean },
+  opts?: { temperature?: number; maxTokens?: number; jsonMode?: boolean; timeoutMs?: number },
 ): Promise<{ content: string; usage?: TokenUsage }> {
   const ref = parseModelRef(model)
+  const timeoutMs = opts?.timeoutMs ?? 180_000
 
   // For Ollama provider, try dynamic context size detection
   if (ref.provider === "ollama") {
@@ -186,11 +187,12 @@ export async function chatCompletionWithUsage(
         temperature: opts?.temperature,
         maxTokens,
         jsonMode: opts?.jsonMode,
+        timeoutMs,
       })
       return { content: result.content, usage: result.usage }
     } catch (err) {
       // Fallback: direct Ollama call if provider system fails (e.g., first run before providers.json exists)
-      const content = await directOllamaCall(ollamaUrl, ref.model, messages, opts?.temperature ?? 0.3, maxTokens, opts?.jsonMode)
+      const content = await directOllamaCall(ollamaUrl, ref.model, messages, opts?.temperature ?? 0.3, maxTokens, opts?.jsonMode, timeoutMs)
       return { content }
     }
   }
@@ -203,6 +205,7 @@ export async function chatCompletionWithUsage(
     temperature: opts?.temperature,
     maxTokens: opts?.maxTokens,
     jsonMode: opts?.jsonMode,
+    timeoutMs,
   })
   return { content: result.content, usage: result.usage }
 }
@@ -215,9 +218,11 @@ async function directOllamaCall(
   temperature: number,
   maxTokens: number,
   jsonMode?: boolean,
+  timeoutMs?: number,
 ): Promise<string> {
+  const effectiveTimeout = timeoutMs ?? 180_000
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 300_000)
+  const timeout = setTimeout(() => controller.abort(), effectiveTimeout)
 
   const body: Record<string, unknown> = { model, messages, temperature, max_tokens: maxTokens }
   if (jsonMode) body.format = "json"
@@ -233,7 +238,7 @@ async function directOllamaCall(
   } catch (err) {
     clearTimeout(timeout)
     if (controller.signal.aborted) {
-      throw new Error(`Ollama request timed out after 5 minutes`)
+      throw new Error(`Ollama request timed out after ${Math.round(effectiveTimeout / 1000)}s`)
     }
     throw err
   }
@@ -461,7 +466,7 @@ export async function runBrain(
       try {
         const msgs = await orchestrator.getMessages(name)
         messageCountsBefore.set(name, msgs.length)
-      } catch {
+      } catch { // Intentionally silent: best-effort baseline count, falls back to 0
         messageCountsBefore.set(name, 0)
       }
     }
@@ -570,7 +575,9 @@ export async function runBrain(
           if (text) {
             responses.push(`${name} response:\n${text.slice(0, 2000)}`)
           }
-        } catch {}
+        } catch (err) {
+          console.error(`[brain] Failed to collect response from ${name}: ${err}`)
+        }
       }
       if (responses.length > 0) {
         results.push("Agent responses after waiting:\n\n" + responses.join("\n\n---\n\n"))

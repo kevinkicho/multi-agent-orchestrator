@@ -544,11 +544,21 @@ function isRateLimitError(err: unknown): boolean {
   return typeof err === "string" && /429|rate.?limit|session usage limit/i.test(err)
 }
 
+/** Check if an error was caused by a request timeout (AbortError) */
+function isTimeoutError(err: unknown): boolean {
+  if (err instanceof DOMException && err.name === "AbortError") return true
+  if (err instanceof Error && err.message.includes("timed out")) return true
+  return false
+}
+
 /** Check if an error indicates the agent is not registered in the orchestrator */
 function isUnknownAgentError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err)
   return /unknown agent/i.test(msg)
 }
+
+/** How long to wait for a single LLM response before aborting (3 minutes) */
+const LLM_CALL_TIMEOUT_MS = 180_000
 
 /** Wait for a single agent to finish (not all agents) */
 type WaitResult = {
@@ -660,7 +670,7 @@ export async function runAgentSupervisor(
   // Warm up the Ollama model to avoid cold-start latency on first LLM call
   warmupModel(ollamaUrl, model).then(() => {
     emit(`Model "${model}" warmed up and ready`)
-  }).catch(() => {}) // non-blocking, non-fatal
+  }).catch(() => {}) // Intentionally silent: best-effort model warmup
   logPerformance({ timestamp: Date.now(), projectName: directory, agentName, model, event: "supervisor_start" })
 
   // Analytics session tracking — await so sessionId is available before first cycle
@@ -668,8 +678,8 @@ export async function runAgentSupervisor(
   try {
     analyticsSessionId = await startSession(agentName, directory, model, directive)
     if (analyticsSessionId) config.onSessionStart?.(analyticsSessionId)
-  } catch {
-    // Analytics failure must not block the supervisor
+  } catch (err) {
+    console.error(`[${agentName}] Failed to start analytics session: ${err}`)
   }
 
   let loggedStop = false
@@ -728,7 +738,7 @@ export async function runAgentSupervisor(
     checkpointSupervisor({
       agentName, cycleNumber: cycleCount, lastSummary: "",
       directive, status: "running", updatedAt: Date.now(),
-    }).catch(() => {})
+    }).catch(err => console.error(`[${agentName}] Failed to checkpoint supervisor state: ${err}`))
 
     let memory = await loadBrainMemory()
     const memoryContext = formatMemoryForPrompt(memory, agentName)
@@ -857,7 +867,7 @@ export async function runAgentSupervisor(
           projectName: directory, agentName, model, cycleNumber: cycleCount,
           sessionId: analyticsSessionId ?? undefined,
           content: pauseMsg, tags: ["pause-request"],
-        }).catch(() => {})
+        }).catch(() => {}) // Intentionally silent: best-effort prompt ledger
       }
 
       // Mid-cycle user feedback — check every round so users can redirect a stuck supervisor
@@ -900,7 +910,7 @@ export async function runAgentSupervisor(
           projectName: directory, agentName, model, cycleNumber: cycleCount,
           sessionId: analyticsSessionId ?? undefined,
           content: lastMsg.content,
-        }).catch(() => {})
+        }).catch(() => {}) // Intentionally silent: best-effort prompt ledger
       }
 
       trimConversation(messages, maxConversationMessages)
@@ -925,11 +935,27 @@ export async function runAgentSupervisor(
       // LLM call with semaphore — withLlmSlot guarantees release even on error
       const doLlmCall = async (): Promise<{ content: string; usage?: import("./brain").TokenUsage } | null> => {
         try {
-          const result = await chatCompletionWithUsage(ollamaUrl, model, messages, config.structuredOutput ? { jsonMode: true } : undefined)
+          const result = await chatCompletionWithUsage(ollamaUrl, model, messages, { ...(config.structuredOutput ? { jsonMode: true } : {}), timeoutMs: LLM_CALL_TIMEOUT_MS })
           consecutiveLlmFailures = 0
           consecutive429s = 0
           return result
         } catch (err) {
+          if (isTimeoutError(err)) {
+            consecutiveLlmFailures++
+            emit(`LLM request timed out after ${Math.round(LLM_CALL_TIMEOUT_MS / 1000)}s (round ${round + 1}, failure #${consecutiveLlmFailures})`)
+            logPerformance({
+              timestamp: Date.now(), projectName: directory, agentName, model,
+              event: "cycle_error", cycleNumber: cycleCount,
+              details: `llm-timeout (${Math.round(LLM_CALL_TIMEOUT_MS / 1000)}s)`,
+            })
+            if (consecutiveLlmFailures >= 3) {
+              const pauseMs = Math.min(30_000 * consecutiveLlmFailures, 300_000)
+              emit(`LLM persistently timing out (${consecutiveLlmFailures} timeouts) — pausing ${Math.round(pauseMs / 1000)}s before next cycle`)
+              await new Promise(r => setTimeout(r, pauseMs))
+            }
+            llmBreakCycle = true
+            return null
+          }
           if (isRateLimitError(err)) {
             consecutive429s++
             config.resourceManager?.reportRateLimit(agentName)
@@ -950,7 +976,7 @@ export async function runAgentSupervisor(
           emit(`Retrying in ${retryDelay / 1000}s...`)
           await new Promise(r => setTimeout(r, retryDelay))
           try {
-            const retryResult = await chatCompletionWithUsage(ollamaUrl, model, messages, config.structuredOutput ? { jsonMode: true } : undefined)
+            const retryResult = await chatCompletionWithUsage(ollamaUrl, model, messages, { ...(config.structuredOutput ? { jsonMode: true } : {}), timeoutMs: LLM_CALL_TIMEOUT_MS })
             consecutiveLlmFailures = 0
             return retryResult
           } catch (retryErr) {
@@ -984,7 +1010,7 @@ export async function runAgentSupervisor(
           projectName: directory, agentName, model, cycleNumber: cycleCount,
           sessionId: analyticsSessionId ?? undefined,
           content: response,
-        }).catch(() => {})
+        }).catch(() => {}) // Intentionally silent: best-effort prompt ledger
       }
 
       if (!response) {
@@ -1033,7 +1059,7 @@ export async function runAgentSupervisor(
       try {
         const msgs = await orchestrator.getMessages(agentName)
         messageCountBefore = msgs.length
-      } catch { /* ignore */ }
+      } catch { /* Intentionally silent: best-effort baseline count, falls back to 0 */ }
 
       for (const cmd of commands) {
         commandCounts[cmd.type] = (commandCounts[cmd.type] ?? 0) + 1
@@ -1048,7 +1074,7 @@ export async function runAgentSupervisor(
                 projectName: directory, agentName, model, cycleNumber: cycleCount,
                 sessionId: analyticsSessionId ?? undefined,
                 content: cmd.message, tags: ["agent-prompt"],
-              }).catch(() => {})
+              }).catch(() => {}) // Intentionally silent: best-effort prompt ledger
             } catch (err) {
               results.push(`Error sending to ${agentName}: ${err}`)
             }
@@ -1133,7 +1159,7 @@ Be specific with file paths, line numbers, and code snippets.`
                 projectName: directory, agentName: targetAgent, model, cycleNumber: cycleCount,
                 sessionId: analyticsSessionId ?? undefined,
                 content: reviewText, tags: ["review"],
-              }).catch(() => {})
+              }).catch(() => {}) // Intentionally silent: best-effort prompt ledger
             } else {
               results.push("Review produced no output.")
             }
@@ -1272,7 +1298,7 @@ Be specific with file paths, line numbers, and code snippets.`
               agentLearnings: {},
             }, agentName)
             // Save conversation checkpoint for resume on restart
-            saveConversationCheckpoint(agentName, cycleCount, directive, messages).catch(() => {})
+            saveConversationCheckpoint(agentName, cycleCount, directive, messages).catch(err => console.error(`[${agentName}] Failed to save conversation checkpoint: ${err}`))
             emit(`Cycle ${cycleCount} complete: ${cmd.summary}`)
             config.dashboardLog?.push({
               type: "cycle-summary",
@@ -1289,8 +1315,8 @@ Be specific with file paths, line numbers, and code snippets.`
             checkpointSupervisor({
               agentName, cycleNumber: cycleCount, lastSummary: cmd.summary,
               directive, status: "running", updatedAt: Date.now(),
-            }).catch(() => {})
-            // Record cycle in analytics
+            }).catch(err => console.error(`[${agentName}] Failed to checkpoint supervisor state: ${err}`))
+            // Record cycle in analytics — intentionally silent: best-effort telemetry
             if (analyticsSessionId) {
               recordCycle(analyticsSessionId, cycleCount, cmd.summary, Date.now() - cycleStartTime, { ...commandCounts }).catch(() => {})
             }
@@ -1450,9 +1476,9 @@ Be specific with file paths, line numbers, and code snippets.`
             checkpointSupervisor({
               agentName, cycleNumber: cycleCount, lastSummary: cmd.summary,
               directive, status: isFailure ? "error" : "done", updatedAt: Date.now(),
-            }).catch(() => {})
+            }).catch(err => console.error(`[${agentName}] Failed to checkpoint final supervisor state: ${err}`))
             // Clear conversation checkpoint on clean stop
-            clearConversationCheckpoint(agentName).catch(() => {})
+            clearConversationCheckpoint(agentName).catch(err => console.error(`[${agentName}] Failed to clear conversation checkpoint: ${err}`))
             // Escalate to project manager
             config.onSupervisorStop?.(agentName, cmd.summary, isFailure)
             config.eventBus?.emit({
@@ -1514,11 +1540,13 @@ Be specific with file paths, line numbers, and code snippets.`
           try {
             await orchestrator.prompt(agentName, "/abort")
             await new Promise(r => setTimeout(r, 2000))
-          } catch {}
+          } catch {} // Intentionally silent: best-effort abort on stale agent
           try {
             const agent = (orchestrator as any).agents?.get(agentName)
             if (agent) { agent.status = "idle"; agent.lastActivity = Date.now(); agent.lastEventAt = Date.now() }
-          } catch {}
+          } catch (err) {
+            console.error(`[${agentName}] Failed to force-reset agent status after stale detection: ${err}`)
+          }
           cycleRestartCount++
           await addBehavioralNote(memory, agentName, `Agent went stale (silent ${waitResult.silentSeconds}s while busy). May need simpler prompts or the opencode process may be unstable.`)
           continue // Skip response collection — retry with next round
@@ -1527,7 +1555,7 @@ Be specific with file paths, line numbers, and code snippets.`
         if (waitResult.reason === "user-feedback") {
           emit(`User feedback received — interrupting wait to process it immediately`)
           // Abort current agent work so we can redirect
-          try { await orchestrator.prompt(agentName, "/abort") } catch {}
+          try { await orchestrator.prompt(agentName, "/abort") } catch {} // Intentionally silent: best-effort abort to redirect agent
           await new Promise(r => setTimeout(r, 1000))
           // Don't collect response — go straight to next round where mid-cycle feedback injection will fire
           results.push(`[USER FEEDBACK] Interrupted current work to process user feedback.`)
@@ -1560,7 +1588,7 @@ Be specific with file paths, line numbers, and code snippets.`
               projectName: directory, agentName, model, cycleNumber: cycleCount,
               sessionId: analyticsSessionId ?? undefined,
               content: lastText,
-            }).catch(() => {})
+            }).catch(() => {}) // Intentionally silent: best-effort prompt ledger
           } else {
             // Agent responded with empty content — track and escalate
             consecutiveEmptyResponses++
@@ -1634,7 +1662,9 @@ Be specific with file paths, line numbers, and code snippets.`
               results.push(`Agent returned an empty response. This may indicate the agent is struggling with the task. Try breaking it into smaller steps or rephrasing.`)
             }
           }
-        } catch { /* ignore */ }
+        } catch (err) {
+          emit(`WARNING: Failed to collect agent response: ${err}`)
+        }
       }
 
       // --- Resource contention check + auto-redirect ---
@@ -1680,7 +1710,7 @@ Be specific with file paths, line numbers, and code snippets.`
         sessionId: analyticsSessionId ?? undefined,
         content: `Supervisor paused after cycle ${cycleCount}`,
         tags: ["pause-entered"],
-      }).catch(() => {})
+      }).catch(() => {}) // Intentionally silent: best-effort prompt ledger
       config.eventBus?.emit({ type: "pause-entered", source: "supervisor", agentName, data: { cycleNumber: cycleCount } })
       await awaitResume(config.pauseState, config.signal)
       pauseInjected = false // reset so next pause request can inject again
@@ -1784,7 +1814,7 @@ Be specific with file paths, line numbers, and code snippets.`
   // End analytics session
   if (analyticsSessionId) {
     const sessionStatus = consecutiveFailedCycles > 0 ? "failed" as const : "completed" as const
-    endSession(analyticsSessionId, sessionStatus).catch(() => {})
+    endSession(analyticsSessionId, sessionStatus).catch(err => console.error(`[${agentName}] Failed to end analytics session: ${err}`))
   }
 }
 

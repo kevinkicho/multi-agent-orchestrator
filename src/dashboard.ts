@@ -532,72 +532,100 @@ export async function startDashboard(
 
       // ---- Provider management endpoints ----
       if (url.pathname === "/api/providers" && req.method === "GET") {
-        const { loadProviders } = await import("./providers")
-        const providers = await loadProviders()
-        // Mask API keys in response (show only last 4 chars)
-        const masked = providers.map(p => ({
-          ...p,
-          apiKey: p.apiKey ? "***" + p.apiKey.slice(-4) : "",
-          hasKey: !!(p.apiKey || (p.apiKeyEnv && process.env[p.apiKeyEnv])),
-        }))
-        return Response.json({ providers: masked }, { headers: corsHeaders })
+        try {
+          const { loadProviders } = await import("./providers")
+          const providers = await loadProviders()
+          // Mask API keys in response (show only last 4 chars)
+          const masked = providers.map(p => ({
+            ...p,
+            apiKey: p.apiKey ? "***" + p.apiKey.slice(-4) : "",
+            hasKey: !!(p.apiKey || (p.apiKeyEnv && process.env[p.apiKeyEnv])),
+          }))
+          return Response.json({ providers: masked }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: `Failed to load providers: ${err instanceof Error ? err.message : String(err)}` }, { status: 500, headers: corsHeaders })
+        }
       }
 
       if (url.pathname === "/api/providers" && req.method === "POST") {
-        const { addOrUpdateProvider } = await import("./providers")
-        const body = await req.json() as { id: string; name: string; baseUrl: string; type: string; apiKey?: string; apiKeyEnv?: string; models?: string[]; enabled?: boolean; defaultTemperature?: number; defaultMaxTokens?: number }
-        await addOrUpdateProvider({
-          id: body.id,
-          name: body.name,
-          baseUrl: body.baseUrl,
-          type: (body.type as "openai-compatible" | "anthropic") || "openai-compatible",
-          apiKey: body.apiKey ?? "",
-          apiKeyEnv: body.apiKeyEnv,
-          models: body.models ?? [],
-          enabled: body.enabled ?? true,
-          defaultTemperature: body.defaultTemperature,
-          defaultMaxTokens: body.defaultMaxTokens,
-        })
-        return Response.json({ ok: true }, { headers: corsHeaders })
+        try {
+          const { addOrUpdateProvider } = await import("./providers")
+          const body = await req.json() as { id: string; name: string; baseUrl: string; type: string; apiKey?: string; apiKeyEnv?: string; models?: string[]; enabled?: boolean; defaultTemperature?: number; defaultMaxTokens?: number }
+          await addOrUpdateProvider({
+            id: body.id,
+            name: body.name,
+            baseUrl: body.baseUrl,
+            type: (body.type as "openai-compatible" | "anthropic") || "openai-compatible",
+            apiKey: body.apiKey ?? "",
+            apiKeyEnv: body.apiKeyEnv,
+            models: body.models ?? [],
+            enabled: body.enabled ?? true,
+            defaultTemperature: body.defaultTemperature,
+            defaultMaxTokens: body.defaultMaxTokens,
+          })
+          return Response.json({ ok: true }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: `Failed to add/update provider: ${err instanceof Error ? err.message : String(err)}` }, { status: 500, headers: corsHeaders })
+        }
       }
 
       if (url.pathname.match(/^\/api\/providers\/[^/]+\/enable$/) && req.method === "POST") {
-        const { enableProvider } = await import("./providers")
-        const providerId = sanitizeParam(url.pathname.split("/")[3]!)
-        const body = await req.json() as { enabled: boolean }
-        const ok = await enableProvider(providerId, body.enabled)
-        return Response.json({ ok }, { headers: corsHeaders })
+        try {
+          const { enableProvider } = await import("./providers")
+          const providerId = sanitizeParam(url.pathname.split("/")[3]!)
+          const body = await req.json() as { enabled: boolean }
+          const ok = await enableProvider(providerId, body.enabled)
+          return Response.json({ ok }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: `Failed to enable provider: ${err instanceof Error ? err.message : String(err)}` }, { status: 500, headers: corsHeaders })
+        }
       }
 
       if (url.pathname.match(/^\/api\/providers\/[^/]+\/apikey$/) && req.method === "POST") {
-        const { setProviderApiKey } = await import("./providers")
-        const providerId = sanitizeParam(url.pathname.split("/")[3]!)
-        const body = await req.json() as { apiKey: string }
-        const ok = await setProviderApiKey(providerId, body.apiKey)
-        return Response.json({ ok }, { headers: corsHeaders })
+        try {
+          const { setProviderApiKey } = await import("./providers")
+          const providerId = sanitizeParam(url.pathname.split("/")[3]!)
+          const body = await req.json() as { apiKey: string }
+          const ok = await setProviderApiKey(providerId, body.apiKey)
+          return Response.json({ ok }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: `Failed to set API key: ${err instanceof Error ? err.message : String(err)}` }, { status: 500, headers:corsHeaders })
+        }
       }
 
       if (url.pathname.match(/^\/api\/providers\/[^/]+\/models$/) && req.method === "POST") {
-        const { addModelToProvider } = await import("./providers")
-        const providerId = sanitizeParam(url.pathname.split("/")[3]!)
-        const body = await req.json() as { model: string }
-        const ok = await addModelToProvider(providerId, body.model)
-        return Response.json({ ok }, { headers: corsHeaders })
+        try {
+          const { addModelToProvider } = await import("./providers")
+          const providerId = sanitizeParam(url.pathname.split("/")[3]!)
+          const body = await req.json() as { model: string }
+          const ok = await addModelToProvider(providerId, body.model)
+          return Response.json({ ok }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: `Failed to add model: ${err instanceof Error ? err.message : String(err)}` }, { status: 500, headers: corsHeaders })
+        }
       }
 
       if (url.pathname.match(/^\/api\/providers\/[^/]+\/models$/) && req.method === "DELETE") {
-        const { removeModelFromProvider } = await import("./providers")
-        const providerId = sanitizeParam(url.pathname.split("/")[3]!)
-        const body = await req.json() as { model: string }
-        const ok = await removeModelFromProvider(providerId, body.model)
-        return Response.json({ ok }, { headers: corsHeaders })
+        try {
+          const { removeModelFromProvider } = await import("./providers")
+          const providerId = sanitizeParam(url.pathname.split("/")[3]!)
+          const body = await req.json() as { model: string }
+          const ok = await removeModelFromProvider(providerId, body.model)
+          return Response.json({ ok }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: `Failed to remove model: ${err instanceof Error ? err.message : String(err)}` }, { status: 500, headers: corsHeaders })
+        }
       }
 
       // List all models across all enabled providers
       if (url.pathname === "/api/models" && req.method === "GET") {
-        const { listAllModels } = await import("./providers")
-        const models = await listAllModels()
-        return Response.json({ models }, { headers: corsHeaders })
+        try {
+          const { listAllModels } = await import("./providers")
+          const models = await listAllModels()
+          return Response.json({ models }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: `Failed to list models: ${err instanceof Error ? err.message : String(err)}` }, { status: 500, headers: corsHeaders })
+        }
       }
 
       // Performance log endpoint

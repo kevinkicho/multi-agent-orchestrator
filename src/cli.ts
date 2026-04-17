@@ -226,6 +226,9 @@ async function main() {
   if (autoApprove) console.log("Auto-approve: enabled")
   console.log("")
 
+  // Track consecutive stuck detections per agent for escalation
+  let stuckCounts: Map<string, number> | undefined
+
   const config: OrchestratorConfig = {
     agents,
     autoApprove,
@@ -269,6 +272,10 @@ async function main() {
       : undefined,
 
     onStatusChange(agentName, status, detail) {
+      // Reset stuck counter when agent recovers from stuck state
+      if (stuckCounts && (status === "idle" || status === "completed") && stuckCounts.has(agentName)) {
+        stuckCounts.delete(agentName)
+      }
       const statusColor = status === "error" || status === "disconnected" ? C.brightRed
         : status === "busy" ? C.yellow
         : status === "completed" ? C.green
@@ -317,11 +324,40 @@ async function main() {
         status: "stuck",
         detail: `Busy for ${mins}min with no progress`,
       })
-      // Auto-fetch latest messages for debugging (orchestrator is available via closure after init)
-      if (lazyOrchestrator) {
-        ;(async () => {
-          try {
-            const msgs = await lazyOrchestrator!.getMessages(agentName)
+
+      // Auto-recovery escalation: nudge → skip → pause
+      // Track consecutive stuck detections per agent
+      if (!stuckCounts) stuckCounts = new Map()
+      const count = (stuckCounts.get(agentName) || 0) + 1
+      stuckCounts.set(agentName, count)
+
+      ;(async () => {
+        try {
+          if (count === 1) {
+            // Nudge: inject a message telling the supervisor the agent is stuck
+            console.log(`${C.yellow}[STUCK-RECOVERY]${C.reset} Nudging ${agentName}'s supervisor about stuck agent`)
+            if (lazyOrchestrator && lazyOrchestrator.prompt) {
+              await lazyOrchestrator.prompt(agentName, `[STUCK] You have been busy for ${mins} minutes with no new messages. Consider:\n1. @abort the current task and try a different approach\n2. @restart your session if you're truly unresponsive\n3. @done with a summary if you've completed enough`)
+            }
+          } else if (count === 2) {
+            // Skip: restart the agent's session to unstick it
+            console.log(`${C.yellow}[STUCK-RECOVERY]${C.reset} Restarting ${agentName}'s session (2nd stuck detection)`)
+            if (lazyOrchestrator && lazyOrchestrator.restartAgent) {
+              await lazyOrchestrator.restartAgent(agentName)
+              dashLog.push({ type: "agent-status", agent: agentName, status: "restarting", detail: "Auto-restarted after 2nd stuck detection" })
+            }
+          } else if (count >= 3) {
+            // Pause: force-reset the agent and let others continue
+            console.log(`${C.brightRed}[STUCK-RECOVERY]${C.reset} Force-resetting ${agentName} (${count} stuck detections) — agent will resume next cycle`)
+            if (lazyOrchestrator && lazyOrchestrator.forceResetAgentStatus) {
+              lazyOrchestrator.forceResetAgentStatus(agentName)
+              dashLog.push({ type: "agent-status", agent: agentName, status: "idle", detail: `Force-reset after ${count} stuck detections` })
+            }
+          }
+
+          // Auto-capture latest messages for debugging
+          if (lazyOrchestrator) {
+            const msgs = await lazyOrchestrator.getMessages(agentName)
             const lastText = extractLastAssistantText(msgs)
             if (lastText) {
               dashLog.push({
@@ -330,9 +366,9 @@ async function main() {
                 text: `[AUTO-CAPTURED — agent stuck] ${lastText.slice(0, 2000)}`,
               })
             }
-          } catch {}
-        })()
-      }
+          }
+        } catch {}
+      })()
     },
   }
 

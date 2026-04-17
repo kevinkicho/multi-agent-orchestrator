@@ -67,7 +67,7 @@ export type Orchestrator = {
   /** Get the latest messages from an agent's session */
   getMessages: (agentName: string) => Promise<unknown[]>
   /** Get status overview of all agents */
-  status: () => Promise<Map<string, { status: string; sessionID: string | null; lastActivity: number }>>
+  status: () => Promise<Map<string, { status: string; sessionID: string | null; lastActivity: number; lastEventAt: number }>>
   /** Dynamically add a new agent at runtime */
   addAgent: (agentConfig: AgentConfig) => Promise<void>
   /** Remove an agent at runtime */
@@ -197,6 +197,10 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
 
   function handleEvent(name: string, agent: AgentState, event: AgentEvent) {
     config.onRawEvent?.(event)
+
+    // Every SSE event — even noisy deltas — proves the agent process is alive.
+    // This powers stale-busy detection in waitForAgent.
+    agent.lastEventAt = Date.now()
 
     const type = event.event.type
 
@@ -403,12 +407,13 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
     },
 
     async status() {
-      const result = new Map<string, { status: string; sessionID: string | null; lastActivity: number }>()
+      const result = new Map<string, { status: string; sessionID: string | null; lastActivity: number; lastEventAt: number }>()
       for (const [name, agent] of agents) {
         result.set(name, {
           status: agent.status,
           sessionID: agent.sessionID,
           lastActivity: agent.lastActivity,
+          lastEventAt: agent.lastEventAt,
         })
       }
       return result

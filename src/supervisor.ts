@@ -416,21 +416,44 @@ function isUnknownAgentError(err: unknown): boolean {
 }
 
 /** Wait for a single agent to finish (not all agents) */
+type WaitResult = {
+  /** Why the wait ended */
+  reason: "idle" | "timeout" | "stale" | "aborted" | "paused" | "disconnected"
+  /** Seconds the agent was silent (no SSE events) when wait ended. 0 if agent finished normally. */
+  silentSeconds: number
+}
+
+/** How long an agent can be "busy" with zero SSE events before we consider it stale/dead */
+const STALE_BUSY_THRESHOLD_MS = 45_000
+
 async function waitForAgent(
   orchestrator: Orchestrator,
   agentName: string,
   timeoutMs = 300_000,
   opts?: { signal?: AbortSignal; pauseState?: PauseState },
-): Promise<void> {
+): Promise<WaitResult> {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
-    if (opts?.signal?.aborted) return
-    if (opts?.pauseState && isPauseRequested(opts.pauseState)) return
+    if (opts?.signal?.aborted) return { reason: "aborted", silentSeconds: 0 }
+    if (opts?.pauseState && isPauseRequested(opts.pauseState)) return { reason: "paused", silentSeconds: 0 }
     const statuses = await orchestrator.status()
     const s = statuses.get(agentName)
-    if (!s || s.status !== "busy") return
+    if (!s) return { reason: "disconnected", silentSeconds: 0 }
+    if (s.status !== "busy") return { reason: "idle", silentSeconds: 0 }
+
+    // Stale-busy detection: agent says "busy" but no SSE events flowing
+    const silenceMs = Date.now() - s.lastEventAt
+    if (silenceMs > STALE_BUSY_THRESHOLD_MS) {
+      return { reason: "stale", silentSeconds: Math.round(silenceMs / 1000) }
+    }
+
     await new Promise(r => setTimeout(r, 2000))
   }
+  // Timed out — compute how long the agent has been silent
+  const statuses = await orchestrator.status()
+  const s = statuses.get(agentName)
+  const silenceMs = s ? Date.now() - s.lastEventAt : 0
+  return { reason: "timeout", silentSeconds: Math.round(silenceMs / 1000) }
 }
 
 
@@ -935,7 +958,12 @@ Be specific with file paths, line numbers, and code snippets.`
             }
 
             // Wait for review to complete
-            await waitForAgent(orchestrator, targetAgent, 300_000, { signal: config.signal, pauseState: config.pauseState })
+            const reviewWait = await waitForAgent(orchestrator, targetAgent, 300_000, { signal: config.signal, pauseState: config.pauseState })
+            if (reviewWait.reason === "stale") {
+              emit(`Review agent ${targetAgent} went stale (silent ${reviewWait.silentSeconds}s) — skipping review`)
+              results.push(`Review skipped: agent was unresponsive (silent ${reviewWait.silentSeconds}s)`)
+              break
+            }
 
             // Get review response
             const reviewMsgs = await orchestrator.getMessages(targetAgent)
@@ -1320,7 +1348,28 @@ Be specific with file paths, line numbers, and code snippets.`
       // Wait for agent to finish, then collect response
       if (shouldWait) {
         emit(`Waiting for ${agentName} to finish...`)
-        await waitForAgent(orchestrator, agentName, 300_000, { signal: config.signal, pauseState: config.pauseState })
+        const waitResult = await waitForAgent(orchestrator, agentName, 300_000, { signal: config.signal, pauseState: config.pauseState })
+
+        // Stale-busy: agent claims busy but no SSE events — process likely dead
+        if (waitResult.reason === "stale") {
+          emit(`STALE AGENT: ${agentName} has been silent for ${waitResult.silentSeconds}s while "busy" — likely dead. Restarting.`)
+          results.push(`[STALE AGENT] ${agentName} was unresponsive for ${waitResult.silentSeconds}s with no activity. Automatically restarted.`)
+          try {
+            await orchestrator.prompt(agentName, "/abort")
+            await new Promise(r => setTimeout(r, 2000))
+          } catch {}
+          try {
+            const agent = (orchestrator as any).agents?.get(agentName)
+            if (agent) { agent.status = "idle"; agent.lastActivity = Date.now(); agent.lastEventAt = Date.now() }
+          } catch {}
+          cycleRestartCount++
+          await addBehavioralNote(memory, agentName, `Agent went stale (silent ${waitResult.silentSeconds}s while busy). May need simpler prompts or the opencode process may be unstable.`)
+          continue // Skip response collection — retry with next round
+        }
+
+        if (waitResult.reason === "timeout") {
+          emit(`TIMEOUT: ${agentName} still busy after 5 minutes (silent for ${waitResult.silentSeconds}s). Will collect whatever is available.`)
+        }
 
         // Collect new response (only messages added after our prompt)
         try {

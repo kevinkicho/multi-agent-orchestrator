@@ -24,6 +24,9 @@ export type AgentState = {
   lastActivity: number
   /** Timestamp when the agent started its current busy period */
   busyStartTime: number | null
+  /** Timestamp of the last SSE event received — any event, including streaming deltas.
+   *  Used to detect stale-busy agents (status stuck on "busy" but no events flowing). */
+  lastEventAt: number
 }
 
 export function createAgent(config: AgentConfig): AgentState {
@@ -45,6 +48,7 @@ export function createAgent(config: AgentConfig): AgentState {
     status: "disconnected",
     lastError: null,
     lastActivity: Date.now(),
+    lastEventAt: Date.now(),
     busyStartTime: null,
   }
 }

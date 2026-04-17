@@ -76,6 +76,8 @@ export type Orchestrator = {
   abortAgent: (agentName: string) => Promise<void>
   /** Restart an agent's session (abort + create fresh session) */
   restartAgent: (agentName: string) => Promise<string>
+  /** Force-reset an agent's status to idle and update activity timestamps. Used when an agent is detected as stale or unresponsive and needs to be unblocked without creating a new session. */
+  forceResetAgentStatus: (agentName: string) => void
   /** Gracefully shut down all connections */
   shutdown: () => void
 }
@@ -476,7 +478,7 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
       const agent = agents.get(agentName)
       if (!agent) throw new Error(`Unknown agent: ${agentName}`)
       // Abort current work
-      try { await agentAbort(agent) } catch {}
+      try { await agentAbort(agent) } catch {} // Intentionally silent: best-effort abort before restart
       agent.busyStartTime = null
       lastMessageCounts.delete(agentName)
       emptyResponseCounts.delete(agentName)
@@ -484,6 +486,15 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
       const sessionID = await agentCreateSession(agent)
       config.onStatusChange?.(agentName, "idle", `Restarted, new session: ${sessionID}`)
       return sessionID
+    },
+
+    forceResetAgentStatus(agentName) {
+      const agent = agents.get(agentName)
+      if (!agent) return
+      agent.status = "idle"
+      agent.lastActivity = Date.now()
+      agent.lastEventAt = Date.now()
+      agent.busyStartTime = null
     },
 
     shutdown() {

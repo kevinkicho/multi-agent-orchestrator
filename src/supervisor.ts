@@ -1546,8 +1546,7 @@ Be specific with file paths, line numbers, and code snippets.`
             await new Promise(r => setTimeout(r, 2000))
           } catch {} // Intentionally silent: best-effort abort on stale agent
           try {
-            const agent = (orchestrator as any).agents?.get(agentName)
-            if (agent) { agent.status = "idle"; agent.lastActivity = Date.now(); agent.lastEventAt = Date.now() }
+            orchestrator.forceResetAgentStatus(agentName)
           } catch (err) {
             console.error(`[${agentName}] Failed to force-reset agent status after stale detection: ${err}`)
           }

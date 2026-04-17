@@ -24,6 +24,7 @@ describe("promptAll result type", () => {
       removeAgent: () => {},
       abortAgent: async () => {},
       restartAgent: async () => "sess",
+      forceResetAgentStatus: () => {},
       shutdown: () => {},
     }
 

@@ -40,6 +40,7 @@ function createMockOrchestrator(): Orchestrator {
     removeAgent() {},
     async abortAgent() {},
     async restartAgent() { return "new-sess" },
+    forceResetAgentStatus() {},
     shutdown() {},
   }
 }

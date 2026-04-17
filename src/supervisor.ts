@@ -1295,38 +1295,40 @@ Be specific with file paths, line numbers, and code snippets.`
             }
             cycleDone = true
             cycleHadProgress = true
-            await addMemoryEntry(memory, {
-              timestamp: Date.now(),
-              objective: `${agentName} cycle ${cycleCount}: ${directive}`,
-              summary: cmd.summary,
-              agentLearnings: {},
-            }, agentName)
-            // Save conversation checkpoint for resume on restart
-            saveConversationCheckpoint(agentName, cycleCount, directive, messages).catch(err => console.error(`[${agentName}] Failed to save conversation checkpoint: ${err}`))
-            emit(`Cycle ${cycleCount} complete: ${cmd.summary}`)
-            config.dashboardLog?.push({
-              type: "cycle-summary",
-              cycle: cycleCount,
-              agent: agentName,
-              summary: cmd.summary,
-            })
-            logPerformance({
-              timestamp: Date.now(), projectName: directory, agentName, model,
-              event: "cycle_complete", cycleNumber: cycleCount,
-              durationMs: Date.now() - cycleStartTime, summary: cmd.summary,
-            })
-            // Checkpoint supervisor state for crash recovery
-            checkpointSupervisor({
-              agentName, cycleNumber: cycleCount, lastSummary: cmd.summary,
-              directive, status: "running", updatedAt: Date.now(),
-            }).catch(err => console.error(`[${agentName}] Failed to checkpoint supervisor state: ${err}`))
-            // Record cycle in analytics — intentionally silent: best-effort telemetry
-            if (analyticsSessionId) {
-              recordCycle(analyticsSessionId, cycleCount, cmd.summary, Date.now() - cycleStartTime, { ...commandCounts }).catch(() => {})
+            // Defer persisting cycle results until post-cycle validation passes.
+            // If validation fails with "inject" action, cycleDone is set back to false
+            // and these saves must not happen — they would create duplicate entries.
+            const cycleSummary = cmd.summary
+            const cycleCompleteActions = async () => {
+              await addMemoryEntry(memory, {
+                timestamp: Date.now(),
+                objective: `${agentName} cycle ${cycleCount}: ${directive}`,
+                summary: cycleSummary,
+                agentLearnings: {},
+              }, agentName)
+              saveConversationCheckpoint(agentName, cycleCount, directive, messages).catch(err => console.error(`[${agentName}] Failed to save conversation checkpoint: ${err}`))
+              emit(`Cycle ${cycleCount} complete: ${cycleSummary}`)
+              config.dashboardLog?.push({
+                type: "cycle-summary",
+                cycle: cycleCount,
+                agent: agentName,
+                summary: cycleSummary,
+              })
+              logPerformance({
+                timestamp: Date.now(), projectName: directory, agentName, model,
+                event: "cycle_complete", cycleNumber: cycleCount,
+                durationMs: Date.now() - cycleStartTime, summary: cycleSummary,
+              })
+              checkpointSupervisor({
+                agentName, cycleNumber: cycleCount, lastSummary: cycleSummary,
+                directive, status: "running", updatedAt: Date.now(),
+              }).catch(err => console.error(`[${agentName}] Failed to checkpoint supervisor state: ${err}`))
+              if (analyticsSessionId) {
+                recordCycle(analyticsSessionId, cycleCount, cycleSummary, Date.now() - cycleStartTime, { ...commandCounts }).catch(() => {}) // Intentionally silent: best-effort telemetry
+              }
+              config.onCycleSummary?.(cycleSummary)
+              config.onCycleComplete?.(cycleCount)
             }
-            // Notify upstream (e.g., TeamManager) about this cycle's summary
-            config.onCycleSummary?.(cmd.summary)
-            config.onCycleComplete?.(cycleCount)
 
             // --- Post-cycle validation ---
             if (config.postCycleValidation && (config.postCycleValidation.command || config.postCycleValidation.preset)) {
@@ -1382,6 +1384,13 @@ Be specific with file paths, line numbers, and code snippets.`
               } catch (err) {
                 emit(`Validation error: ${err}`)
               }
+            }
+
+            // Only persist cycle results if validation passed (or wasn't run).
+            // If validation failed with "inject" action, cycleDone was set back to false
+            // and we skip this — preventing duplicate memory entries.
+            if (cycleDone) {
+              await cycleCompleteActions()
             }
 
             // --- False progress detection ---

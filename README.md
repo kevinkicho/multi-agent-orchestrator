@@ -47,7 +47,7 @@ Multi-Agent Orchestrator spawns and manages multiple [opencode](https://github.c
                     |              |               |
              +------v------+ +----v-------+ +-----v------+
              |  opencode   | | opencode   | | opencode   |
-             |  serve :3001| | serve :3002| | serve :3003|
+             |  serve :rand| | serve :rand| | serve :rand|
              +------+------+ +-----+------+ +-----+------+
                     |              |               |
              +------v------+ +----v-------+ +-----v------+
@@ -71,7 +71,7 @@ Multi-Agent Orchestrator spawns and manages multiple [opencode](https://github.c
 ```
 
 Each project gets:
-- A dedicated **opencode serve** instance (worker agent) on its own port
+- A dedicated **opencode serve** instance (worker agent) on a randomly assigned port (10000–60000)
 - A dedicated **LLM supervisor** that reviews the worker's output, assigns tasks, and provides feedback
 - An optional **git branch** for isolated work (`agent/<name>`)
 - A **row in the dashboard** with separate worker and supervisor log panels
@@ -129,7 +129,9 @@ Each project gets:
 - **Analytics and session tracking** -- Cycle summaries, git snapshots, AI-powered evaluation, cross-session comparison, timeline visualization
 - **Prompt ledger** -- Persistent, queryable log of every prompt at every level with filters and pagination
 - **Performance logging** -- Per-model cycle stats with automatic archival of entries older than 7 days
-- **Project save/restore** -- Auto-save projects with directives, models, and history. Restore from previous sessions
+- **Project save/restore** -- Auto-save projects with directives, models, and history. On startup, a restore modal offers to re-add all previously active projects or start fresh
+- **Random port allocation** -- Worker agents are assigned random ports (10000–60000) to avoid conflicts with other local services
+- **Ghost project cleanup** -- Failed or errored projects are automatically cleaned from the project map, so re-adding always works
 
 ### Reliability
 
@@ -261,17 +263,18 @@ The dashboard is served at `http://127.0.0.1:4000` (configurable) and provides:
 - **Real-time streaming** -- SSE auto-connect on page load, plus 30-second auto-refresh for open panels
 - **Global search** -- Filters across all panels, project rows, log entries, live events, and bus events
 - **Toast notifications** -- Stacked notifications for agent completions, errors, and actions (success/error/warning/info types)
-- **Command palette** -- Ctrl+K to open, with quick commands for adding projects, sending prompts, checking status
+- **Command palette** -- Ctrl+K or `?` button to open. 35+ commands organized into 7 sections (Prompting, Supervision, Projects, Pause & Resume, Git & Validation, Tasks, Team Mode, Infrastructure) with examples for each command
 - **Permission approvals** -- Visual permission request cards with approve/deny/approve-all buttons
 - **Project management** -- Add projects via folder browser, remove projects, restart supervisors
-- **Directive editing** -- View and edit each project's directive; saving restarts the supervisor
+- **Tabbed project drawers** -- Each project has a collapsible drawer with three tabs: Settings (model selector, directive, comments), History (directive timeline with revert), and Memory (agent behavioral notes, project notes, session summaries)
 - **Per-project model selection** -- Choose from models across all enabled providers
+- **Agent memory viewer** -- Memory tab shows behavioral notes (amber), project notes (green), and session summaries (purple) with learnings — lets you see what the AI has learned about your project
 - **Branch isolation badges** -- Shows the agent's working branch with merge button
 - **Post-cycle validation** -- Configure validation commands or presets per project
 - **Blinking status badges** -- Status indicators blink when agents are active
 - **Model performance comparison** -- Collapsible section with per-model cycle stats
-- **Directive history timeline** -- View directive evolution with source badges, timestamps, comments, and one-click revert
-- **Project save/restore** -- Auto-save on changes; restore modal with directory existence checks
+- **Project save/restore** -- Auto-save on changes; restore modal on startup when saved projects exist but none are active
+- **Port display** -- Each project header shows its assigned port number
 - **Project status badges** -- Real-time STARTING, RUNNING, SUPERVISING, FINISHED, ERROR badges
 - **Team hierarchy visualization** -- Manager node connected to member cards with status dots, roles, and directives
 - **Event Bus panel** -- Live event log with type/source filters
@@ -286,6 +289,7 @@ The dashboard is served at `http://127.0.0.1:4000` (configurable) and provides:
 - **Responsive layout** -- Adapts at 900px and 600px breakpoints
 - **ARIA accessibility** -- Screen reader support with roles, labels, keyboard navigation, and aria-expanded sync via MutationObserver
 - **Drag-to-annotate feedback** -- Select text in any log panel to submit behavioral or project feedback
+- **Smart auto-scroll** -- Chat logs stick to bottom when you're there, but don't force-scroll when you've scrolled up to read history. Properly catches up when opening a collapsed panel
 
 ---
 
@@ -364,7 +368,7 @@ When the orchestrator is running, the interactive REPL accepts:
 ### Project Lifecycle
 
 1. **Add a project** -- via dashboard or `project add <directory>`. The ProjectManager:
-   - Finds a free port starting from 3001
+   - Finds a free random port (10000–60000) to avoid conflicts with other local services
    - Spawns an `opencode serve` instance pointed at the project directory
    - Waits for the health check to pass
    - Registers the agent with the orchestrator
@@ -407,6 +411,8 @@ The orchestrator persists state in `.orchestrator-memory.json`:
 - **Session entries** -- Summaries of past brain/supervisor sessions (last 50)
 - **Project notes** -- Per-agent notes accumulated by supervisors (last 20 per agent)
 - **Behavioral notes** -- Per-agent lessons about how agents work best (last 10 per agent), injected into future supervisor system prompts. Deduplicated by keyword similarity.
+
+All memory is viewable per-agent in the dashboard's **Memory tab** (in each project's drawer) and via the `GET /api/memory/<agent>` endpoint.
 
 ### Event Bus
 
@@ -452,12 +458,12 @@ Performance events logged to `orchestrator-performance.json`: `supervisor_start`
 | `supervisor.ts` | ~1800 | Socratic supervisor loop: free-thinking LLM dialogue with `@` marker parsing, per-agent cycles, stale-busy detection, pause hard-break, validation, false progress detection, resource contention, event bus emissions, command recovery. Legacy UPPERCASE command fallback. |
 | `brain.ts` | 594 | Higher-level brain: coordinates multiple agents toward a single objective. Dynamic model context size detection. |
 | `brain-memory.ts` | 215 | Persistent memory store: session summaries, project notes, behavioral notes with async write locks. |
-| `project-manager.ts` | 820 | Dynamic project provisioning: spawns processes, allocates ports, branch isolation, directive history, pause/resume, A/B test tracking. |
+| `project-manager.ts` | 894 | Dynamic project provisioning: random port allocation (10000–60000), ghost project cleanup, branch isolation, directive history, pause/resume, save/restore, A/B test tracking. |
 | `team-manager.ts` | 814 | Team mode: LLM-powered manager coordinating multiple agents with hiring/dissolution, role assignment, and event bus integration. |
-| `dashboard.ts` | 1084 | Web dashboard HTTP server: REST API endpoints, long-poll event streaming, SSE, static asset serving, API token authentication. |
-| `dashboard.html` | 371 | Dashboard HTML shell: markup structure referencing external CSS and JS. |
-| `dashboard-client.css` | 1170 | Dashboard styles: dark/light themes, responsive breakpoints, sidebar, toast notifications, team hierarchy. |
-| `dashboard-client.js` | 2314 | Dashboard client logic: event handling, agent management, status updates, search, toasts, sidebar, ARIA sync. |
+| `dashboard.ts` | 1144 | Web dashboard HTTP server: REST API endpoints, memory API, project restore, long-poll event streaming, SSE, static asset serving, API token authentication. |
+| `dashboard.html` | 418 | Dashboard HTML shell: command palette with 35+ commands, markup structure referencing external CSS and JS. |
+| `dashboard-client.css` | 1371 | Dashboard styles: dark/light themes, responsive breakpoints, sidebar, toast notifications, team hierarchy, tabbed drawers, memory viewer. |
+| `dashboard-client.js` | 2750 | Dashboard client logic: event handling, agent management, status updates, search, toasts, sidebar, ARIA sync, smart auto-scroll, tabbed drawers, memory viewer, restore modal. |
 | `providers.ts` | 514 | Multi-LLM provider management: Ollama, OpenAI, Anthropic, Google, Groq, Mistral, OpenRouter, custom. Model listing, API key resolution, provider templates. |
 | `event-bus.ts` | 137 | In-memory event bus: ring buffer, pattern-matched subscriptions, SSE streaming support. |
 | `resource-manager.ts` | 240 | Advisory file locks, work intent ledger, LLM concurrency semaphore, rate-limit coordination. |
@@ -551,7 +557,7 @@ The dashboard server exposes these REST endpoints. `GET` requests are unauthenti
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/api/projects` | List active projects |
-| `POST` | `/api/projects` | Add a project (`{ directory, directive?, name? }`) |
+| `POST` | `/api/projects` | Add a project (`{ directory, directive?, name? }`). Returns 409 if already active, 404 if directory missing |
 | `DELETE` | `/api/projects/<id>` | Remove a project |
 | `PUT` | `/api/projects/<id>/directive` | Update directive and restart supervisor (`{ directive }`) |
 | `PUT` | `/api/projects/<id>/model` | Update model and restart supervisor (`{ model }`) |
@@ -564,7 +570,9 @@ The dashboard server exposes these REST endpoints. `GET` requests are unauthenti
 | `POST` | `/api/projects/<id>/validation` | Set validation config (`{ command?, preset?, failAction? }`) |
 | `POST` | `/api/projects/<id>/ab-test` | Start an A/B test (`{ variants: [...] }`) |
 | `GET` | `/api/projects/<id>/ab-test` | Get A/B test results for a project |
-| `GET` | `/api/saved-projects` | Load saved project configs for restore |
+| `GET` | `/api/projects/saved` | Load saved project configs for restore |
+| `POST` | `/api/projects/restore` | Restore all saved projects |
+| `GET` | `/api/memory/<agent>` | Agent memory: behavioral notes, project notes, session summaries |
 
 ### Global Controls
 

@@ -90,15 +90,18 @@ type SavedProjects = {
 // Port utilities
 // ---------------------------------------------------------------------------
 
-const BASE_PORT = 3001
+const PORT_MIN = 10000
+const PORT_MAX = 60000
 const usedPorts = new Set<number>()
 
-async function findFreePort(startFrom: number): Promise<number> {
-  let port = startFrom
-  while (usedPorts.has(port)) port++
-  // Reserve immediately to prevent concurrent addProject calls from grabbing the same port
-  for (let attempt = 0; attempt < 50; attempt++) {
-    while (usedPorts.has(port)) port++
+function randomPort(): number {
+  return PORT_MIN + Math.floor(Math.random() * (PORT_MAX - PORT_MIN))
+}
+
+async function findFreePort(): Promise<number> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const port = randomPort()
+    if (usedPorts.has(port)) continue
     usedPorts.add(port) // reserve before testing
     try {
       const server = Bun.serve({ port, hostname: "127.0.0.1", fetch: () => new Response("") })
@@ -106,10 +109,9 @@ async function findFreePort(startFrom: number): Promise<number> {
       return port // already in usedPorts
     } catch {
       usedPorts.delete(port) // release failed reservation
-      port++
     }
   }
-  throw new Error(`Cannot find free port starting from ${startFrom}`)
+  throw new Error("Cannot find free port after 100 attempts")
 }
 
 // ---------------------------------------------------------------------------
@@ -235,10 +237,15 @@ export class ProjectManager {
     const id = `proj-${++this.idCounter}`
     let agentName = projectName.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-")
 
-    // Check for duplicate directory
-    for (const p of this.projects.values()) {
-      if (p.directory === resolvedDir && p.status !== "stopped") {
-        throw new Error(`Project at ${resolvedDir} is already active`)
+    // Check for duplicate directory — clean up dead entries, block truly active ones
+    for (const [existingId, p] of this.projects.entries()) {
+      if (p.directory === resolvedDir) {
+        if (p.status === "stopped" || p.status === "error") {
+          // Remove stale entry so re-add works cleanly
+          this.projects.delete(existingId)
+        } else {
+          throw new Error(`Project at ${resolvedDir} is already active`)
+        }
       }
     }
 
@@ -246,11 +253,11 @@ export class ProjectManager {
     const baseAgentName = agentName
     let suffix = 1
     while (this.orchestrator.agents.has(agentName) ||
-           Array.from(this.projects.values()).some(p => p.agentName === agentName && p.status !== "stopped")) {
+           Array.from(this.projects.values()).some(p => p.agentName === agentName && p.status !== "stopped" && p.status !== "error")) {
       agentName = `${baseAgentName}-${++suffix}`
     }
 
-    const port = await findFreePort(BASE_PORT)
+    const port = await findFreePort()
 
     const project: ProjectState = {
       id,
@@ -363,12 +370,11 @@ export class ProjectManager {
 
       return project
     } catch (err) {
-      project.status = "error"
-      project.error = String(err)
       this.dashLog.push({ type: "brain-thinking", text: `Error adding ${projectName}: ${err}` })
-      // Clean up
+      // Clean up — remove from map so re-add isn't blocked
       const proc = this.processes.get(id)
       if (proc) { killProcessTree(proc.pid).catch(() => {}); this.processes.delete(id) }
+      this.projects.delete(id)
       usedPorts.delete(port)
       throw err
     }
@@ -842,7 +848,37 @@ export class ProjectManager {
     })
   }
 
-  /** Load previously saved projects (for restore on startup) */
+  /** Load previously saved projects list (does not restore them — caller decides) */
+  async getSavedProjects(): Promise<SavedProjects["projects"]> {
+    try {
+      const data = await readJsonFile<SavedProjects>(resolve(process.cwd(), PROJECTS_FILE), { projects: [] })
+      return data?.projects ?? []
+    } catch {
+      return []
+    }
+  }
+
+  /** Restore previously saved projects (re-adds them) */
+  async restoreProjects(): Promise<{ restored: string[]; failed: string[] }> {
+    const saved = await this.getSavedProjects()
+    if (saved.length === 0) return { restored: [], failed: [] }
+
+    const restored: string[] = []
+    const failed: string[] = []
+
+    for (const p of saved) {
+      try {
+        await this.addProject(p.directory, p.directive, p.name, p.directiveHistory)
+        restored.push(p.name)
+      } catch (err) {
+        failed.push(`${p.name}: ${err}`)
+        this.dashLog.push({ type: "brain-thinking", text: `Failed to restore ${p.name}: ${err}` })
+      }
+    }
+
+    return { restored, failed }
+  }
+
   /** Shut down everything — kills all child processes and waits for port release */
   shutdown() {
     // Cancel all pending auto-restart timers

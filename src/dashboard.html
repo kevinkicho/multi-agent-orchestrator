@@ -346,17 +346,70 @@
 
   <div class="cmd-palette" id="cmd-palette">
     <h3>Commands</h3>
+
+    <div class="cmd-section-title">Prompting</div>
     <div class="cmd-grid">
-      <div class="cmd-item" onclick="cmdFill('')"><span class="cmd-key">&lt;agent&gt; &lt;prompt&gt;</span><span class="cmd-desc">Send prompt to agent</span></div>
-      <div class="cmd-item" onclick="cmdFill('all ')"><span class="cmd-key">all &lt;prompt&gt;</span><span class="cmd-desc">Prompt all agents</span></div>
-      <div class="cmd-item" onclick="cmdFill('brain ')"><span class="cmd-key">brain &lt;objective&gt;</span><span class="cmd-desc">One-shot orchestrator task</span></div>
-      <div class="cmd-item" onclick="cmdFill('brain-loop ')"><span class="cmd-key">brain-loop &lt;directive&gt;</span><span class="cmd-desc">Start parallel supervisors</span></div>
-      <div class="cmd-item" onclick="cmdFill('brain-queue')"><span class="cmd-key">brain-queue</span><span class="cmd-desc">Run task queue</span></div>
-      <div class="cmd-item" onclick="cmdFill('stop')"><span class="cmd-key">stop</span><span class="cmd-desc">Soft stop all supervisors</span></div>
-      <div class="cmd-item" onclick="cmdFill('tasks')"><span class="cmd-key">tasks</span><span class="cmd-desc">Show task queue</span></div>
-      <div class="cmd-item" onclick="cmdFill('task add ')"><span class="cmd-key">task add &lt;title&gt;</span><span class="cmd-desc">Add a task</span></div>
-      <div class="cmd-item" onclick="cmdFill('status')"><span class="cmd-key">status</span><span class="cmd-desc">Agent status</span></div>
-      <div class="cmd-item" onclick="cmdFill('messages ')"><span class="cmd-key">messages &lt;agent&gt;</span><span class="cmd-desc">Recent messages</span></div>
+      <div class="cmd-item" onclick="cmdFill('')"><span class="cmd-key">&lt;agent&gt; &lt;prompt&gt;</span><span class="cmd-desc">Send prompt to agent</span><span class="cmd-example">e.g. <code>yahoo Fix the chart tooltip</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('all ')"><span class="cmd-key">all &lt;prompt&gt;</span><span class="cmd-desc">Prompt all agents at once</span><span class="cmd-example">e.g. <code>all Run your test suite</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('messages ')"><span class="cmd-key">messages &lt;agent&gt;</span><span class="cmd-desc">Show recent messages from an agent</span><span class="cmd-example">e.g. <code>messages nih</code></span></div>
+    </div>
+
+    <div class="cmd-section-title">Supervision</div>
+    <div class="cmd-grid">
+      <div class="cmd-item" onclick="cmdFill('brain ')"><span class="cmd-key">brain &lt;objective&gt;</span><span class="cmd-desc">One-shot orchestrator task (no loop)</span><span class="cmd-example">e.g. <code>brain Review all agents and summarize progress</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('brain-loop ')"><span class="cmd-key">brain-loop &lt;directive&gt;</span><span class="cmd-desc">Start parallel supervisors for all agents</span><span class="cmd-example">e.g. <code>brain-loop Focus on fixing test failures</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('brain-queue')"><span class="cmd-key">brain-queue</span><span class="cmd-desc">Run the task queue with the brain</span><span class="cmd-example">Processes pending tasks in order</span></div>
+      <div class="cmd-item" onclick="cmdFill('stop')"><span class="cmd-key">stop</span><span class="cmd-desc">Soft stop all supervisors and brain</span><span class="cmd-example">Finishes current cycle, then stops</span></div>
+    </div>
+
+    <div class="cmd-section-title">Projects</div>
+    <div class="cmd-grid">
+      <div class="cmd-item" onclick="cmdFill('projects')"><span class="cmd-key">projects</span><span class="cmd-desc">List all active projects</span><span class="cmd-example">Shows id, name, status, port, directory</span></div>
+      <div class="cmd-item" onclick="cmdFill('project add ')"><span class="cmd-key">project add &lt;dir&gt; [name]</span><span class="cmd-desc">Add a new project by directory path</span><span class="cmd-example">e.g. <code>project add C:\Users\me\myapp MyApp</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('project remove ')"><span class="cmd-key">project remove &lt;id&gt;</span><span class="cmd-desc">Stop and remove a project</span><span class="cmd-example">e.g. <code>project remove proj-2</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('status')"><span class="cmd-key">status</span><span class="cmd-desc">Show all agent connection status</span><span class="cmd-example">Shows session, last activity time</span></div>
+    </div>
+
+    <div class="cmd-section-title">Pause &amp; Resume</div>
+    <div class="cmd-grid">
+      <div class="cmd-item" onclick="cmdFill('pause ')"><span class="cmd-key">pause &lt;name&gt;</span><span class="cmd-desc">Pause a project's supervisor</span><span class="cmd-example">e.g. <code>pause yahoo</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('resume ')"><span class="cmd-key">resume &lt;name&gt;</span><span class="cmd-desc">Resume a paused project</span><span class="cmd-example">e.g. <code>resume yahoo</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('pause-all')"><span class="cmd-key">pause-all</span><span class="cmd-desc">Pause all supervising projects</span><span class="cmd-example">Each finishes current cycle first</span></div>
+      <div class="cmd-item" onclick="cmdFill('resume-all')"><span class="cmd-key">resume-all</span><span class="cmd-desc">Resume all paused projects</span><span class="cmd-example">All paused supervisors restart</span></div>
+    </div>
+
+    <div class="cmd-section-title">Git &amp; Validation</div>
+    <div class="cmd-grid">
+      <div class="cmd-item" onclick="cmdFill('branch ')"><span class="cmd-key">branch &lt;name&gt;</span><span class="cmd-desc">Show agent's isolated git branch</span><span class="cmd-example">e.g. <code>branch nih</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('merge ')"><span class="cmd-key">merge &lt;name&gt; [target]</span><span class="cmd-desc">Merge agent branch into target (default: main)</span><span class="cmd-example">e.g. <code>merge yahoo develop</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('validate ')"><span class="cmd-key">validate &lt;name&gt; &lt;cmd&gt;</span><span class="cmd-desc">Set post-cycle validation command</span><span class="cmd-example">e.g. <code>validate nih test</code> or <code>validate nih bun test</code></span></div>
+    </div>
+
+    <div class="cmd-section-title">Tasks</div>
+    <div class="cmd-grid">
+      <div class="cmd-item" onclick="cmdFill('tasks')"><span class="cmd-key">tasks</span><span class="cmd-desc">Show the task queue</span><span class="cmd-example">Lists all pending/done tasks</span></div>
+      <div class="cmd-item" onclick="cmdFill('task add ')"><span class="cmd-key">task add &lt;title&gt;</span><span class="cmd-desc">Add a new task to the queue</span><span class="cmd-example">e.g. <code>task add Fix login page responsive layout</code></span></div>
+    </div>
+
+    <div class="cmd-section-title">Team Mode</div>
+    <div class="cmd-grid">
+      <div class="cmd-item" onclick="cmdFill('team-loop ')"><span class="cmd-key">team-loop [goal]</span><span class="cmd-desc">Start team manager with coordinated agents</span><span class="cmd-example">e.g. <code>team-loop Ship the v2 release</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('team')"><span class="cmd-key">team</span><span class="cmd-desc">Show team members and their status</span><span class="cmd-example">Lists role, agent, directive, last summary</span></div>
+      <div class="cmd-item" onclick="cmdFill('team hire-requests')"><span class="cmd-key">team hire-requests</span><span class="cmd-desc">Show pending hire requests from manager</span><span class="cmd-example">Manager can request new team members</span></div>
+      <div class="cmd-item" onclick="cmdFill('team approve-hire ')"><span class="cmd-key">team approve-hire &lt;idx&gt; &lt;agent&gt;</span><span class="cmd-desc">Approve a hire request</span><span class="cmd-example">e.g. <code>team approve-hire 0 frontend-dev</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('team dissolve-requests')"><span class="cmd-key">team dissolve-requests</span><span class="cmd-desc">Show pending dissolve requests</span><span class="cmd-example">Manager can request member removal</span></div>
+      <div class="cmd-item" onclick="cmdFill('team approve-dissolve ')"><span class="cmd-key">team approve-dissolve &lt;agent&gt;</span><span class="cmd-desc">Approve a dissolve request</span><span class="cmd-example">e.g. <code>team approve-dissolve backend-dev</code></span></div>
+    </div>
+
+    <div class="cmd-section-title">Infrastructure</div>
+    <div class="cmd-grid">
+      <div class="cmd-item" onclick="cmdFill('providers')"><span class="cmd-key">providers</span><span class="cmd-desc">List LLM providers and their status</span><span class="cmd-example">Shows enabled/disabled, API key status</span></div>
+      <div class="cmd-item" onclick="cmdFill('provider enable ')"><span class="cmd-key">provider enable|disable &lt;id&gt;</span><span class="cmd-desc">Enable or disable a provider</span><span class="cmd-example">e.g. <code>provider enable openai</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('provider key ')"><span class="cmd-key">provider key &lt;id&gt; &lt;key&gt;</span><span class="cmd-desc">Set API key for a provider</span><span class="cmd-example">e.g. <code>provider key openai sk-...</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('models')"><span class="cmd-key">models</span><span class="cmd-desc">List all available models across providers</span><span class="cmd-example">Use <code>provider:model</code> format to set</span></div>
+      <div class="cmd-item" onclick="cmdFill('events')"><span class="cmd-key">events [limit]</span><span class="cmd-desc">Show recent event bus events</span><span class="cmd-example">e.g. <code>events 50</code></span></div>
+      <div class="cmd-item" onclick="cmdFill('locks')"><span class="cmd-key">locks</span><span class="cmd-desc">Show active file locks and LLM queue</span><span class="cmd-example">Shows which agents hold which files</span></div>
+      <div class="cmd-item" onclick="cmdFill('intents')"><span class="cmd-key">intents</span><span class="cmd-desc">Show declared work intents from agents</span><span class="cmd-example">What each agent plans to work on</span></div>
     </div>
   </div>
 

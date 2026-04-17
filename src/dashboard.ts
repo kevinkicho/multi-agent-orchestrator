@@ -354,6 +354,40 @@ export async function startDashboard(
         return Response.json(pm.listProjects(), { headers: corsHeaders })
       }
 
+      if (url.pathname === "/api/projects/saved" && req.method === "GET") {
+        const pm = opts?.projectManager
+        if (!pm) return Response.json([], { headers: corsHeaders })
+        const saved = await pm.getSavedProjects()
+        return Response.json(saved, { headers: corsHeaders })
+      }
+
+      if (url.pathname === "/api/projects/restore" && req.method === "POST") {
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Project manager not available" }, { status: 500, headers: corsHeaders })
+        try {
+          const result = await pm.restoreProjects()
+          return Response.json({ ok: true, ...result }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ ok: false, error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // Memory for a specific agent
+      if (url.pathname.match(/^\/api\/memory\/[^/]+$/) && req.method === "GET") {
+        const agentName = sanitizeParam(url.pathname.split("/").pop()!)
+        try {
+          const store = await loadBrainMemory()
+          const sessions = store.agentEntries?.[agentName] ?? store.entries.filter(e =>
+            e.objective.includes(agentName) || agentName in e.agentLearnings
+          )
+          const projectNotes = store.projectNotes[agentName] ?? []
+          const behavioralNotes = store.behavioralNotes?.[agentName] ?? []
+          return Response.json({ agentName, sessions, projectNotes, behavioralNotes }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ agentName, sessions: [], projectNotes: [], behavioralNotes: [] }, { headers: corsHeaders })
+        }
+      }
+
       if (url.pathname === "/api/projects" && req.method === "POST") {
         const pm = opts?.projectManager
         if (!pm) return Response.json({ error: "Project manager not available" }, { status: 500, headers: corsHeaders })
@@ -370,7 +404,9 @@ export async function startDashboard(
           )
           return Response.json({ ok: true, project }, { headers: corsHeaders })
         } catch (err) {
-          return Response.json({ ok: false, error: String(err) }, { status: 500, headers: corsHeaders })
+          const msg = String(err)
+          const status = msg.includes("already active") ? 409 : msg.includes("does not exist") ? 404 : 500
+          return Response.json({ ok: false, error: msg }, { status, headers: corsHeaders })
         }
       }
 

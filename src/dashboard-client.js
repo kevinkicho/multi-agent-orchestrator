@@ -79,6 +79,22 @@ function projectLabel(agentName) {
   return agentName.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
 }
 
+// Toggle project row open/closed and scroll logs to bottom if needed
+function toggleProjectRow(rowEl) {
+  rowEl.classList.toggle('open')
+  if (rowEl.classList.contains('open')) {
+    // Scroll any logs that received content while collapsed
+    requestAnimationFrame(function() {
+      rowEl.querySelectorAll('.panel-log').forEach(function(log) {
+        if (log._needsScrollOnReveal) {
+          log.scrollTop = log.scrollHeight
+          log._needsScrollOnReveal = false
+        }
+      })
+    })
+  }
+}
+
 // Track recently removed agents so polling/events don't re-create their rows
 const removedAgents = new Set()
 
@@ -91,10 +107,11 @@ function ensureAgent(name) {
   row.id = 'row-' + name
 
   row.innerHTML = `
-    <div class="project-row-header" onclick="this.parentElement.classList.toggle('open')" role="button" tabindex="0" aria-expanded="true" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click()}">
+    <div class="project-row-header" onclick="toggleProjectRow(this.parentElement)" role="button" tabindex="0" aria-expanded="true" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click()}">
       <span class="project-row-arrow" aria-hidden="true">&#9654;</span>
       <span class="project-row-name">${escapeHtml(projectLabel(name))}</span>
       <span class="project-row-dir" id="dir-${name}"></span>
+      <span class="project-row-port" id="port-${name}" style="font-size:9px;color:#666;margin-left:4px;font-family:monospace;"></span>
       <div class="project-row-badges">
         <span class="agent-badge badge-starting" id="projstatus-${name}" style="margin-right:8px;">STARTING</span>
         <span style="font-size:10px;color:#666;">Worker:</span>
@@ -113,25 +130,34 @@ function ensureAgent(name) {
     <div class="directive-section" onclick="event.stopPropagation()">
       <div class="directive-toggle" onclick="this.nextElementSibling.classList.toggle('open')">&#9660; Settings</div>
       <div class="directive-content" id="dcontent-${name}">
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-          <span style="font-size:10px;color:#888;min-width:40px;">Model:</span>
-          <select class="directive-text" id="msel-${name}" style="min-height:auto;height:26px;padding:2px 6px;flex:1;max-width:300px;">
-            <option value="">(global default)</option>
-          </select>
-          <button class="directive-save" onclick="saveModel('${name}')" style="white-space:nowrap;">Change Model</button>
+        <div class="drawer-tabs">
+          <button class="drawer-tab active" onclick="switchDrawerTab('${name}','settings',this)">Settings</button>
+          <button class="drawer-tab" onclick="switchDrawerTab('${name}','history',this)">History</button>
+          <button class="drawer-tab" onclick="switchDrawerTab('${name}','memory',this)">Memory</button>
         </div>
-        <div style="margin-bottom:4px;font-size:10px;color:#888;">Directive:</div>
-        <textarea class="directive-text" id="dtxt-${name}" rows="3"></textarea>
-        <div class="directive-actions">
-          <button class="directive-save" onclick="saveDirective('${name}')">Save Directive &amp; Restart Supervisor</button>
+        <div class="drawer-panel active" id="dtab-settings-${name}">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+            <span style="font-size:10px;color:#888;min-width:40px;">Model:</span>
+            <select class="directive-text" id="msel-${name}" style="min-height:auto;height:26px;padding:2px 6px;flex:1;max-width:300px;">
+              <option value="">(global default)</option>
+            </select>
+            <button class="directive-save" onclick="saveModel('${name}')" style="white-space:nowrap;">Change Model</button>
+          </div>
+          <div style="margin-bottom:4px;font-size:10px;color:#888;">Directive:</div>
+          <textarea class="directive-text" id="dtxt-${name}" rows="3"></textarea>
+          <div class="directive-actions">
+            <button class="directive-save" onclick="saveDirective('${name}')">Save Directive &amp; Restart Supervisor</button>
+          </div>
+          <div style="margin-top:8px;display:flex;gap:6px;align-items:center;">
+            <input type="text" class="directive-text" id="dcmt-${name}" placeholder="Leave feedback for supervisor..." style="min-height:auto;height:26px;padding:2px 8px;flex:1;">
+            <button class="directive-save" onclick="sendComment('${name}')" style="white-space:nowrap;">Send Comment</button>
+          </div>
         </div>
-        <div style="margin-top:8px;display:flex;gap:6px;align-items:center;">
-          <input type="text" class="directive-text" id="dcmt-${name}" placeholder="Leave feedback for supervisor..." style="min-height:auto;height:26px;padding:2px 8px;flex:1;">
-          <button class="directive-save" onclick="sendComment('${name}')" style="white-space:nowrap;">Send Comment</button>
+        <div class="drawer-panel" id="dtab-history-${name}">
+          <div id="dhist-${name}" style="max-height:280px;overflow-y:auto;"></div>
         </div>
-        <div style="margin-top:8px;">
-          <div class="directive-toggle" onclick="toggleHistory('${name}')" id="dhist-toggle-${name}">&#9654; Directive History</div>
-          <div id="dhist-${name}" style="display:none;margin-top:4px;max-height:250px;overflow-y:auto;"></div>
+        <div class="drawer-panel" id="dtab-memory-${name}">
+          <div id="dmem-${name}" style="max-height:280px;overflow-y:auto;"><em style="color:#555;">Click to load memory...</em></div>
         </div>
       </div>
     </div>
@@ -178,6 +204,7 @@ function ensureAgent(name) {
     directiveText: row.querySelector('#dtxt-' + name),
     modelSelect: row.querySelector('#msel-' + name),
     dirLabel: row.querySelector('#dir-' + name),
+    portLabel: row.querySelector('#port-' + name),
     link: row.querySelector('#link-' + name),
     chatInput: row.querySelector('#chat-' + name),
     chatBtn: row.querySelector('.agent-chatbox button'),
@@ -222,11 +249,12 @@ const logStores = new WeakMap() // logEl -> { entries: [], renderedStart: int }
 function getStore(logEl) {
   let s = logStores.get(logEl)
   if (!s) {
-    s = { entries: [], renderedStart: 0 }
+    s = { entries: [], renderedStart: 0, pinned: true }
     logStores.set(logEl, s)
-    // Attach scroll-up listener once
+    // Track pinned state on user scroll + load older on scroll-up
     logEl.addEventListener('scroll', function() {
       if (logEl.scrollTop < 40) loadOlder(logEl)
+      s.pinned = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 60
     })
   }
   return s
@@ -244,8 +272,9 @@ function appendToLog(logEl, node) {
     store.renderedStart = Math.max(0, store.renderedStart - excess)
   }
 
-  // Check if user has scrolled up (not pinned to bottom)
-  const pinned = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 60
+  // Use tracked pinned state from scroll events (more reliable than checking at append time).
+  // If the element is hidden (display:none parent), defer scroll to when panel becomes visible.
+  const isHidden = logEl.offsetParent === null
 
   // If we have too many DOM nodes, remove oldest rendered ones
   const rendered = logEl.children.length
@@ -259,7 +288,13 @@ function appendToLog(logEl, node) {
 
   logEl.appendChild(node)
 
-  if (pinned) logEl.scrollTop = logEl.scrollHeight
+  if (store.pinned) {
+    if (isHidden) {
+      logEl._needsScrollOnReveal = true
+    } else {
+      logEl.scrollTop = logEl.scrollHeight
+    }
+  }
 }
 
 /** Render a batch of older entries when user scrolls to the top */
@@ -644,6 +679,9 @@ function applyProjectData(projects) {
     if (!agent) continue
     agent.projectId = proj.id
     agent.directive = proj.directive
+    if (agent.portLabel && proj.workerPort) {
+      agent.portLabel.textContent = ':' + proj.workerPort
+    }
     // Populate directive textarea (unless user is actively editing)
     if (agent.directiveText && !agent.directiveText._userEdited) {
       agent.directiveText.value = proj.directive || ''
@@ -1386,18 +1424,94 @@ async function sendComment(agentName) {
   }
 }
 
-function toggleHistory(agentName) {
-  const histEl = document.getElementById('dhist-' + agentName)
-  const toggle = document.getElementById('dhist-toggle-' + agentName)
-  if (!histEl) return
-  if (histEl.style.display === 'none') {
-    histEl.style.display = 'block'
-    toggle.innerHTML = '&#9660; Directive History'
-    loadHistory(agentName)
-  } else {
-    histEl.style.display = 'none'
-    toggle.innerHTML = '&#9654; Directive History'
+function switchDrawerTab(agentName, tabName, btn) {
+  var content = document.getElementById('dcontent-' + agentName)
+  if (!content) return
+  // Deactivate all tabs and panels
+  content.querySelectorAll('.drawer-tab').forEach(function(t) { t.classList.remove('active') })
+  content.querySelectorAll('.drawer-panel').forEach(function(p) { p.classList.remove('active') })
+  // Activate selected
+  btn.classList.add('active')
+  var panel = document.getElementById('dtab-' + tabName + '-' + agentName)
+  if (panel) panel.classList.add('active')
+  // Auto-load data when switching to tabs
+  if (tabName === 'history') loadHistory(agentName)
+  if (tabName === 'memory') loadMemory(agentName)
+}
+
+async function loadMemory(agentName) {
+  var el = document.getElementById('dmem-' + agentName)
+  if (!el) return
+  el.innerHTML = '<em style="color:#555;">Loading memory...</em>'
+  try {
+    var res = await apiFetch('/api/memory/' + agentName)
+    var data = await res.json()
+    var html = ''
+
+    // Behavioral notes
+    if (data.behavioralNotes && data.behavioralNotes.length > 0) {
+      html += '<div class="mem-section">'
+      html += '<div class="mem-section-title">Behavioral Notes</div>'
+      for (var i = 0; i < data.behavioralNotes.length; i++) {
+        html += '<div class="mem-entry mem-behavioral">' + escapeHtml(data.behavioralNotes[i]) + '</div>'
+      }
+      html += '</div>'
+    }
+
+    // Project notes
+    if (data.projectNotes && data.projectNotes.length > 0) {
+      html += '<div class="mem-section">'
+      html += '<div class="mem-section-title">Project Notes</div>'
+      for (var i = 0; i < data.projectNotes.length; i++) {
+        html += '<div class="mem-entry mem-project">' + escapeHtml(data.projectNotes[i]) + '</div>'
+      }
+      html += '</div>'
+    }
+
+    // Session summaries
+    if (data.sessions && data.sessions.length > 0) {
+      html += '<div class="mem-section">'
+      html += '<div class="mem-section-title">Session Summaries</div>'
+      var sessions = data.sessions.slice().reverse() // most recent first
+      for (var i = 0; i < sessions.length; i++) {
+        var s = sessions[i]
+        var date = new Date(s.timestamp).toLocaleString()
+        var learnings = s.agentLearnings && s.agentLearnings[agentName]
+          ? s.agentLearnings[agentName] : []
+        html += '<div class="mem-entry mem-session">'
+        html += '<div class="mem-session-header">'
+        html += '<span class="mem-date">' + escapeHtml(date) + '</span>'
+        html += '<span class="mem-objective">' + escapeHtml(s.objective || '').slice(0, 120) + '</span>'
+        html += '</div>'
+        if (s.summary) {
+          html += '<div class="mem-summary">' + escapeHtml(s.summary) + '</div>'
+        }
+        if (learnings.length > 0) {
+          html += '<div class="mem-learnings">'
+          html += '<span class="mem-learnings-label">Learnings:</span>'
+          for (var j = 0; j < learnings.length; j++) {
+            html += '<div class="mem-learning-item">' + escapeHtml(learnings[j]) + '</div>'
+          }
+          html += '</div>'
+        }
+        html += '</div>'
+      }
+      html += '</div>'
+    }
+
+    if (!html) {
+      html = '<em style="color:#555;font-size:11px;">No memory records yet. Memory accumulates as the supervisor runs cycles.</em>'
+    }
+
+    el.innerHTML = html
+  } catch (err) {
+    el.innerHTML = '<em style="color:#ef4444;font-size:11px;">Error loading memory: ' + err + '</em>'
   }
+}
+
+// toggleHistory kept for backward compat but now called from switchDrawerTab
+function toggleHistory(agentName) {
+  loadHistory(agentName)
 }
 
 async function loadHistory(agentName) {
@@ -2533,6 +2647,63 @@ function appendEventToLog(evt) {
 // ---- Auto-refresh: all panels refresh on a unified interval ----
 // SSE auto-connects on page load
 setTimeout(() => { connectSSE() }, 1500)
+
+// ---- Check for saved projects to restore ----
+setTimeout(async function() {
+  try {
+    const res = await apiFetch('/api/projects/saved')
+    const saved = await res.json()
+    if (!saved || saved.length === 0) return
+    // Only show if no projects are currently active
+    const activeRes = await apiFetch('/api/projects')
+    const active = await activeRes.json()
+    if (active && active.length > 0) return
+
+    // Show restore banner
+    var banner = document.createElement('div')
+    banner.id = 'restore-banner'
+    banner.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#1a1a2e;border:1px solid #2a2a4a;border-radius:12px;padding:24px 32px;z-index:300;box-shadow:0 8px 32px rgba(0,0,0,0.6);text-align:center;max-width:500px;'
+    var names = saved.map(function(p) { return p.name }).join(', ')
+    banner.innerHTML =
+      '<div style="font-size:14px;color:#e0e0e0;margin-bottom:12px;font-weight:600;">Restore Previous Session?</div>' +
+      '<div style="font-size:12px;color:#888;margin-bottom:16px;">Found ' + saved.length + ' saved project' + (saved.length > 1 ? 's' : '') + ':</div>' +
+      '<div style="font-size:13px;color:#c084fc;margin-bottom:20px;word-break:break-word;">' + escapeHtml(names) + '</div>' +
+      '<div style="display:flex;gap:12px;justify-content:center;">' +
+        '<button id="restore-yes" style="background:#22c55e;color:#fff;border:none;padding:8px 24px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;">Restore All</button>' +
+        '<button id="restore-no" style="background:#333;color:#aaa;border:1px solid #555;padding:8px 24px;border-radius:6px;cursor:pointer;font-size:13px;">Start Fresh</button>' +
+      '</div>'
+    // Overlay
+    var overlay = document.createElement('div')
+    overlay.id = 'restore-overlay'
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:299;'
+    document.body.appendChild(overlay)
+    document.body.appendChild(banner)
+
+    document.getElementById('restore-yes').onclick = async function() {
+      this.disabled = true
+      this.textContent = 'Restoring...'
+      try {
+        var rr = await apiFetch('/api/projects/restore', { method: 'POST' })
+        var result = await rr.json()
+        if (result.restored && result.restored.length > 0) {
+          showNotification('Restored ' + result.restored.length + ' project' + (result.restored.length > 1 ? 's' : '') + ': ' + result.restored.join(', '), 'success')
+        }
+        if (result.failed && result.failed.length > 0) {
+          showNotification('Failed to restore: ' + result.failed.join('; '), 'warning')
+        }
+      } catch (err) {
+        showNotification('Restore failed: ' + err, 'error')
+      }
+      banner.remove()
+      overlay.remove()
+    }
+
+    document.getElementById('restore-no').onclick = function() {
+      banner.remove()
+      overlay.remove()
+    }
+  } catch (e) { /* no saved projects or API not ready */ }
+}, 2500)
 
 // Refresh all data panels every 30 seconds
 setInterval(() => {

@@ -247,11 +247,11 @@ function ensureAgent(name) {
 // -----------------------------------------------------------------------
 // Virtual-scroll log manager
 // -----------------------------------------------------------------------
-// Each log panel keeps ALL entries in a lightweight backing array but
+// Each log panel keeps ALL entries as lightweight data objects but
 // only renders the most recent MAX_RENDERED items as DOM nodes.
 // When the user scrolls to the top, a batch of older entries is
-// materialized on demand. This keeps DOM size bounded no matter how
-// long the orchestrator runs.
+// materialized on demand. This keeps DOM size bounded and avoids
+// retaining detached DOM nodes in memory.
 // -----------------------------------------------------------------------
 
 const MAX_RENDERED = 200      // max DOM nodes per log panel
@@ -259,12 +259,22 @@ const RENDER_BATCH = 60       // how many older entries to render on scroll-up
 const MAX_BACKING = 5000      // max entries kept in memory (older are discarded)
 const logStores = new WeakMap() // logEl -> { entries: [], renderedStart: int }
 
+// Entry types for the backing store — lightweight data, not DOM nodes
+// These are reconstructed into DOM nodes on demand by renderEntry()
+const ENTRY_LOG = 'log'
+const ENTRY_EXPANDABLE = 'expandable'
+const ENTRY_COLLAPSIBLE = 'collapsible'
+const ENTRY_CYCLE_SUMMARY = 'cycle-summary'
+const ENTRY_RAW = 'raw' // generic entry with className + innerHTML
+const ENTRY_SV_CYCLE_HEADER = 'sv-cycle-header'
+const ENTRY_SV_LLM = 'sv-llm'
+const ENTRY_SV_ENTRY = 'sv-entry'
+
 function getStore(logEl) {
   let s = logStores.get(logEl)
   if (!s) {
     s = { entries: [], renderedStart: 0, pinned: true }
     logStores.set(logEl, s)
-    // Track pinned state on user scroll + load older on scroll-up
     logEl.addEventListener('scroll', function() {
       if (logEl.scrollTop < 40) loadOlder(logEl)
       s.pinned = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 60
@@ -273,10 +283,95 @@ function getStore(logEl) {
   return s
 }
 
-/** Append a pre-built DOM node to a log panel through the virtual store */
-function appendToLog(logEl, node) {
+/** Reconstruct a DOM node from a stored entry data object */
+function renderEntry(entry) {
+  switch (entry.type) {
+    case ENTRY_LOG: {
+      const el = document.createElement('div')
+      el.className = 'log-entry ' + entry.className
+      el.innerHTML = '<span class="timestamp">' + escapeHtml(entry.timestamp) + '</span>' + entry.html
+      return el
+    }
+    case ENTRY_EXPANDABLE: {
+      if (entry.text.length <= EXPAND_THRESHOLD) {
+        const el = document.createElement('div')
+        el.className = 'log-entry ' + entry.className
+        el.innerHTML = '<span class="timestamp">' + escapeHtml(entry.timestamp) + '</span>' + escapeHtml(entry.text)
+        return el
+      }
+      const preview = entry.text.slice(0, EXPAND_THRESHOLD).replace(/\n/g, ' ') + '...'
+      const wrapper = document.createElement('div')
+      wrapper.className = 'log-entry expandable ' + entry.className
+      wrapper.innerHTML = '<span class="timestamp">' + escapeHtml(entry.timestamp) + '</span>'
+        + '<span class="expandable-preview">' + escapeHtml(preview) + '</span>'
+        + '<pre class="expandable-full">' + escapeHtml(entry.text) + '</pre>'
+      wrapper.addEventListener('click', function() { wrapper.classList.toggle('expanded') })
+      return wrapper
+    }
+    case ENTRY_COLLAPSIBLE: {
+      const wrapper = document.createElement('div')
+      const cls = entry.collapsibleType === 'prompt' ? 'prompt-entry' : 'response-entry'
+      wrapper.className = 'collapsible ' + cls + (entry.startOpen ? ' open' : '')
+      wrapper.innerHTML = '<div class="collapsible-header" onclick="this.parentElement.classList.toggle(\'open\')">'
+        + '<span class="collapsible-arrow">&#9654;</span>'
+        + '<span>' + escapeHtml(entry.header) + '</span>'
+        + '<span class="timestamp">' + escapeHtml(entry.timestamp) + '</span>'
+        + '</div>'
+        + '<div class="collapsible-body">' + escapeHtml(entry.body) + '</div>'
+      return wrapper
+    }
+    case ENTRY_CYCLE_SUMMARY: {
+      const el = document.createElement('div')
+      el.className = 'cycle-summary'
+      const title = entry.cycle > 0 ? 'Cycle ' + entry.cycle + ' Summary' : 'Final Summary'
+      el.innerHTML = '<div class="cycle-summary-title">' + title + '</div>'
+        + '<div class="cycle-summary-text">' + escapeHtml(entry.summary) + '</div>'
+      return el
+    }
+    case ENTRY_RAW: {
+      const el = document.createElement('div')
+      if (entry.className) el.className = entry.className
+      el.innerHTML = entry.html || ''
+      if (entry.style) Object.assign(el.style, entry.style)
+      return el
+    }
+    case ENTRY_SV_CYCLE_HEADER: {
+      const el = document.createElement('div')
+      el.className = 'supervisor-entry sv-cycle-header'
+      el.innerHTML = '<span class="sv-ts">' + escapeHtml(entry.timestamp) + '</span>Cycle ' + escapeHtml(entry.cycle)
+      return el
+    }
+    case ENTRY_SV_LLM: {
+      const wrapper = document.createElement('div')
+      wrapper.className = 'supervisor-entry sv-llm-round ' + (entry.className || '')
+      wrapper.innerHTML = '<div class="sv-llm-header" onclick="this.parentElement.classList.toggle(\'open\')">'
+        + '<span class="sv-llm-arrow">&#9654;</span>'
+        + '<span>' + escapeHtml(entry.header + entry.preview) + '</span>'
+        + '<span class="sv-ts">' + escapeHtml(entry.timestamp) + '</span>'
+        + '</div>'
+        + '<div class="sv-llm-body">' + escapeHtml(entry.body || '(empty)') + '</div>'
+      return wrapper
+    }
+    case ENTRY_SV_ENTRY: {
+      const el = document.createElement('div')
+      el.className = entry.className || 'supervisor-entry'
+      return el
+    }
+    default: {
+      const el = document.createElement('div')
+      el.className = 'log-entry'
+      el.textContent = '[unknown entry type]'
+      return el
+    }
+  }
+}
+
+/** Push a data entry into the virtual store, render the tail of the log */
+function pushEntry(logEl, entry) {
   const store = getStore(logEl)
-  store.entries.push(node)
+
+  // Store data object, not DOM node
+  store.entries.push(entry)
 
   // Trim backing array if it exceeds the memory cap
   if (store.entries.length > MAX_BACKING) {
@@ -285,11 +380,7 @@ function appendToLog(logEl, node) {
     store.renderedStart = Math.max(0, store.renderedStart - excess)
   }
 
-  // Use tracked pinned state from scroll events (more reliable than checking at append time).
-  // If the element is hidden (display:none parent), defer scroll to when panel becomes visible.
-  const isHidden = logEl.offsetParent === null
-
-  // If we have too many DOM nodes, remove oldest rendered ones
+  // Remove oldest rendered entries if we have too many DOM nodes
   const rendered = logEl.children.length
   if (rendered >= MAX_RENDERED) {
     const toRemove = rendered - MAX_RENDERED + 1
@@ -299,8 +390,11 @@ function appendToLog(logEl, node) {
     store.renderedStart += toRemove
   }
 
+  // Render and append the new entry
+  const node = renderEntry(entry)
   logEl.appendChild(node)
 
+  const isHidden = logEl.offsetParent === null
   if (store.pinned) {
     if (isHidden) {
       logEl._needsScrollOnReveal = true
@@ -320,8 +414,13 @@ function loadOlder(logEl) {
   const start = store.renderedStart - batch
   const frag = document.createDocumentFragment()
   for (let i = start; i < store.renderedStart; i++) {
-    const original = store.entries[i]
-    if (original) frag.appendChild(original)
+    const entry = store.entries[i]
+    if (entry) {
+      const node = renderEntry(entry)
+      // For expandable entries, we can't re-attach click listeners from data,
+      // so we re-render them fresh (which already includes the listener in renderEntry)
+      frag.appendChild(node)
+    }
   }
   logEl.insertBefore(frag, logEl.firstChild)
   store.renderedStart = start
@@ -330,13 +429,10 @@ function loadOlder(logEl) {
   logEl.scrollTop += logEl.scrollHeight - prevHeight
 }
 
-// -- Convenience wrappers that create nodes and route through appendToLog --
+// -- Convenience wrappers that create entry data and route through pushEntry --
 
 function addLogEntry(logEl, className, html) {
-  const entry = document.createElement('div')
-  entry.className = 'log-entry ' + className
-  entry.innerHTML = '<span class="timestamp">' + ts() + '</span>' + html
-  appendToLog(logEl, entry)
+  pushEntry(logEl, { type: ENTRY_LOG, className, html, timestamp: ts() })
 }
 
 function makeHeader(text, maxLen) {
@@ -350,40 +446,15 @@ function makeHeader(text, maxLen) {
 var EXPAND_THRESHOLD = 120
 
 function addExpandableEntry(logEl, className, text) {
-  if (text.length <= EXPAND_THRESHOLD) {
-    addLogEntry(logEl, className, escapeHtml(text))
-    return
-  }
-  var preview = text.slice(0, EXPAND_THRESHOLD).replace(/\n/g, ' ') + '...'
-  var wrapper = document.createElement('div')
-  wrapper.className = 'log-entry expandable ' + className
-  wrapper.innerHTML = '<span class="timestamp">' + ts() + '</span>'
-    + '<span class="expandable-preview">' + escapeHtml(preview) + '</span>'
-    + '<pre class="expandable-full">' + escapeHtml(text) + '</pre>'
-  wrapper.addEventListener('click', function() { wrapper.classList.toggle('expanded') })
-  appendToLog(logEl, wrapper)
+  pushEntry(logEl, { type: ENTRY_EXPANDABLE, className, text, timestamp: ts() })
 }
 
 function addCollapsible(logEl, type, header, body, startOpen) {
-  const wrapper = document.createElement('div')
-  const cls = type === 'prompt' ? 'prompt-entry' : 'response-entry'
-  wrapper.className = 'collapsible ' + cls + (startOpen ? ' open' : '')
-  wrapper.innerHTML = '<div class="collapsible-header" onclick="this.parentElement.classList.toggle(&#39;open&#39;)">'
-    + '<span class="collapsible-arrow">&#9654;</span>'
-    + '<span>' + escapeHtml(header) + '</span>'
-    + '<span class="timestamp">' + ts() + '</span>'
-    + '</div>'
-    + '<div class="collapsible-body">' + escapeHtml(body) + '</div>'
-  appendToLog(logEl, wrapper)
+  pushEntry(logEl, { type: ENTRY_COLLAPSIBLE, collapsibleType: type, header, body, startOpen: !!startOpen, timestamp: ts() })
 }
 
 function addCycleSummary(logEl, cycle, summary) {
-  const el = document.createElement('div')
-  el.className = 'cycle-summary'
-  const title = cycle > 0 ? 'Cycle ' + cycle + ' Summary' : 'Final Summary'
-  el.innerHTML = '<div class="cycle-summary-title">' + title + '</div>'
-    + '<div class="cycle-summary-text">' + escapeHtml(summary) + '</div>'
-  appendToLog(logEl, el)
+  pushEntry(logEl, { type: ENTRY_CYCLE_SUMMARY, cycle, summary, timestamp: ts() })
 }
 
 function setBadge(badge, status) {
@@ -507,9 +578,7 @@ function handleEvent(event) {
       + '<button class="perm-btn perm-approve" onclick="replyPermission(&#39;' + event.agent + '&#39;, &#39;' + event.requestID + '&#39;, &#39;approve&#39;, &#39;' + id + '&#39;)">Approve</button>'
       + '<button class="perm-btn perm-deny" onclick="replyPermission(&#39;' + event.agent + '&#39;, &#39;' + event.requestID + '&#39;, &#39;deny&#39;, &#39;' + id + '&#39;)">Deny</button>'
       + '</div></div>'
-    const entry = document.createElement('div')
-    entry.innerHTML = html
-    appendToLog(agent.workerLog, entry)
+    pushEntry(agent.workerLog, { type: ENTRY_RAW, className: '', html })
   }
 
   if (event.type === 'permission-resolved') {
@@ -534,10 +603,7 @@ function handleEvent(event) {
     // --- Cycle header: "===== agent — CYCLE N =====" ---
     if (text.includes('=====') && /CYCLE \d+/.test(text)) {
       const m = text.match(/CYCLE (\d+)/)
-      const el = document.createElement('div')
-      el.className = 'supervisor-entry sv-cycle-header'
-      el.innerHTML = '<span class="sv-ts">' + ts() + '</span>Cycle ' + (m ? m[1] : '?')
-      appendToLog(logEl, el)
+      pushEntry(logEl, { type: ENTRY_SV_CYCLE_HEADER, cycle: m ? m[1] : '?', timestamp: ts() })
       return
     }
 
@@ -545,63 +611,50 @@ function handleEvent(event) {
     if (/^--- .+ cycle \d+, round \d+ ---/.test(text)) {
       const m = text.match(/cycle (\d+), round (\d+)/)
       const header = 'Round ' + (m ? m[2] : '?')
-      // Everything after the first line is the LLM response body
       const bodyStart = text.indexOf('\n')
       const body = bodyStart !== -1 ? text.slice(bodyStart + 1).trim() : ''
-      // Extract command names for the header preview
       const cmds = (body.match(/^(PROMPT|WAIT|MESSAGES|REVIEW|RESTART|ABORT|NOTE_BEHAVIOR|NOTE|DIRECTIVE|CYCLE_DONE|STOP)\b/gm) || [])
       const preview = cmds.length > 0 ? ' — ' + cmds.join(', ') : ''
-
-      const wrapper = document.createElement('div')
-      wrapper.className = 'sv-llm-round'
-      wrapper.innerHTML = '<div class="sv-llm-header" onclick="this.parentElement.classList.toggle(&#39;open&#39;)">'
-        + '<span class="sv-llm-arrow">&#9654;</span>'
-        + '<span>' + escapeHtml(header + preview) + '</span>'
-        + '<span class="sv-ts">' + ts() + '</span>'
-        + '</div>'
-        + '<div class="sv-llm-body">' + escapeHtml(body || '(empty)') + '</div>'
-      appendToLog(logEl, wrapper)
+      pushEntry(logEl, { type: ENTRY_SV_LLM, className: '', header, preview, body, timestamp: ts() })
       return
     }
 
     // --- Categorize all other messages ---
-    const el = document.createElement('div')
-    el.className = 'supervisor-entry'
+    let className = 'supervisor-entry'
 
     // Errors / circuit breaker / unknown agent (check first — CIRCUIT BREAKER contains "restart caps")
     if (/CIRCUIT BREAKER|UNKNOWN AGENT|LLM request failed|LLM retry failed|Ollama persistently|Error |ALERT/i.test(text)) {
-      el.className += ' sv-error'
+      className += ' sv-error'
     }
     // Rate limit / cooldown / throttle
     else if (/RATE LIMITED|429|cooling down|rate-limit|consecutive 429/i.test(text)) {
-      el.className += ' sv-rate-limit'
+      className += ' sv-rate-limit'
     }
     // Restart / abort / review actions
     else if (/Restarting .+ session|Agent restarted|Aborting .+|RESTART CAP|Throttling restart|Throttling auto-restart|consecutive empty responses.*restarting|Sending review to|Requesting self-review/i.test(text)) {
-      el.className += ' sv-action'
+      className += ' sv-action'
     }
     // Results from orchestrator (agent response, messages, etc.)
     else if (/^(Sent to |Recent messages from |.+ response:|Review results from |Agent .+ aborted|Error sending|Error reading)/i.test(text)) {
-      el.className += ' sv-result'
+      className += ' sv-result'
     }
     // Notes and directives saved
     else if (/^(Note saved|Behavioral note saved|Directive updated)/i.test(text)) {
-      el.className += ' sv-note'
+      className += ' sv-note'
     }
     // Lifecycle events (supervisor start/stop/done/soft stop)
     else if (/Supervisor start|Supervisor stop|supervisor ended|Soft stop|Completed \d+ cycles|Cycle \d+ complete/i.test(text)) {
-      el.className += ' sv-lifecycle'
+      className += ' sv-lifecycle'
     }
     // Meta / low-priority info (pausing, waiting, nudging, empty response)
     else if (/^(Pausing |Waiting for |Retrying in |next cycle pause|LLM returned empty|Agent responsiveness low|WARNING:)/i.test(text)) {
-      el.className += ' sv-meta'
+      className += ' sv-meta'
     }
 
     if (text.length > EXPAND_THRESHOLD) {
-      addExpandableEntry(logEl, el.className, text)
+      addExpandableEntry(logEl, className, text)
     } else {
-      el.innerHTML = '<span class="sv-ts">' + ts() + '</span>' + escapeHtml(text)
-      appendToLog(logEl, el)
+      addLogEntry(logEl, className, escapeHtml(text))
     }
   }
 
@@ -2156,7 +2209,7 @@ fetch('/api/crash-info').then(r => r.ok ? r.json() : null).then(data => {
     }
     html += '</div>'
     banner.innerHTML = html
-    appendToLog(brainLog, banner)
+    pushEntry(brainLog, { type: ENTRY_RAW, className: banner.className, html: banner.innerHTML })
     // Open brain panel so the crash banner is visible
     if (!document.getElementById('brain-section').classList.contains('open')) {
       document.getElementById('brain-section').classList.add('open')
@@ -2252,11 +2305,7 @@ cmdInput.addEventListener('keydown', async (e) => {
         cmdStatus.style.color = '#4ade80'
         if (!data.output) showNotification('Command sent', 'success', 2000)
         if (data.output) {
-          const entry = document.createElement('div')
-          entry.style.color = '#8b8bff'
-          entry.textContent = '> ' + cmd + '\n' + data.output
-          entry.style.whiteSpace = 'pre-wrap'
-          appendToLog(brainLog, entry)
+          pushEntry(brainLog, { type: ENTRY_RAW, className: '', html: '<div style="color:#8b8bff;white-space:pre-wrap;">' + escapeHtml('> ' + cmd + '\n' + data.output) + '</div>' })
         }
       } else {
         cmdStatus.textContent = data.error || 'error'

@@ -291,7 +291,7 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
   const healthInterval = 15_000 // check every 15 seconds
 
   healthTimer = setInterval(async () => {
-    for (const [name, agent] of agents) {
+    for (const [name, agent] of Array.from(agents.entries())) {
       if (agent.status !== "disconnected") continue
       // Attempt reconnection
       try {
@@ -328,7 +328,7 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
   const emptyResponseCounts = new Map<string, number>()
 
   stuckTimer = setInterval(async () => {
-    for (const [name, agent] of agents) {
+    for (const [name, agent] of Array.from(agents.entries())) {
       if (agent.status !== "busy" || !agent.busyStartTime) continue
       const elapsed = Date.now() - agent.busyStartTime
       if (elapsed < stuckThreshold) continue
@@ -367,7 +367,7 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
   // Poll for pending permissions (backup for any missed SSE events)
   const pollInterval = config.pollInterval ?? 2000
   pollTimer = setInterval(async () => {
-    for (const [name, agent] of agents) {
+    for (const [name, agent] of Array.from(agents.entries())) {
       if (agent.status === "disconnected") continue
       try {
         const permissions = await agentListPermissions(agent)

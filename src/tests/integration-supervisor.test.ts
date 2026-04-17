@@ -184,7 +184,7 @@ describe("Integration: supervisor round simulation", () => {
     expect(r2.nudged).toBe(true)
     expect(nudge.consecutiveEmpty).toBe(2)
     const lastMsg2 = messages[messages.length - 1]!.content
-    expect(lastMsg2).toContain("```commands") // level 2 shows format
+    expect(lastMsg2).toContain("@check") // level 2 shows format example
 
     const r3 = simulateRound(null, messages, nudge, eventBus, resourceManager, "agent-1")
     expect(nudge.consecutiveEmpty).toBe(3)

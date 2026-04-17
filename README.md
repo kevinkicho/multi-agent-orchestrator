@@ -88,14 +88,23 @@ Each project gets:
 - **Team mode** -- A team manager coordinates multiple agents toward a shared goal, with automatic hiring/dissolution of team members, role assignment, and directive management
 - **Brain mode** -- A higher-level orchestrator brain that coordinates across all agents with a single objective
 
-### Supervision and Recovery
+### Socratic Supervision
 
-- **Stuck agent detection and recovery** -- Monitors agents for inactivity. Supervisors can issue `RESTART` and `ABORT` commands, and failed supervisors auto-restart after 10 seconds
+- **Dialogue-based supervision** -- Supervisors engage in Socratic dialogue with workers rather than issuing rigid commands. The LLM thinks freely in natural language, using lightweight `@` markers (`@worker:`, `@check`, `@done:`, `@note:`, `@lesson:`, etc.) to take actions when ready
+- **Free thinking preserved** -- All reasoning between `@` markers stays in the conversation context, building understanding across rounds instead of being discarded
+- **Worker engagement prompts** -- Worker responses are presented as dialogue turns with reflection prompts ("What did the worker do well? What might they have missed?"), encouraging critical engagement over task-checking
+- **Legacy fallback** -- If no `@` markers are found, the parser falls back to the legacy UPPERCASE command format for backwards compatibility
+
+### Recovery and Resilience
+
+- **Stale-busy detection** -- Monitors SSE heartbeat events from workers. If an agent claims "busy" but no SSE events arrive for 45 seconds, it's flagged as stale and automatically restarted
+- **Pause hard-break** -- If a pause is requested but the LLM doesn't issue `@done:` within 2 rounds, the cycle is force-ended (prevents runaway loops)
 - **Post-cycle validation** -- Run tests, lints, or type checks after each cycle. Built-in presets (`test`, `lint`, `typecheck`) or custom commands. Failed validation can warn, inject feedback, or pause the supervisor
 - **False progress detection** -- Compares LLM summaries against actual `git diff` to catch hallucinated progress
-- **Command recovery** -- Nudge system with escalating hints when the LLM fails to produce valid commands. Circuit breaker trips after repeated failures. Fuzzy command extraction recovers partial matches
+- **Command recovery** -- Nudge system with escalating hints when the LLM fails to produce valid `@` markers. Circuit breaker trips after repeated failures. Fuzzy command extraction recovers partial matches
 - **Empty response escalation** -- 3-tier escalation for consecutive empty agent responses: warn, abort, restart + behavioral note
 - **Conversation checkpoints** -- Save/restore supervisor message arrays so restarts resume from where they left off
+- **Auto-question answering** -- When workers ask interactive questions (e.g., "should I delete these files or focus on the build?"), the orchestrator auto-selects the first option so agents never block waiting for human input
 
 ### Coordination
 
@@ -107,7 +116,7 @@ Each project gets:
 
 ### Learning and Memory
 
-- **Behavioral learning** -- Supervisors save `NOTE_BEHAVIOR` lessons. These notes are injected into future system prompts so the same mistakes aren't repeated. Deduplicated by keyword similarity
+- **Behavioral learning** -- Supervisors save `@lesson:` notes about how agents work best. These are injected into future system prompts so the same mistakes aren't repeated. Deduplicated by keyword similarity
 - **Persistent memory** -- Brain and supervisors remember context across sessions via a JSON-based memory store
 - **Directive history** -- Track how project directives evolve over time (user vs supervisor changes), add comments, revert to previous versions
 - **Summary validation** -- Rejects vague `CYCLE_DONE` and `STOP` summaries, forcing actionable descriptions
@@ -362,22 +371,23 @@ When the orchestrator is running, the interactive REPL accepts:
    - Creates an isolated `agent/<name>` git branch (if git is available)
    - Starts an autonomous supervisor loop for that project
 
-2. **Supervision cycle** -- Each project's supervisor runs in a loop:
-   - Reads the agent's recent messages and loads persistent memory
-   - Injects behavioral notes from previous cycles into the system prompt
-   - On first cycle with existing memory, adds "RESUMING FROM PREVIOUS SESSION" context
-   - Checks for urgent events from the event bus
-   - Asks the LLM to review the work and decide next steps
-   - Executes commands: `PROMPT`, `WAIT`, `MESSAGES`, `REVIEW`, `NOTE`, `NOTE_BEHAVIOR`, `DIRECTIVE`, `NOTIFY`, `RESTART`, `ABORT`, `CYCLE_DONE`, `STOP`
-   - Runs post-cycle validation (if configured) after `CYCLE_DONE`
+2. **Supervision cycle** -- Each project's supervisor runs in a Socratic dialogue loop:
+   - Reads the worker's recent messages and loads persistent memory
+   - Injects behavioral lessons from previous cycles into the system prompt
+   - On first cycle with existing memory, adds resumption context
+   - Checks for urgent events from the event bus and mid-cycle user feedback
+   - Asks the LLM to **think freely** about the situation and decide next steps
+   - The LLM reasons in natural language, then uses `@` markers to take actions: `@worker:` (talk to worker), `@check` (read messages), `@review`, `@note:`, `@lesson:`, `@directive:`, `@broadcast:`, `@intent:`, `@restart`, `@abort`, `@done:` (end cycle), `@stop:`
+   - After each `@worker:` message, waits for the worker, then presents the response as dialogue with reflection prompts
+   - Runs post-cycle validation (if configured) after `@done:`
    - Checks for false progress (summary claims work but git shows no changes)
    - Updates file locks and checks for contention with other agents
    - Emits events to the event bus at each stage
    - Records all prompts to the prompt ledger
-   - If a pause is requested, injects a wrap-up directive then blocks until resumed
+   - If a pause is requested, injects a wrap-up directive; force-breaks after 2 rounds if LLM doesn't comply
    - Dynamically adjusts cycle pause based on responsiveness
 
-3. **Stuck detection** -- The orchestrator monitors agents every 30 seconds. If an agent has been busy longer than the threshold (default 5 min) with no new messages, it's flagged as stuck.
+3. **Stale-busy detection** -- Every SSE event from a worker (including streaming deltas) updates a `lastEventAt` timestamp. If an agent claims "busy" but no SSE events have arrived for 45 seconds, it's flagged as stale and automatically restarted — much more accurate than the old timeout-based approach.
 
 4. **Failure recovery** -- If a supervisor stops due to failure, the project manager auto-restarts after 10 seconds. The command recovery system nudges the LLM with escalating hints when it fails to produce valid commands.
 
@@ -436,10 +446,10 @@ Performance events logged to `orchestrator-performance.json`: `supervisor_start`
 |------|-------|-------------|
 | `cli.ts` | 1057 | Entry point: config loading, CLI argument parsing, interactive REPL, command handler, stuck detection callback. |
 | `launcher.ts` | 173 | Alternative entry point that spawns pre-configured opencode serve instances before starting the CLI. |
-| `orchestrator.ts` | 460 | Core orchestration: agent connections, prompt queuing, SSE subscriptions, health monitoring, stuck detection, abort/restart. |
+| `orchestrator.ts` | ~470 | Core orchestration: agent connections, prompt queuing, SSE subscriptions with heartbeat tracking (`lastEventAt`), health monitoring, stale-busy detection, auto-question answering, auto-permission approval, abort/restart. |
 | `agent.ts` | 142 | Agent abstraction: wraps the opencode SDK client with session management, prompting, and health checks. |
 | `events.ts` | 106 | SSE client: connects to each agent's event stream with auto-reconnect. |
-| `supervisor.ts` | 1663 | LLM supervisor loop: per-agent cycles with validation, false progress detection, resource contention, event bus emissions, command recovery, pause integration. |
+| `supervisor.ts` | ~1800 | Socratic supervisor loop: free-thinking LLM dialogue with `@` marker parsing, per-agent cycles, stale-busy detection, pause hard-break, validation, false progress detection, resource contention, event bus emissions, command recovery. Legacy UPPERCASE command fallback. |
 | `brain.ts` | 594 | Higher-level brain: coordinates multiple agents toward a single objective. Dynamic model context size detection. |
 | `brain-memory.ts` | 215 | Persistent memory store: session summaries, project notes, behavioral notes with async write locks. |
 | `project-manager.ts` | 820 | Dynamic project provisioning: spawns processes, allocates ports, branch isolation, directive history, pause/resume, A/B test tracking. |
@@ -452,7 +462,7 @@ Performance events logged to `orchestrator-performance.json`: `supervisor_start`
 | `event-bus.ts` | 137 | In-memory event bus: ring buffer, pattern-matched subscriptions, SSE streaming support. |
 | `resource-manager.ts` | 240 | Advisory file locks, work intent ledger, LLM concurrency semaphore, rate-limit coordination. |
 | `git-utils.ts` | 129 | Git operations: exec, diff, branch, checkout, merge, delete, latest commit, clean check. |
-| `command-recovery.ts` | 199 | Command recovery: nudge state machine, circuit breaker, fuzzy command extraction, command constants. |
+| `command-recovery.ts` | ~210 | Command recovery: nudge state machine (Socratic `@` marker guidance), circuit breaker, fuzzy command extraction, command constants for both Socratic and legacy formats. |
 | `token-tracker.ts` | 155 | Token usage tracking per agent with budget limits. |
 | `conversation-checkpoint.ts` | 78 | Save/restore supervisor conversation state for warm restarts. |
 | `analytics.ts` | 844 | Analytics engine: session tracking, git snapshots, AI evaluation, cross-session comparison, A/B test orchestration. |
@@ -625,10 +635,11 @@ The pause service provides graceful suspension of project supervisors, distinct 
 ### How it works
 
 1. **Request pause** -- via dashboard button, CLI (`pause <project>`), or API (`POST /api/projects/<id>/pause`)
-2. **Wrap-up injection** -- The supervisor injects a message: "A pause has been requested. Finish your current task plan, ensure the agent reaches a clean state, then issue CYCLE_DONE."
-3. **Block at cycle boundary** -- After CYCLE_DONE, the supervisor enters a blocked state instead of starting the next cycle
-4. **Dashboard feedback** -- PAUSING badge (amber) while wrapping up, then PAUSED (blue) once blocked. Tooltips show time since request
-5. **Resume** -- via dashboard, CLI, or API. The supervisor immediately starts the next cycle
+2. **Wrap-up injection** -- The supervisor injects a message asking the LLM to wrap up cleanly and issue `@done:`
+3. **Hard break** -- If the LLM doesn't comply within 2 rounds after the pause injection, the cycle is force-ended (prevents infinite loops with smaller models)
+4. **Block at cycle boundary** -- After the cycle ends, the supervisor enters a blocked state instead of starting the next cycle
+5. **Dashboard feedback** -- PAUSING badge (amber) while wrapping up, then PAUSED (blue) once blocked. Tooltips show time since request
+6. **Resume** -- via dashboard, CLI, or API. The supervisor immediately starts the next cycle
 
 ---
 
@@ -684,7 +695,7 @@ Persistent, queryable log of every prompt at every level of the orchestration hi
 ## Testing
 
 ```bash
-# Run all tests (281 tests across 15 files)
+# Run all tests (319 tests across 16 files)
 bun test
 
 # Run a specific test file

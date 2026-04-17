@@ -33,26 +33,21 @@ export function buildEmptyNudge(state: NudgeState, validCommands: string[], defa
   state.consecutiveEmpty++
 
   if (state.consecutiveEmpty === 1) {
-    return "Your previous response was empty. Please issue commands in a ```commands code block."
+    return "Your previous response was empty. Think about the current situation and then take an action using an @ marker, like @check to see what the worker has been doing."
   }
 
   if (state.consecutiveEmpty === 2) {
-    const exampleCmd = validCommands[0] ?? defaultCommand
-    return `Your response was empty again. Here is the expected format:
+    return `Your response was empty again. Please respond with your thinking followed by an action. For example:
 
-\`\`\`commands
-${exampleCmd}
-\`\`\`
+Let me check what the worker has been up to.
 
-Please respond with at least one command.`
+@check`
   }
 
   // Level 3+: force the simplest possible action
-  return `You have sent ${state.consecutiveEmpty} empty responses in a row. Issue this command now:
+  return `You have sent ${state.consecutiveEmpty} empty responses in a row. Please respond with:
 
-\`\`\`commands
-${defaultCommand}
-\`\`\``
+${defaultCommand}`
 }
 
 /**
@@ -78,28 +73,35 @@ export function buildNoParseNudge(
 
   if (state.consecutiveNoParse === 1) {
     return `${failedFeedback}
-Please put commands inside a \`\`\`commands code block. Valid commands: ${validCommands.join(", ")}`
+I couldn't find any actions in your response. Use @ markers to take action. For example:
+
+@check
+
+to see what the worker has been doing, or:
+
+@worker: Your message to the worker here
+
+Available markers: @worker:, @check, @review, @restart, @abort, @note:, @lesson:, @directive:, @broadcast:, @intent:, @done:, @stop:`
   }
 
   if (state.consecutiveNoParse === 2) {
-    const exampleCmd = validCommands[0] ?? defaultCommand
     return `${failedFeedback}
-Your response did not contain valid commands. Here is the exact format:
+Your response still had no recognizable actions. Each action must start with @ at the beginning of a line. Example:
 
-\`\`\`commands
-${exampleCmd}
-\`\`\`
+@check
 
-Available commands: ${validCommands.join(", ")}`
+Or to talk to the worker:
+
+@worker: Please check the current test results and report what's failing.
+
+Try using ${defaultCommand} now.`
   }
 
   // Level 3+: force action
   return `${failedFeedback}
-You have failed to issue parseable commands ${state.consecutiveNoParse} times. Please issue exactly this:
+You have not issued a valid action ${state.consecutiveNoParse} times. Please respond with ONLY this:
 
-\`\`\`commands
-${defaultCommand}
-\`\`\``
+${defaultCommand}`
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +182,11 @@ export function isTripped(cb: CircuitBreakerState): boolean {
 // ---------------------------------------------------------------------------
 
 export const SUPERVISOR_COMMANDS = [
+  // Socratic @ markers (primary)
+  "@worker:", "@check", "@review", "@restart", "@abort",
+  "@note:", "@lesson:", "@directive:", "@broadcast:", "@intent:",
+  "@done:", "@stop:",
+  // Legacy UPPERCASE commands (fallback)
   "PROMPT", "WAIT", "MESSAGES", "REVIEW", "RESTART", "ABORT",
   "NOTE", "NOTE_BEHAVIOR", "DIRECTIVE", "NOTIFY", "INTENT",
   "CYCLE_DONE", "STOP",
@@ -194,6 +201,6 @@ export const MANAGER_COMMANDS = [
   "STATUS_CHECK", "MANAGER_DONE",
 ]
 
-export const SUPERVISOR_DEFAULT_CMD = "MESSAGES"
+export const SUPERVISOR_DEFAULT_CMD = "@check"
 export const BRAIN_DEFAULT_CMD = "STATUS"
 export const MANAGER_DEFAULT_CMD = "STATUS_CHECK"

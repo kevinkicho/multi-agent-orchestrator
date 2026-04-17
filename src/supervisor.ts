@@ -152,81 +152,81 @@ export type ParallelSupervisorsConfig = {
 }
 
 // ---------------------------------------------------------------------------
-// System prompt — focused on a single agent/project
+// System prompt — Socratic dialogue mode
 // ---------------------------------------------------------------------------
 
-function buildSupervisorPrompt(agentName: string, directory: string, reviewEnabled: boolean, hasReviewer: boolean, behavioralNotes: string[]): string {
-  const reviewCmd = reviewEnabled
-    ? `  REVIEW                    — ${hasReviewer ? "Send work to the dedicated reviewer agent" : "Ask your agent to critically self-review its recent changes"}\n`
+function buildSocraticPrompt(agentName: string, directory: string, reviewEnabled: boolean, hasReviewer: boolean, behavioralNotes: string[]): string {
+  const reviewAction = reviewEnabled
+    ? `- @review — ${hasReviewer ? "Send work to a dedicated reviewer" : "Ask the worker to self-review recent changes"}\n`
     : ""
 
   const behavioralSection = behavioralNotes.length > 0
-    ? `\n## IMPORTANT — Agent Behavioral Notes (from previous cycles)\n${behavioralNotes.map(n => `- ${n}`).join("\n")}\nApply these lessons when interacting with your agent.\n`
+    ? `\n## Lessons from Previous Cycles\n${behavioralNotes.map(n => `- ${n}`).join("\n")}\n`
     : ""
 
-  return `You are a dedicated supervisor for a single AI coding agent working on a software project.
+  return `You are a thinking partner and supervisor for an AI coding agent ("the worker") on a software project.
 
-Agent: ${agentName}
+Worker: ${agentName}
 Project: ${directory}
 ${behavioralSection}
-You can issue these commands (one per line, in a \`\`\`commands code block):
+## How to work
 
-  PROMPT <message>          — Send a task, question, or feedback to your agent
-  WAIT                      — Wait for your agent to finish its current work
-  MESSAGES                  — Read your agent's recent conversation
-${reviewCmd}  RESTART                   — Restart the agent's session (use when agent is stuck, unresponsive, or in a bad state)
-  ABORT                     — Cancel whatever the agent is currently doing
-  NOTE <text>               — Save a persistent note about this project
-  NOTE_BEHAVIOR <text>      — Save a behavioral note about how this agent works best (injected into future system prompts)
-  DIRECTIVE <text>          — Update the project directive (evolves as project progresses)
-  NOTIFY <message>           — Broadcast a message to all other supervisors (fast coordination)
-  INTENT <description> [files: f1, f2] — Declare what you plan to work on next (files optional but recommended)
-  CYCLE_DONE <summary>      — End this supervision cycle (a new one starts after a pause)
-  STOP <summary>            — Permanently stop supervising this agent
+Think freely. Reason out loud. Ask yourself questions: "What is the real problem here?", "What assumptions am I making?", "Is this the right approach, or am I missing something?" Your natural-language reasoning is preserved between rounds — use it to build understanding across the conversation.
 
-Each cycle you should:
-1. Check MESSAGES to see your agent's recent work
-2. Review their output thoroughly — look for bugs, missing edge cases, incomplete features
-3. Give specific, actionable feedback with file paths and code references
-4. Assign new tasks when the agent is idle
-${reviewEnabled ? "5. Use REVIEW after significant changes to catch issues the agent may have missed\n" : ""}6. Save NOTEs about important project state for future cycles
-7. Issue CYCLE_DONE with a summary when you've reviewed everything and the agent has direction
+When you're ready to take an action, use one of these markers on its own line:
 
-IMPORTANT — if the agent appears stuck (busy for a long time with no output, or not executing commands):
-- First try ABORT to cancel its current work
-- If still unresponsive after a new PROMPT, use RESTART to get a fresh session
-- Save a NOTE_BEHAVIOR about what caused the agent to get stuck so future cycles avoid it
-- Do NOT issue 5+ prompts to a stuck agent — escalate with RESTART after 2-3 failed attempts
+### Talking to the worker
+- @worker: <message> — Talk to the worker. Ask questions, give tasks, provide feedback, suggest alternatives. Multi-line: everything until the next @ marker is sent.
+- @check — Read the worker's recent messages to see what they've been doing.
+${reviewAction}
+### Agent lifecycle
+- @abort — Cancel the worker's current task.
+- @restart — Restart the worker's session (use when truly stuck/unresponsive).
 
-IMPORTANT — CYCLE_DONE and STOP summaries must be specific and actionable:
-- BAD: "Cycle completed." / "Done." / "ANALYZING AND START FIXING"
-- GOOD: "Fixed SSRF vulnerability in ai-brief route. Agent now working on P1 test failures. 63/297 tests passing."
-- Include: what was accomplished, what's in progress, what's next
+### Memory & coordination
+- @note: <text> — Save a project note for future cycles.
+- @lesson: <text> — Save a behavioral lesson about how this worker operates best.
+- @directive: <text> — Evolve the project direction as understanding deepens.
+- @broadcast: <text> — Send a message to all other supervisors.
+- @intent: <description> [files: f1, f2] — Declare planned work to avoid conflicts with other agents.
 
-IMPORTANT — Background processes and port management:
-- NEVER tell the agent to start servers with "&" (background). Background processes become zombies that leak ports.
-- Instead, tell the agent to start the server and run tests in ONE command, e.g.: "node server.js & sleep 2 && npx playwright test; kill %1"
-- Or use a test framework's built-in server startup (e.g., Playwright's webServer config)
-- If tests fail with ERR_CONNECTION_REFUSED, check if a server is already running before starting another
+### Cycle control
+- @done: <summary> — End this cycle. Summary must be specific: what was accomplished, what's next.
+- @stop: <summary> — Permanently stop supervising this worker.
 
-Guidelines:
-- Be a thorough code reviewer — your agent is capable but benefits from oversight
-- Give specific feedback: file paths, function names, line numbers, code snippets
-- Don't micromanage — describe WHAT needs to happen, let the agent decide HOW
-- If the agent is stuck or producing poor results, try ABORT then rephrase the task
-- If the agent is completely unresponsive, use RESTART — don't keep prompting a dead agent
+## Your approach
+
+**Think before acting.** Before sending work to the worker, reason about:
+- What's the current state? What has the worker already done?
+- What's the highest-value next step? Why this over alternatives?
+- Are there risks, edge cases, or assumptions worth questioning?
+
+**Engage with the worker's reasoning.** When the worker responds, don't just check-mark it and move on. Push back if something seems off: "You mentioned X but I don't see how that handles Y..." Build on good ideas: "That's a solid approach for the core case — what about when Z happens?"
+
+**Evolve your understanding.** Your first take on a problem may not be right. As you see the worker's output and the code's actual state, update your mental model. Use @directive to capture how your understanding of the project direction has shifted.
+
+**Be a Socratic partner, not a task dispatcher.** The best outcomes come from genuine dialogue — probing questions, building on each other's ideas, challenging assumptions. The worker is a capable reasoning agent, not a command executor.
+
+## Practical guidelines
+- Start each cycle by checking in: @check to see recent work, then think about what you learn.
+- Give the worker context and reasoning, not just bare instructions. "We need to fix X because Y, and I think the approach should be Z because..." is better than "Fix X."
+- If the worker is stuck, don't just retry — think about WHY it's stuck and try a different angle.
+- If stuck/unresponsive: @abort first, then rephrase. If still dead: @restart. Save a @lesson about what caused it.
+- Don't send 5+ messages to an unresponsive worker — escalate.
+- NEVER tell the worker to start background processes with "&". Use single commands: "node server.js & sleep 2 && npx playwright test; kill %1"
 - Prioritize: bugs > missing features > code quality > polish
-- Track project progress with NOTEs so you remember across cycles
-- Use NOTE_BEHAVIOR for agent-specific lessons (e.g., "keep prompts to one action at a time")
-- Use DIRECTIVE to update the project direction as phases complete
-- Use INTENT before starting significant work to declare what files you'll touch — this helps other agents avoid conflicts
-- If you receive a [REDIRECT] message, adjust your plan to avoid the conflicting files and focus on non-overlapping work
-- You manage ONLY this one agent — focus all your attention on this project
+- @done summaries must be specific: "Fixed auth bypass in /api/login. Worker implementing rate limiting. 12/15 tests passing." NOT "Done." or "Cycle completed."
+- You manage ONLY this worker — give it your full attention.
 `
 }
 
+/** Legacy prompt builder — kept for reference/fallback */
+function buildSupervisorPrompt(agentName: string, directory: string, reviewEnabled: boolean, hasReviewer: boolean, behavioralNotes: string[]): string {
+  return buildSocraticPrompt(agentName, directory, reviewEnabled, hasReviewer, behavioralNotes)
+}
+
 // ---------------------------------------------------------------------------
-// Command parsing — simplified (no agent names needed)
+// Command types — shared by both Socratic and legacy parsers
 // ---------------------------------------------------------------------------
 
 type SupervisorCommand =
@@ -244,22 +244,149 @@ type SupervisorCommand =
   | { type: "cycle_done"; summary: string }
   | { type: "stop"; summary: string }
 
-// Commands that are recognized as starting a new command (not continuation of PROMPT)
-const COMMAND_PREFIXES = [
+// ---------------------------------------------------------------------------
+// Socratic response parser — extracts actions from natural language + @ markers
+// ---------------------------------------------------------------------------
+
+/** All recognized @ markers (order matters — longer prefixes first to avoid partial matches) */
+const SOCRATIC_MARKERS = [
+  { prefix: "@worker:", type: "prompt" as const, hasBody: true },
+  { prefix: "@check", type: "messages" as const, hasBody: false },
+  { prefix: "@review", type: "review" as const, hasBody: false },
+  { prefix: "@restart", type: "restart" as const, hasBody: false },
+  { prefix: "@abort", type: "abort" as const, hasBody: false },
+  { prefix: "@lesson:", type: "note_behavior" as const, hasBody: true },
+  { prefix: "@note:", type: "note" as const, hasBody: true },
+  { prefix: "@directive:", type: "directive" as const, hasBody: true },
+  { prefix: "@broadcast:", type: "broadcast" as const, hasBody: true },
+  { prefix: "@intent:", type: "intent" as const, hasBody: true },
+  { prefix: "@done:", type: "cycle_done" as const, hasBody: true },
+  { prefix: "@stop:", type: "stop" as const, hasBody: true },
+] as const
+
+function matchMarker(line: string): { marker: typeof SOCRATIC_MARKERS[number]; rest: string } | null {
+  const trimmed = line.trim()
+  for (const m of SOCRATIC_MARKERS) {
+    if (m.hasBody) {
+      if (trimmed.startsWith(m.prefix)) {
+        return { marker: m, rest: trimmed.slice(m.prefix.length).trim() }
+      }
+    } else {
+      // Exact match (possibly with trailing whitespace/punctuation)
+      if (trimmed === m.prefix || trimmed.startsWith(m.prefix + " ") || trimmed === m.prefix + ".") {
+        return { marker: m, rest: "" }
+      }
+    }
+  }
+  return null
+}
+
+function parseSocraticResponse(response: string): { commands: SupervisorCommand[]; thinking: string } {
+  const commands: SupervisorCommand[] = []
+  const thinkingLines: string[] = []
+
+  // Strip LLM think tags
+  const cleaned = response.replace(/<\/?think>/gi, "\n")
+  const lines = cleaned.split("\n")
+
+  let currentMarker: { marker: typeof SOCRATIC_MARKERS[number]; bodyLines: string[] } | null = null
+
+  function flushCurrent() {
+    if (!currentMarker) return
+    const body = currentMarker.bodyLines.join("\n").trim()
+    const m = currentMarker.marker
+
+    switch (m.type) {
+      case "prompt":
+        if (body) commands.push({ type: "prompt", message: body })
+        // Implicit wait after every @worker message
+        commands.push({ type: "wait" })
+        break
+      case "messages":
+        commands.push({ type: "messages" })
+        break
+      case "review":
+        commands.push({ type: "review" })
+        break
+      case "restart":
+        commands.push({ type: "restart" })
+        break
+      case "abort":
+        commands.push({ type: "abort" })
+        break
+      case "note":
+        if (body) commands.push({ type: "note", text: body })
+        break
+      case "note_behavior":
+        if (body) commands.push({ type: "note_behavior", text: body })
+        break
+      case "directive":
+        if (body) commands.push({ type: "directive", text: body })
+        break
+      case "broadcast":
+        if (body) commands.push({ type: "notify", message: body })
+        break
+      case "intent": {
+        const filesMatch = body.match(/\[files?:\s*([^\]]+)\]/)
+        const files = filesMatch
+          ? filesMatch[1]!.split(",").map(f => f.trim()).filter(Boolean)
+          : []
+        const description = body.replace(/\[files?:\s*[^\]]+\]/, "").trim()
+        if (description) commands.push({ type: "intent", description, files })
+        break
+      }
+      case "cycle_done":
+        commands.push({ type: "cycle_done", summary: body || "Cycle completed." })
+        break
+      case "stop":
+        commands.push({ type: "stop", summary: body || "Supervisor stopped." })
+        break
+    }
+    currentMarker = null
+  }
+
+  for (const line of lines) {
+    const match = matchMarker(line)
+    if (match) {
+      // Flush any pending marker
+      flushCurrent()
+      // Start new marker
+      currentMarker = { marker: match.marker, bodyLines: match.rest ? [match.rest] : [] }
+      // No-body markers can be flushed immediately
+      if (!match.marker.hasBody) {
+        flushCurrent()
+      }
+    } else if (currentMarker && currentMarker.marker.hasBody) {
+      // Continuation line for a multi-line marker body
+      currentMarker.bodyLines.push(line)
+    } else {
+      // Free thinking — preserved as context
+      thinkingLines.push(line)
+    }
+  }
+
+  // Flush any trailing marker
+  flushCurrent()
+
+  return { commands, thinking: thinkingLines.join("\n").trim() }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy command parsing — fallback for older command format
+// ---------------------------------------------------------------------------
+
+const LEGACY_COMMAND_PREFIXES = [
   "PROMPT ", "WAIT", "MESSAGES", "REVIEW", "RESTART", "ABORT",
   "NOTE_BEHAVIOR ", "NOTE ", "DIRECTIVE ", "NOTIFY ", "INTENT ",
   "CYCLE_DONE", "STOP",
 ]
 
 function isCommandLine(trimmed: string): boolean {
-  return COMMAND_PREFIXES.some(p => trimmed === p.trim() || trimmed.startsWith(p))
+  return LEGACY_COMMAND_PREFIXES.some(p => trimmed === p.trim() || trimmed.startsWith(p))
 }
 
-function parseSupervisorCommands(response: string): SupervisorCommand[] {
+function parseLegacyCommands(response: string): SupervisorCommand[] {
   const commands: SupervisorCommand[] = []
-
-  // Strip LLM reasoning/think tags that some models (e.g. glm-5.1) leak into output.
-  // These tags appear mid-line and corrupt command parsing.
   const cleaned = response.replace(/<\/?think>/gi, "\n")
 
   const codeBlockMatch = cleaned.match(/```commands?\n([\s\S]*?)```/)
@@ -267,7 +394,6 @@ function parseSupervisorCommands(response: string): SupervisorCommand[] {
     ? codeBlockMatch[1]!.split("\n")
     : cleaned.split("\n")
 
-  // Track the last PROMPT command so continuation lines can be appended
   let lastPrompt: { type: "prompt"; message: string } | null = null
 
   for (const line of lines) {
@@ -306,7 +432,6 @@ function parseSupervisorCommands(response: string): SupervisorCommand[] {
       commands.push({ type: "notify", message: trimmed.slice(7) })
     } else if (trimmed.startsWith("INTENT ")) {
       lastPrompt = null
-      // INTENT <description> [files: file1, file2, ...]
       const rest = trimmed.slice(7)
       const filesMatch = rest.match(/\[files?:\s*([^\]]+)\]/)
       const files = filesMatch
@@ -321,12 +446,21 @@ function parseSupervisorCommands(response: string): SupervisorCommand[] {
       lastPrompt = null
       commands.push({ type: "stop", summary: trimmed.slice(4).trim() || "Supervisor stopped." })
     } else if (lastPrompt) {
-      // Continuation line for a multi-line PROMPT — append to the last PROMPT message
       lastPrompt.message += "\n" + trimmed
     }
   }
 
   return commands
+}
+
+/** Unified parser: try Socratic @ markers first, fall back to legacy UPPERCASE commands */
+function parseSupervisorCommands(response: string): SupervisorCommand[] {
+  // Try Socratic parsing first
+  const socratic = parseSocraticResponse(response)
+  if (socratic.commands.length > 0) return socratic.commands
+
+  // Fall back to legacy command format
+  return parseLegacyCommands(response)
 }
 
 /**
@@ -335,10 +469,11 @@ function parseSupervisorCommands(response: string): SupervisorCommand[] {
  */
 function parseJsonCommands(response: string): SupervisorCommand[] {
   try {
-    const parsed = JSON.parse(response) as { commands?: string[]; thinking?: string }
-    if (Array.isArray(parsed.commands)) {
-      // Convert JSON array back to newline-separated text and parse through normal parser
-      const asText = "```commands\n" + parsed.commands.join("\n") + "\n```"
+    const parsed = JSON.parse(response) as { commands?: string[]; actions?: string[]; thinking?: string }
+    const items = parsed.actions ?? parsed.commands
+    if (Array.isArray(items)) {
+      // Convert JSON array to newline-separated text and parse through unified parser
+      const asText = items.join("\n")
       return parseSupervisorCommands(asText)
     }
   } catch {
@@ -351,12 +486,12 @@ function parseJsonCommands(response: string): SupervisorCommand[] {
 const JSON_MODE_INSTRUCTION = `
 
 IMPORTANT: You MUST respond with a JSON object. Format:
-{"commands": ["COMMAND1 arg1 arg2", "COMMAND2 arg"], "thinking": "optional reasoning"}
+{"actions": ["@check", "@worker: your message here"], "thinking": "your reasoning"}
 
 Example:
-{"commands": ["MESSAGES", "WAIT"], "thinking": "Checking agent state before assigning work"}
+{"actions": ["@check"], "thinking": "Let me see what the worker has been doing before deciding next steps"}
 
-Every command goes as a string in the "commands" array, using the same format documented above.
+Every action goes as a string in the "actions" array, using the @ marker format documented above.
 Do NOT use a code block — respond with pure JSON only.`
 
 // ---------------------------------------------------------------------------
@@ -627,36 +762,36 @@ export async function runAgentSupervisor(
     const projectNotes = memory.projectNotes[agentName] ?? []
     const isResume = cycleCount === 1 && (projectNotes.length > 0 || memory.entries.length > 0)
     const resumeBlock = isResume
-      ? `\n## RESUMING FROM PREVIOUS SESSION\nThis project was previously worked on. Before assigning new tasks:\n1. Use MESSAGES to check the agent's current state\n2. Review project notes below for context on what was done\n3. Ask the agent to run \`git status\` and \`git log --oneline -5\` to understand current state\n4. Orient the agent on where to pick up — don't repeat completed work\n${projectNotes.length > 0 ? `\nLatest project notes:\n${projectNotes.slice(-5).map(n => `- ${n}`).join("\n")}` : ""}`
+      ? `\n## Resuming from previous session\nThis project was previously worked on. Before diving in, take a moment to orient yourself:\n- Use @check to see what the worker has been doing\n- Review the project notes below for context\n- Consider asking the worker to run \`git status\` and \`git log --oneline -5\`\n- Think about where to pick up — what's the highest-value next step?\n${projectNotes.length > 0 ? `\nLatest project notes:\n${projectNotes.slice(-5).map(n => `- ${n}`).join("\n")}` : ""}`
       : ""
 
     // Check for unread user comments on the directive
     const unreadComments = config.getUnreadComments?.() ?? []
     const commentBlock = unreadComments.length > 0
-      ? `\n## User Feedback on Directive\nThe human user has left comments for you to review:\n${unreadComments.map(c => `> "${c}"`).join("\n")}\nPlease acknowledge this feedback and adjust your approach accordingly.`
+      ? `\n## User feedback\nThe human user left you a message:\n${unreadComments.map(c => `> "${c}"`).join("\n")}\nThink about what they're telling you and how it should shape your approach.`
       : ""
 
     // Inject other agents' declared work intents so this supervisor can avoid overlap
     const intentSummary = config.resourceManager?.formatIntentSummary(agentName) ?? ""
     const intentBlock = intentSummary && !intentSummary.includes("(no other agents")
-      ? `\n## Other Agents' Work Intents\n${intentSummary}\nUse INTENT to declare your planned work before starting. Avoid overlapping files where possible.`
+      ? `\n## Other agents' work\n${intentSummary}\nConsider using @intent: before starting significant work to avoid stepping on other agents' toes.`
       : ""
 
     const capabilityBlock = agentCapabilities && cycleCount === 1
-      ? `\n## Agent Capabilities\n${agentCapabilities}\nTailor your prompts to what the agent can actually do.`
+      ? `\n## Worker capabilities\n${agentCapabilities}\nKeep these in mind when thinking about what to ask the worker to do.`
       : ""
 
     const initialContent = [
       statusLine,
-      memoryContext ? `\n## Memory from Previous Cycles\n${memoryContext}` : "",
+      memoryContext ? `\n## Memory from previous cycles\n${memoryContext}` : "",
       resumeBlock,
       commentBlock,
       intentBlock,
       capabilityBlock,
       `\nDirective: ${directive}`,
       isResume
-        ? `\nThis is supervision cycle #${cycleCount} (resuming). Check the agent's current state before assigning work.`
-        : `\nThis is supervision cycle #${cycleCount}. Check in with your agent, review their work, and keep them productive.`,
+        ? `\nThis is cycle #${cycleCount} (resuming). Start by understanding where things stand before deciding what to do next.`
+        : `\nThis is cycle #${cycleCount}. Start by checking in with the worker (@check), then think about the best path forward.`,
     ].filter(Boolean).join("\n")
 
     const baseSystemPrompt = buildSupervisorPrompt(agentName, directory, reviewEnabled, hasReviewer, behavioralNotes)
@@ -714,7 +849,7 @@ export async function runAgentSupervisor(
       if (config.pauseState && isPauseRequested(config.pauseState) && !pauseInjected) {
         pauseInjected = true
         pauseInjectedAtRound = round
-        const pauseMsg = "IMPORTANT: A pause has been requested. Finish your current task plan — ensure the agent reaches a clean state (tests passing, code committed, no half-done changes), then issue CYCLE_DONE with a detailed summary. Do NOT start new tasks."
+        const pauseMsg = "A pause has been requested by the user. Wrap up your current thinking — make sure the worker is at a clean stopping point (no half-done changes, tests passing, code committed). Then use @done: with a detailed summary of what was accomplished and what's next. Don't start new tasks."
         messages.push({ role: "user", content: pauseMsg })
         emit(`Pause requested — injecting wrap-up directive into conversation.`)
         recordPrompt({
@@ -728,7 +863,7 @@ export async function runAgentSupervisor(
       // Mid-cycle user feedback — check every round so users can redirect a stuck supervisor
       const midCycleComments = config.getUnreadComments?.() ?? []
       if (midCycleComments.length > 0) {
-        const feedbackMsg = `[USER FEEDBACK — READ THIS NOW]\nThe human user has sent you urgent feedback:\n${midCycleComments.map(c => `> "${c}"`).join("\n")}\n\nACT ON THIS IMMEDIATELY. Adjust your current approach based on this feedback. If the user says to ignore something, stop pursuing it and move on.`
+        const feedbackMsg = `The human user just sent you direct feedback:\n\n${midCycleComments.map(c => `> "${c}"`).join("\n")}\n\nThis is real-time input from the person who owns this project. Stop what you're doing and think about what they're telling you. Adjust your approach based on their feedback — they can see things you can't.`
         messages.push({ role: "user", content: feedbackMsg })
         emit(`Injected ${midCycleComments.length} user comment(s) mid-cycle`)
       }
@@ -907,7 +1042,7 @@ export async function runAgentSupervisor(
             try {
               config.dashboardLog?.push({ type: "agent-prompt", agent: agentName, text: cmd.message })
               await orchestrator.prompt(agentName, cmd.message)
-              results.push(`Sent to ${agentName}: "${cmd.message.slice(0, 120)}..."`)
+              results.push(`Message sent to the worker. Waiting for their response...`)
               recordPrompt({
                 source: "supervisor", target: agentName, direction: "outbound",
                 projectName: directory, agentName, model, cycleNumber: cycleCount,
@@ -929,7 +1064,7 @@ export async function runAgentSupervisor(
             try {
               const msgs = await orchestrator.getMessages(agentName)
               const formatted = formatRecentMessages(msgs, 6, 3000)
-              results.push(`Recent messages from ${agentName}:\n${formatted.join("\n\n")}`)
+              results.push(`Here's what the worker has been up to recently:\n\n${formatted.join("\n\n")}\n\nStudy this carefully. What's the worker's current state? Are they making progress, stuck, or going in a wrong direction?`)
             } catch (err) {
               results.push(`Error reading messages: ${err}`)
             }
@@ -991,7 +1126,7 @@ Be specific with file paths, line numbers, and code snippets.`
             const reviewText = extractLastAssistantText(reviewMsgs)
             if (reviewText) {
               const truncated = reviewText.slice(0, 5000)
-              results.push(`Review results from ${targetAgent}:\n${truncated}`)
+              results.push(`Review from ${targetAgent}:\n\n${truncated}\n\nConsider: do you agree with this review? Are there points the reviewer missed, or do they raise valid concerns that should be addressed?`)
               config.dashboardLog?.push({ type: "agent-response", agent: targetAgent, text: reviewText })
               recordPrompt({
                 source: "agent", target: "supervisor", direction: "inbound",
@@ -1417,7 +1552,8 @@ Be specific with file paths, line numbers, and code snippets.`
           if (lastText) {
             consecutiveEmptyResponses = 0
             cycleHadProgress = true
-            results.push(`${agentName} response:\n${lastText.slice(0, 5000)}`)
+            // Present worker response as dialogue for Socratic engagement
+            results.push(`Worker ${agentName} replied:\n\n${lastText.slice(0, 5000)}\n\nReflect on this response. What did the worker do well? What might they have missed? What should happen next?`)
             config.dashboardLog?.push({ type: "agent-response", agent: agentName, text: lastText })
             recordPrompt({
               source: "agent", target: "supervisor", direction: "inbound",

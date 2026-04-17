@@ -16,7 +16,7 @@ describe("buildEmptyNudge — escalating", () => {
     const state = createNudgeState()
     const msg = buildEmptyNudge(state, SUPERVISOR_COMMANDS, SUPERVISOR_DEFAULT_CMD)
     expect(msg).toContain("empty")
-    expect(msg).toContain("commands")
+    expect(msg).toContain("@")
     expect(state.consecutiveEmpty).toBe(1)
   })
 
@@ -24,8 +24,7 @@ describe("buildEmptyNudge — escalating", () => {
     const state = createNudgeState()
     buildEmptyNudge(state, BRAIN_COMMANDS, BRAIN_DEFAULT_CMD) // level 1
     const msg = buildEmptyNudge(state, BRAIN_COMMANDS, BRAIN_DEFAULT_CMD) // level 2
-    expect(msg).toContain("```commands")
-    expect(msg).toContain(BRAIN_COMMANDS[0]!) // example command
+    expect(msg).toContain("@check")
     expect(state.consecutiveEmpty).toBe(2)
   })
 
@@ -35,7 +34,6 @@ describe("buildEmptyNudge — escalating", () => {
     buildEmptyNudge(state, MANAGER_COMMANDS, MANAGER_DEFAULT_CMD) // 2
     const msg = buildEmptyNudge(state, MANAGER_COMMANDS, MANAGER_DEFAULT_CMD) // 3
     expect(msg).toContain(MANAGER_DEFAULT_CMD)
-    expect(msg).toContain("```commands")
     expect(state.consecutiveEmpty).toBe(3)
   })
 
@@ -53,13 +51,13 @@ describe("buildEmptyNudge — escalating", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildNoParseNudge — escalating with feedback", () => {
-  test("level 1: shows failed lines and valid commands list", () => {
+  test("level 1: shows failed lines and mentions @ markers", () => {
     const state = createNudgeState()
     const badResponse = "I think we should do something\nLet me check the status"
     const msg = buildNoParseNudge(state, badResponse, SUPERVISOR_COMMANDS, SUPERVISOR_DEFAULT_CMD)
     expect(msg).toContain("not recognized")
     expect(msg).toContain("I think we should do something")
-    expect(msg).toContain("Valid commands:")
+    expect(msg).toContain("@ markers")
     expect(state.consecutiveNoParse).toBe(1)
     expect(state.lastFailedLines.length).toBeGreaterThan(0)
   })
@@ -68,8 +66,8 @@ describe("buildNoParseNudge — escalating with feedback", () => {
     const state = createNudgeState()
     buildNoParseNudge(state, "bad", BRAIN_COMMANDS, BRAIN_DEFAULT_CMD)
     const msg = buildNoParseNudge(state, "still bad", BRAIN_COMMANDS, BRAIN_DEFAULT_CMD)
-    expect(msg).toContain("```commands")
-    expect(msg).toContain("Available commands:")
+    expect(msg).toContain("@worker:")
+    expect(msg).toContain(BRAIN_DEFAULT_CMD)
     expect(state.consecutiveNoParse).toBe(2)
   })
 
@@ -78,7 +76,7 @@ describe("buildNoParseNudge — escalating with feedback", () => {
     for (let i = 0; i < 2; i++) buildNoParseNudge(state, "x", MANAGER_COMMANDS, MANAGER_DEFAULT_CMD)
     const msg = buildNoParseNudge(state, "still nothing", MANAGER_COMMANDS, MANAGER_DEFAULT_CMD)
     expect(msg).toContain(MANAGER_DEFAULT_CMD)
-    expect(msg).toContain("failed to issue parseable commands 3 times")
+    expect(msg).toContain("not issued a valid action 3 times")
   })
 
   test("truncates long failed lines", () => {

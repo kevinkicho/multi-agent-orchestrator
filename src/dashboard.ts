@@ -459,10 +459,11 @@ export async function startDashboard(
         const projectId = sanitizeParam(url.pathname.split("/")[3] ?? "")
         try {
           const body = await req.json() as { model: string }
-          if (!body.model?.trim()) {
-            return Response.json({ error: "Model name is required" }, { status: 400, headers: corsHeaders })
+          const modelName = body.model?.trim()
+          if (!modelName || modelName === "default") {
+            return Response.json({ error: "Please select a specific model from the dropdown" }, { status: 400, headers: corsHeaders })
           }
-          pm.updateModel(projectId, body.model.trim())
+          pm.updateModel(projectId, modelName)
           // Restart supervisor with new model
           pm.restartSupervisor(projectId)
           return Response.json({ ok: true }, { headers: corsHeaders })

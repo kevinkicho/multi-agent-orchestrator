@@ -1338,15 +1338,20 @@ async function saveModel(agentName) {
   const agent = projectRows[agentName]
   if (!agent || !agent.projectId) { alert('Project not found for ' + agentName); return }
   const model = agent.modelSelect.value
+  if (!model) {
+    // "(global default)" selected — clear override, just restart supervisor with existing config
+    addLogEntry(agent.supervisorLog, 'status', 'Model already set to global default — no change needed.')
+    return
+  }
   try {
     const res = await apiFetch('/api/projects/' + agent.projectId + '/model', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: model || 'default' }),
+      body: JSON.stringify({ model }),
     })
     const data = await res.json()
     if (data.ok) {
-      addLogEntry(agent.supervisorLog, 'status', 'Model changed to: ' + (model || '(global default)') + '. Supervisor restarting...')
+      addLogEntry(agent.supervisorLog, 'status', 'Model changed to: ' + model + '. Supervisor restarting...')
     } else {
       alert('Failed to change model: ' + (data.error || 'Unknown error'))
     }

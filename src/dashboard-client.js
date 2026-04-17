@@ -1,6 +1,19 @@
 // API token injected by the server for authenticating mutating requests
 const API_TOKEN = window.__API_TOKEN__ || ''
 
+// Global error boundary — catch unhandled errors and promise rejections
+// so the poll loop and SSE can recover instead of silently dying
+window.onerror = function(message, source, lineno, colno, error) {
+  console.error('[orchestrator-dashboard] Uncaught error:', message, source, lineno, colno, error)
+  showNotification('Unexpected error: ' + (typeof message === 'string' ? message.slice(0, 200) : 'Unknown error'), 'error')
+  return false // allow default handling too
+}
+window.addEventListener('unhandledrejection', function(event) {
+  console.error('[orchestrator-dashboard] Unhandled promise rejection:', event.reason)
+  showNotification('Unexpected error: ' + (event.reason instanceof Error ? event.reason.message : String(event.reason).slice(0, 200)), 'error')
+  // Don't preventDefault — let the rejection still be logged to console
+})
+
 // Wrapper around fetch that automatically adds the API token header on mutating requests
 function apiFetch(url, opts) {
   opts = opts || {}
@@ -2325,12 +2338,24 @@ async function pollEvents() {
       pollConsecutiveFailures++
       if (pollConsecutiveFailures >= 3) setConnectionState('disconnected')
       else setConnectionState('degraded')
-      console.log('Poll error, retrying...', err)
+      console.error('[orchestrator-dashboard] Poll event error:', err)
+      // If handleEvent threw, cursor hasn't advanced — skip stale events by advancing cursor
+      // so we don't get stuck in a loop crashing on the same bad event
+      if (cursor === 0) cursor = Date.now()
       await new Promise(r => setTimeout(r, 2000))
     }
   }
 }
-pollEvents()
+// Start poll loop with crash recovery — if pollEvents throws out of the while loop,
+// restart it after a delay
+function startPolling() {
+  pollEvents().catch(err => {
+    console.error('[orchestrator-dashboard] Poll loop exited unexpectedly:', err)
+    showNotification('Event stream crashed — reconnecting...', 'error')
+    setTimeout(startPolling, 5000)
+  })
+}
+startPolling()
 
 // ---- LLM Providers ----
 var ollamaAvailableModels = [] // cached from /api/ollama-models

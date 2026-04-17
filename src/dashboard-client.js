@@ -1218,13 +1218,53 @@ window.refreshAnalytics = async function() {
   }
 }
 
-// Fetch initial status
-fetch('/api/status').then(r => { if (!r.ok) throw new Error('status ' + r.status); return r.json() }).then(data => { applyStatusData(data); checkEmptyState() }).catch(() => {})
-fetch('/api/projects').then(r => { if (!r.ok) throw new Error('projects ' + r.status); return r.json() }).then(applyProjectData).catch(() => {})
+// Connection state indicator for the status bar
+let connectionState = 'connected' // 'connected' | 'degraded' | 'disconnected'
+let consecutivePollFailures = 0
+
+function updateConnectionIndicator() {
+  const indicator = document.getElementById('connection-indicator')
+  if (!indicator) return
+  if (connectionState === 'connected') {
+    indicator.textContent = ''
+    indicator.style.color = ''
+  } else if (connectionState === 'degraded') {
+    indicator.textContent = '⚠ Reconnecting...'
+    indicator.style.color = '#f59e0b'
+  } else {
+    indicator.textContent = '✗ Disconnected'
+    indicator.style.color = '#ef4444'
+  }
+}
+
+function setConnectionState(state) {
+  if (connectionState === state) return
+  connectionState = state
+  updateConnectionIndicator()
+}
+
+// Fetch initial status with error handling
+let initialLoadSucceeded = false
+fetch('/api/status').then(r => { if (!r.ok) throw new Error('status ' + r.status); return r.json() }).then(data => {
+  applyStatusData(data); checkEmptyState(); initialLoadSucceeded = true; setConnectionState('connected'); consecutivePollFailures = 0
+}).catch(err => {
+  console.error('Initial status load failed:', err)
+  setConnectionState('disconnected')
+  const emptyEl = document.getElementById('empty-state')
+  if (emptyEl) emptyEl.innerHTML = '<h2>Unable to connect</h2><p style="color:#aaa;">The orchestrator server is not responding. Please check that it is running and refresh the page.</p><button onclick="location.reload()">Retry</button>'
+})
+fetch('/api/projects').then(r => { if (!r.ok) throw new Error('projects ' + r.status); return r.json() }).then(data => { applyProjectData(data); if (!initialLoadSucceeded) { initialLoadSucceeded = true; setConnectionState('connected'); consecutivePollFailures = 0 } }).catch(err => {
+  console.error('Initial projects load failed:', err)
+  if (!initialLoadSucceeded) setConnectionState('disconnected')
+})
 
 // Poll backend every 10s to keep status in sync
 setInterval(() => {
-  fetch('/api/status').then(r => { if (!r.ok) throw new Error('status ' + r.status); return r.json() }).then(applyStatusData).catch(() => {})
+  fetch('/api/status').then(r => { if (!r.ok) throw new Error('status ' + r.status); return r.json() }).then(data => { applyStatusData(data); setConnectionState('connected'); consecutivePollFailures = 0 }).catch(err => {
+    consecutivePollFailures++
+    if (consecutivePollFailures >= 3) setConnectionState('disconnected')
+    else setConnectionState('degraded')
+  })
   fetch('/api/projects').then(r => { if (!r.ok) throw new Error('projects ' + r.status); return r.json() }).then(applyProjectData).catch(() => {})
 }, 10000)
 
@@ -1352,8 +1392,10 @@ function exportLogs() {
 async function saveDirective(agentName) {
   const agent = projectRows[agentName]
   if (!agent || !agent.projectId) { alert('Project not found for ' + agentName); return }
+  const btn = agent.directiveText?.closest('.directive-section')?.querySelector('.directive-save')
   const text = agent.directiveText.value.trim()
   if (!text) { alert('Directive cannot be empty'); return }
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving...' }
   try {
     const res = await apiFetch('/api/projects/' + agent.projectId + '/directive', {
       method: 'PUT',
@@ -1369,6 +1411,8 @@ async function saveDirective(agentName) {
     }
   } catch (err) {
     alert('Error saving directive: ' + err)
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Save Directive & Restart Supervisor' }
   }
 }
 
@@ -1377,10 +1421,11 @@ async function saveModel(agentName) {
   if (!agent || !agent.projectId) { alert('Project not found for ' + agentName); return }
   const model = agent.modelSelect.value
   if (!model) {
-    // "(global default)" selected — clear override, just restart supervisor with existing config
     addLogEntry(agent.supervisorLog, 'status', 'Model already set to global default — no change needed.')
     return
   }
+  const btn = agent.modelSelect?.closest('div')?.querySelector('.directive-save')
+  if (btn) { btn.disabled = true; btn.textContent = 'Changing...' }
   try {
     const res = await apiFetch('/api/projects/' + agent.projectId + '/model', {
       method: 'PUT',
@@ -1395,6 +1440,8 @@ async function saveModel(agentName) {
     }
   } catch (err) {
     alert('Error changing model: ' + err)
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Change Model' }
   }
 }
 
@@ -1402,8 +1449,10 @@ async function sendComment(agentName) {
   const agent = projectRows[agentName]
   if (!agent || !agent.projectId) { alert('Project not found'); return }
   const input = document.getElementById('dcmt-' + agentName)
+  const btn = input?.nextElementSibling
   const comment = input.value.trim()
   if (!comment) { alert('Please enter a comment.'); return }
+  if (btn) { btn.disabled = true; btn.textContent = 'Sending...' }
   try {
     const res = await apiFetch('/api/projects/' + agent.projectId + '/directive-comment', {
       method: 'POST',
@@ -1421,6 +1470,8 @@ async function sendComment(agentName) {
     }
   } catch (err) {
     alert('Error: ' + err)
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Send Comment' }
   }
 }
 
@@ -1701,11 +1752,17 @@ async function togglePause(agentName) {
 }
 
 async function pauseAll() {
-  await apiFetch('/api/pause-all', { method: 'POST' })
+  try {
+    const res = await apiFetch('/api/pause-all', { method: 'POST' })
+    if (!res.ok) { const err = await res.json().catch(() => ({})); showNotification('Pause all failed: ' + (err.error || res.status), 'error') }
+  } catch (err) { showNotification('Pause all error: ' + err, 'error') }
 }
 
 async function resumeAll() {
-  await apiFetch('/api/resume-all', { method: 'POST' })
+  try {
+    const res = await apiFetch('/api/resume-all', { method: 'POST' })
+    if (!res.ok) { const err = await res.json().catch(() => ({})); showNotification('Resume all failed: ' + (err.error || res.status), 'error') }
+  } catch (err) { showNotification('Resume all error: ' + err, 'error') }
 }
 
 // Update pause button text based on status
@@ -2239,12 +2296,16 @@ document.querySelectorAll('.brain-section, .project-row').forEach(el => {
   ariaObserver.observe(el, { attributes: true, attributeFilter: ['class'] })
 })
 
-// Long-polling event loop
+// Long-polling event loop with connection state tracking
+let pollConsecutiveFailures = 0
 async function pollEvents() {
   while (true) {
     try {
       const res = await fetch('/api/events?since=' + cursor)
       if (!res.ok) {
+        pollConsecutiveFailures++
+        if (pollConsecutiveFailures >= 3) setConnectionState('disconnected')
+        else setConnectionState('degraded')
         await new Promise(r => setTimeout(r, 2000))
         continue
       }
@@ -2253,7 +2314,15 @@ async function pollEvents() {
       for (const event of data.events) {
         handleEvent(event)
       }
+      // Successful poll — but don't override SSE's disconnected state
+      if (connectionState !== 'disconnected' || pollConsecutiveFailures === 0) {
+        setConnectionState('connected')
+      }
+      pollConsecutiveFailures = 0
     } catch (err) {
+      pollConsecutiveFailures++
+      if (pollConsecutiveFailures >= 3) setConnectionState('disconnected')
+      else setConnectionState('degraded')
       console.log('Poll error, retrying...', err)
       await new Promise(r => setTimeout(r, 2000))
     }
@@ -2564,6 +2633,9 @@ async function refreshTeam() {
 // ---- Live Event Stream (SSE) ----
 let sseSource = null
 let sseConnected = false
+let sseReconnectDelay = 1000 // Start with 1s, exponential backoff up to 60s
+const SSE_MAX_DELAY = 60000
+const SSE_BASE_DELAY = 1000
 
 function toggleSSE() {
   if (sseConnected) disconnectSSE()
@@ -2576,6 +2648,8 @@ function connectSSE() {
   sseSource = new EventSource(url)
   sseSource.onopen = function() {
     sseConnected = true
+    sseReconnectDelay = SSE_BASE_DELAY // Reset backoff on successful connection
+    setConnectionState('connected')
     document.getElementById('sse-status').textContent = 'connected'
     document.getElementById('sse-status').style.color = '#22c55e'
     document.getElementById('sse-toggle-btn').textContent = 'Disconnect'
@@ -2584,7 +2658,6 @@ function connectSSE() {
     try {
       const evt = JSON.parse(e.data)
       appendEventToLog(evt)
-      // Live directive update from bus event
       if (evt.type === 'directive-updated' && evt.agentName) {
         const agent = projectRows[evt.agentName]
         if (agent && evt.data?.directive) {
@@ -2594,12 +2667,16 @@ function connectSSE() {
           }
         }
       }
-    } catch {}
+    } catch {} // Intentionally silent: best-effort SSE event parsing
   }
   sseSource.onerror = function() {
     disconnectSSE()
-    // Auto-reconnect after 5s
-    setTimeout(function() { if (!sseConnected) connectSSE() }, 5000)
+    // Exponential backoff with jitter
+    const delay = Math.min(sseReconnectDelay, SSE_MAX_DELAY) + Math.random() * 1000
+    sseReconnectDelay = sseReconnectDelay * 2
+    document.getElementById('sse-status').textContent = 'reconnecting...'
+    document.getElementById('sse-status').style.color = '#f59e0b'
+    setTimeout(function() { if (!sseConnected) connectSSE() }, delay)
   }
 }
 
@@ -2717,6 +2794,15 @@ setInterval(() => {
 // ---- Per-project branch & validation UI helpers ----
 async function mergeBranch(projectId) {
   if (!confirm('Merge agent branch into main?')) return
+  // Find the merge button for this project
+  const mergeBtns = document.querySelectorAll('.project-row-remove')
+  let mergeBtn = null
+  for (const btn of mergeBtns) {
+    if (btn.onclick?.toString().includes(projectId) && btn.textContent.trim() === 'Merge') {
+      mergeBtn = btn; break
+    }
+  }
+  if (mergeBtn) { mergeBtn.disabled = true; mergeBtn.textContent = 'Merging...' }
   try {
     const res = await apiFetch('/api/projects/' + projectId + '/merge', {
       method: 'POST',
@@ -2725,11 +2811,12 @@ async function mergeBranch(projectId) {
     })
     const result = await res.json()
     if (result.success) {
-      alert('Merge successful!')
+      showNotification('Merge successful', 'success')
     } else {
-      alert('Merge failed: ' + result.output)
+      showNotification('Merge failed: ' + (result.output || 'Unknown error'), 'error')
     }
-  } catch (err) { alert('Error: ' + err) }
+  } catch (err) { showNotification('Merge error: ' + err, 'error') }
+  finally { if (mergeBtn) { mergeBtn.disabled = false; mergeBtn.textContent = 'Merge' } }
 }
 
 async function setValidation(projectId) {
@@ -2740,11 +2827,16 @@ async function setValidation(projectId) {
     ? { preset: choice.trim().toLowerCase(), failAction: 'inject' }
     : { command: choice, failAction: 'inject' }
   try {
-    await apiFetch('/api/projects/' + projectId + '/validation', {
+    const res = await apiFetch('/api/projects/' + projectId + '/validation', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     })
-    alert('Validation set: ' + (body.preset || body.command))
-  } catch (err) { alert('Error: ' + err) }
+    if (res.ok) {
+      showNotification('Validation set: ' + (body.preset || body.command), 'success')
+    } else {
+      const err = await res.json().catch(() => ({}))
+      showNotification('Failed to set validation: ' + (err.error || res.status), 'error')
+    }
+  } catch (err) { showNotification('Error: ' + err, 'error') }
 }

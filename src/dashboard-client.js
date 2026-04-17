@@ -230,13 +230,11 @@ function ensureAgent(name) {
     supervisorStatus: 'idle',
   }
 
-  // Track when user starts editing the directive textarea
+  // Track when user is actively editing the directive textarea
+  // Only clear _userEdited on successful save, not on blur
   if (data.directiveText) {
     data.directiveText.addEventListener('input', function() { this._userEdited = true })
-    data.directiveText.addEventListener('blur', function() {
-      // Clear edit flag after a short delay so polling can update if user moved away
-      setTimeout(() => { this._userEdited = false }, 5000)
-    })
+    data.directiveText.addEventListener('focus', function() { this._userEdited = true })
   }
 
   projectRows[name] = data
@@ -484,6 +482,7 @@ function statusToDot(status) {
     case 'error': return 'dot-error'
     case 'completed': return 'dot-done'
     case 'paused': return 'dot-paused'
+    case 'stuck': return 'dot-stuck'
     default: return 'dot-idle'
   }
 }
@@ -507,8 +506,8 @@ function updateStatusBar() {
     const combined = effectiveStatus(a)
     const dotClass = statusToDot(combined)
     const label = statusToLabel(combined)
-    const labelColor = dotClass === 'dot-busy' ? '#facc15' : dotClass === 'dot-disconnected' || dotClass === 'dot-error' ? '#ef4444' : dotClass === 'dot-done' ? '#60a5fa' : dotClass === 'dot-paused' ? '#f59e0b' : '#4ade80'
-    return '<span><span class="status-dot ' + dotClass + '" aria-hidden="true"></span>' + name + '<span class="status-dot-label" style="color:' + labelColor + ';margin-left:4px;">' + label + '</span></span>'
+    const labelColor = dotClass === 'dot-busy' ? '#facc15' : dotClass === 'dot-disconnected' || dotClass === 'dot-error' ? '#ef4444' : dotClass === 'dot-done' ? '#60a5fa' : dotClass === 'dot-paused' ? '#f59e0b' : dotClass === 'dot-stuck' ? '#fb923c' : '#4ade80'
+    return '<a href="javascript:void(0)" onclick="document.getElementById(\'row-' + name + '\')?.scrollIntoView({behavior:\'smooth\',block:\'center\'})" style="text-decoration:none;color:inherit;cursor:pointer"><span class="status-dot ' + dotClass + '" aria-hidden="true"></span>' + name + '<span class="status-dot-label" style="color:' + labelColor + ';margin-left:4px;">' + label + '</span></a>'
   })
   statusBar.innerHTML = items.join('')
 }
@@ -1311,6 +1310,7 @@ function setConnectionState(state) {
 
 // Fetch initial status with error handling
 let initialLoadSucceeded = false
+const emptyStateOriginalHTML = document.getElementById('empty-state')?.innerHTML || ''
 fetch('/api/status').then(r => { if (!r.ok) throw new Error('status ' + r.status); return r.json() }).then(data => {
   applyStatusData(data); checkEmptyState(); initialLoadSucceeded = true; setConnectionState('connected'); consecutivePollFailures = 0
 }).catch(err => {
@@ -1324,9 +1324,16 @@ fetch('/api/projects').then(r => { if (!r.ok) throw new Error('projects ' + r.st
   if (!initialLoadSucceeded) setConnectionState('disconnected')
 })
 
+function restoreEmptyState() {
+  const emptyEl = document.getElementById('empty-state')
+  if (emptyEl && Object.keys(projectRows).length === 0) {
+    emptyEl.innerHTML = emptyStateOriginalHTML
+  }
+}
+
 // Poll backend every 10s to keep status in sync
 setInterval(() => {
-  fetch('/api/status').then(r => { if (!r.ok) throw new Error('status ' + r.status); return r.json() }).then(data => { applyStatusData(data); setConnectionState('connected'); consecutivePollFailures = 0 }).catch(err => {
+  fetch('/api/status').then(r => { if (!r.ok) throw new Error('status ' + r.status); return r.json() }).then(data => { applyStatusData(data); setConnectionState('connected'); consecutivePollFailures = 0; if (!initialLoadSucceeded) { initialLoadSucceeded = true; restoreEmptyState() } }).catch(err => {
     consecutivePollFailures++
     if (consecutivePollFailures >= 3) setConnectionState('disconnected')
     else setConnectionState('degraded')
@@ -1389,40 +1396,109 @@ if (localStorage.getItem('orch-theme') === 'light') {
 }
 
 // Search/filter — global across all panels, projects, events, and logs
+let filterDebounceTimer = null
 function filterLogs(query) {
+  clearTimeout(filterDebounceTimer)
+  filterDebounceTimer = setTimeout(() => _filterLogs(query), 120)
+}
+
+function _filterLogs(query) {
   const q = query.toLowerCase()
 
-  // Filter log entries in worker/supervisor panels
-  document.querySelectorAll('.log-entry, .perm-request, .collapsible, .cycle-summary, .supervisor-entry, .sv-llm-round').forEach(el => {
-    el.style.display = !q || el.textContent.toLowerCase().includes(q) ? '' : 'none'
-  })
+  // Filter log entries in worker/supervisor panels using backing arrays
+  for (const [name, agent] of Object.entries(projectRows)) {
+    const rowEl = document.getElementById('row-' + name)
+    if (!rowEl) continue
 
-  // Filter brain log
-  brainLog.querySelectorAll('div').forEach(el => {
-    el.style.display = !q || el.textContent.toLowerCase().includes(q) ? '' : 'none'
-  })
+    const nameMatch = !q || name.toLowerCase().includes(q)
+    const dirMatch = !q || (agent.dirLabel && agent.dirLabel.textContent.toLowerCase().includes(q))
 
-  // Filter project rows by name/directory
-  document.querySelectorAll('.project-row').forEach(row => {
-    if (!q) { row.style.display = ''; return }
-    const name = row.querySelector('.project-row-name')?.textContent?.toLowerCase() || ''
-    const dir = row.querySelector('.project-row-dir')?.textContent?.toLowerCase() || ''
-    const hasMatchInLogs = row.querySelector('.log-entry:not([style*="display: none"]), .supervisor-entry:not([style*="display: none"]), .collapsible:not([style*="display: none"])')
-    row.style.display = name.includes(q) || dir.includes(q) || hasMatchInLogs ? '' : 'none'
-  })
+    // Search backing arrays for match
+    let logMatch = false
+    if (q) {
+      for (const logEl of [agent.workerLog, agent.supervisorLog]) {
+        const store = logStores.get(logEl)
+        if (!store) continue
+        for (const entry of store.entries) {
+          if (entryToText(entry).toLowerCase().includes(q)) { logMatch = true; break }
+        }
+        if (logMatch) break
+      }
+    }
 
-  // Filter live event stream entries
+    // Show/hide project row
+    rowEl.style.display = !q || nameMatch || dirMatch || logMatch ? '' : 'none'
+
+    // Show/hide individual DOM entries based on backing store match
+    for (const logEl of [agent.workerLog, agent.supervisorLog]) {
+      const store = logStores.get(logEl)
+      if (!store) continue
+      // Only filter rendered entries (in the DOM)
+      for (let i = 0; i < logEl.children.length; i++) {
+        const child = logEl.children[i]
+        if (!q) { child.style.display = ''; continue }
+        // Find the corresponding entry in the backing store
+        const renderedIndex = store.renderedStart + i
+        const entry = store.entries[renderedIndex]
+        if (entry) {
+          child.style.display = entryToText(entry).toLowerCase().includes(q) ? '' : 'none'
+        } else {
+          child.style.display = child.textContent.toLowerCase().includes(q) ? '' : 'none'
+        }
+      }
+    }
+  }
+
+  // Filter brain log using backing array
+  if (q) {
+    const bStore = logStores.get(brainLog)
+    let brainMatch = false
+    if (bStore) {
+      for (const entry of bStore.entries) {
+        if (entryToText(entry).toLowerCase().includes(q)) { brainMatch = true; break }
+      }
+    }
+    // Filter rendered entries
+    for (let i = 0; i < brainLog.children.length; i++) {
+      const child = brainLog.children[i]
+      if (bStore) {
+        const renderedIndex = bStore.renderedStart + i
+        const entry = bStore.entries[renderedIndex]
+        child.style.display = (entry && entryToText(entry).toLowerCase().includes(q)) ? '' : 'none'
+      } else {
+        child.style.display = child.textContent.toLowerCase().includes(q) ? '' : 'none'
+      }
+    }
+  } else {
+    brainLog.querySelectorAll('div').forEach(el => { el.style.display = '' })
+  }
+
+  // Filter live event stream entries (no backing store, DOM-only)
   document.querySelectorAll('#live-event-log > div').forEach(el => {
     el.style.display = !q || el.textContent.toLowerCase().includes(q) ? '' : 'none'
   })
 
-  // Filter bus events
+  // Filter bus events (no backing store, DOM-only)
   document.querySelectorAll('#bus-events > div').forEach(el => {
     el.style.display = !q || el.textContent.toLowerCase().includes(q) ? '' : 'none'
   })
 }
 
-// Export logs
+// Export logs — iterates backing arrays for complete history
+function entryToText(entry) {
+  switch (entry.type) {
+    case ENTRY_LOG: return entry.timestamp + ' ' + entry.html.replace(/<[^>]*>/g, '')
+    case ENTRY_EXPANDABLE: return entry.timestamp + ' ' + entry.text
+    case ENTRY_COLLAPSIBLE: return entry.timestamp + ' ' + entry.header + ': ' + entry.body
+    case ENTRY_CYCLE_SUMMARY: return entry.timestamp + ' Cycle ' + entry.cycle + ' Summary: ' + entry.summary
+    case ENTRY_SV_CYCLE_HEADER: return entry.timestamp + ' Cycle ' + entry.cycle
+    case ENTRY_SV_LLM: return entry.timestamp + ' ' + entry.header + entry.preview + ': ' + (entry.body || '')
+    case ENTRY_SV_ENTRY: return entry.timestamp
+    case ENTRY_RAW: return entry.html ? entry.html.replace(/<[^>]*>/g, '') : ''
+    default: return ''
+  }
+}
+
 function exportLogs() {
   const lines = []
   lines.push('=== OpenCode Orchestrator Log Export ===')
@@ -1430,20 +1506,29 @@ function exportLogs() {
   lines.push('')
   for (const [name, a] of Object.entries(projectRows)) {
     lines.push('--- ' + name + ' (Worker) ---')
-    a.workerLog.querySelectorAll('.log-entry, .collapsible, .cycle-summary').forEach(el => {
-      lines.push(el.textContent)
-    })
+    const wStore = logStores.get(a.workerLog)
+    if (wStore) {
+      for (const entry of wStore.entries) {
+        lines.push(entryToText(entry))
+      }
+    }
     lines.push('')
     lines.push('--- ' + name + ' (Supervisor) ---')
-    a.supervisorLog.querySelectorAll('.supervisor-entry, .sv-llm-round, .log-entry, .cycle-summary').forEach(el => {
-      lines.push(el.textContent)
-    })
+    const sStore = logStores.get(a.supervisorLog)
+    if (sStore) {
+      for (const entry of sStore.entries) {
+        lines.push(entryToText(entry))
+      }
+    }
     lines.push('')
   }
   lines.push('--- Brain ---')
-  brainLog.querySelectorAll('div').forEach(el => {
-    lines.push(el.textContent)
-  })
+  const bStore = logStores.get(brainLog)
+  if (bStore) {
+    for (const entry of bStore.entries) {
+      lines.push(entryToText(entry))
+    }
+  }
   const blob = new Blob([lines.join('\n')], { type: 'text/plain' })
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)
@@ -2046,6 +2131,9 @@ async function sendPrompt(agentName) {
   btn.disabled = true
   btn.textContent = '...'
 
+  // Local echo so the user sees their prompt immediately
+  addLogEntry(agent.workerLog, 'prompt', '<span style="color:#8b8bff;">You:</span> ' + escapeHtml(text))
+
   try {
     const res = await apiFetch('/api/prompt/' + agentName, {
       method: 'POST',
@@ -2054,12 +2142,12 @@ async function sendPrompt(agentName) {
     })
     if (!res.ok) {
       const err = await res.json()
-      alert('Failed to send prompt: ' + (err.error || res.status))
+      addLogEntry(agent.workerLog, 'error', '<span style="color:#ef4444;">Prompt failed:</span> ' + escapeHtml(err.error || res.status))
     } else {
       input.value = ''
     }
   } catch (err) {
-    alert('Network error: ' + err)
+    addLogEntry(agent.workerLog, 'error', '<span style="color:#ef4444;">Network error:</span> ' + escapeHtml(String(err)))
   }
 
   input.disabled = false
@@ -2282,6 +2370,7 @@ cmdInput.addEventListener('keydown', async (e) => {
     const cmd = cmdInput.value.trim()
     if (!cmd) return
     cmdHistory.push(cmd)
+    if (cmdHistory.length > 100) cmdHistory.shift()
     cmdHistoryIdx = -1
     cmdInput.value = ''
     cmdInput.disabled = true

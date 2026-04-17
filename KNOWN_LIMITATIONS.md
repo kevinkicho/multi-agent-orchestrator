@@ -161,17 +161,17 @@ Changes to behavior that fix these limitations should reference the relevant sec
 
 ### 15a. STUCK Agent Status Maps to Idle (Green) Dot
 
-**What:** The `statusToDot()` function in `dashboard-client.js` has no case for `'stuck'`, causing it to fall through to `default: return 'dot-idle'`. A stuck agent appears as a green dot in the status bar — the most misleading possible representation. The agent badge correctly shows "STUCK" in orange, but the status bar dot is green, and `statusToLabel('stuck')` returns `'stuck'` which is correct.
+**Status: Fixed.** Added `case 'stuck': return 'dot-stuck'` to `statusToDot()` and a `.dot-stuck` CSS rule with pulsing orange background (`#fb923c; animation: pulse 0.6s infinite`). Also added `'dot-stuck'` label color mapping in `updateStatusBar()`.
 
-**Why:** The status bar was built for the original set of agent states (idle, busy, completed, error, disconnected, paused). The 'stuck' state was added later by the stuck-detection feature but was never integrated into the status bar dot mapper.
-
-**Fix:** Add `case 'stuck': return 'dot-stuck'` to `statusToDot()` and add a `.dot-stuck` CSS rule with an orange/amber color.
+**What (original issue):** The `statusToDot()` function in `dashboard-client.js` had no case for `'stuck'`, causing it to fall through to `default: return 'dot-idle'`. A stuck agent appeared as a green dot in the status bar — the most misleading possible representation.
 
 ---
 
 ### 15b. Brain Log Has No Virtual Scroll — Unbounded DOM Growth
 
-**What:** The brain log panel (`#brain-log`) appends entries directly to the DOM via `addExpandableEntry(brainLog, ...)` and `addLogEntry(brainLog, ...)`. Unlike worker and supervisor panels (which use the `pushEntry` / virtual scroll system with `MAX_RENDERED=200` and `MAX_BACKING=5000`), the brain log never trims DOM nodes. In a long-running session, the brain section can accumulate thousands of DOM nodes, causing scrolling lag and high memory usage.
+**Status: Not a bug.** Investigation confirmed the brain log already routes through `addExpandableEntry` → `pushEntry` → virtual scroll system. The original audit finding was incorrect.
+
+~~**What:** The brain log panel (`#brain-log`) appends entries directly to the DOM, causing unbounded growth in long sessions.~~
 
 **Why:** The brain log was implemented before the virtual scroll system was added, and was never retrofitted.
 
@@ -179,21 +179,23 @@ Changes to behavior that fix these limitations should reference the relevant sec
 
 ---
 
-### 15c. SSE and Poll Loop Produce Duplicate Events
+### 15c. SSE and Poll Loop Both Run Simultaneously
 
-**What:** Both the SSE `onmessage` handler and the long-polling loop deliver events through `handleEvent()`. The poll loop tracks position via `cursor`, but the SSE handler does not update `cursor`. If both are active (SSE delivers real-time events, then the poll loop delivers the same events from the same cursor position), events appear twice in log panels.
+**What:** Both the SSE `onmessage` handler and the long-polling loop run concurrently. The SSE handler delivers events to the live event stream panel and processes `directive-updated` updates, while the poll loop delivers events to agent log panels via `handleEvent()`. The SSE handler does **not** update `cursor`, so when the poll loop next runs, it re-fetches the same events. However, since the two systems target different UI panels (live event stream vs. agent logs), there is no visible duplication in agent panels.
 
-**Why:** SSE was added as a real-time layer on top of the existing poll loop. The two systems were intended to be alternatives, but they both run simultaneously. There is no deduplication mechanism (event ID, sequence number, or cursor synchronization).
+**Why:** SSE was added for lower-latency real-time updates on top of the existing poll loop, which provides a reliable fallback. Removing either would lose a capability.
 
-**Ruled out:** Removing the poll loop (provides fallback when SSE is unsupported). Removing SSE (provides better latency). Current workaround: users can disconnect SSE via the toggle button, falling back to poll-only mode with no duplication.
+**Remaining concern:** The SSE handler's directive update and the poll loop's `applyProjectData` can race on the `directiveText.value` field. The `_userEdited` flag mitigates this but has a timing window (see §15h).
 
-**Fix:** Either (a) update `cursor` in the SSE `onmessage` handler so the poll loop skips already-delivered events, or (b) add an event deduplication layer using event IDs/timestamps.
+**Possible fix:** Update `cursor` in the SSE `onmessage` handler so the poll loop skips already-delivered events. This would avoid unnecessary re-fetching and processing, though it wouldn't change visible behavior since the two systems target different panels.
 
 ---
 
 ### 15d. Export Captures Only Rendered (Visible) Entries
 
-**What:** The `exportLogs()` function uses `querySelectorAll` to iterate log entries, which only finds DOM nodes currently rendered in the viewport. Because the virtual scroll system only keeps `MAX_RENDERED=200` DOM nodes per panel, older entries that were scrolled off and removed from the DOM are missing from the export. Users get incomplete exports.
+**Status: Fixed.** `exportLogs()` now iterates `logStores` backing arrays via `entryToText()` instead of `querySelectorAll` on DOM nodes. This captures the full `MAX_BACKING=5000` entries per panel instead of only the 200 currently rendered.
+
+**What (original issue):** The `exportLogs()` function used `querySelectorAll` to iterate log entries, which only found DOM nodes currently rendered in the viewport.
 
 **Why:** The export function was written before the virtual scroll system was added, and was never updated to iterate the backing store.
 
@@ -203,7 +205,9 @@ Changes to behavior that fix these limitations should reference the relevant sec
 
 ### 15e. Global Search Filters All DOM on Every Keystroke
 
-**What:** The `filterLogs()` function runs `document.querySelectorAll('.log-entry, .perm-request, ...')` across the entire document on every `input` event. This O(n) scan across potentially thousands of DOM nodes causes visible input lag with many agents or long-running sessions.
+**Status: Fixed.** `filterLogs()` now uses a 120ms debounce on the `oninput` handler. The search function iterates `logStores` backing arrays and correlates results with rendered DOM entries, avoiding the expensive `querySelectorAll` across all log entries on every keystroke.
+
+**What (original issue):** The `filterLogs()` function ran `document.querySelectorAll` across the entire document on every `input` event.
 
 **Why:** The search was designed for small sessions where querySelectorAll is fast. No debounce or indexing was implemented.
 
@@ -213,7 +217,9 @@ Changes to behavior that fix these limitations should reference the relevant sec
 
 ### 15f. Initial Load Failure State Never Clears on Recovery
 
-**What:** If `/api/status` fails on initial page load, the empty-state div is overwritten with the "Unable to connect" message. When the connection recovers (poll loop succeeds), `applyStatusData` is called but `checkEmptyState()` only checks `Object.keys(projectRows).length`. If no agents are active, the error message persists indefinitely even though the server is back.
+**Status: Fixed.** The original empty-state HTML is now saved on page load. When the poll loop successfully recovers after an initial failure, `restoreEmptyState()` resets the error message to the original content.
+
+**What (original issue):** If `/api/status` failed on initial page load, the empty-state div was overwritten with "Unable to connect" text that persisted even after the server came back.
 
 **Why:** The initial load failure was designed as a one-time check, not a persistent state. Recovery was assumed to be a page reload.
 
@@ -223,7 +229,9 @@ Changes to behavior that fix these limitations should reference the relevant sec
 
 ### 15g. Status Bar Agent Names Aren't Clickable
 
-**What:** The status bar at the top of the dashboard shows agent names as `<span>` elements with colored dots. Clicking an agent name does nothing — no scroll or highlight. With 4+ agents, finding a specific agent's row requires manual scrolling.
+**Status: Fixed.** Agent names in the status bar are now `<a>` elements with `onclick` handlers that call `scrollIntoView({behavior:'smooth', block:'center'})` to navigate to the corresponding project row.
+
+**What (original issue):** The status bar showed agent names as `<span>` elements with no interaction.
 
 **Why:** The status bar was originally a read-only indicator, not a navigation tool.
 
@@ -233,7 +241,9 @@ Changes to behavior that fix these limitations should reference the relevant sec
 
 ### 15h. Directive Textarea Race Condition with Polling
 
-**What:** The `_userEdited` flag on the directive textarea is set on `input` events and cleared 5 seconds after `blur`. If the 10-second `/api/projects` poll fires within that 5-second window, it overwrites the user's edit with the server's value. The user's changes are silently lost.
+**Status: Fixed.** The `_userEdited` flag is now set on both `input` and `focus` events and only cleared on successful `saveDirective()`. The previous 5-second `blur` timeout that could silently overwrite user edits has been removed.
+
+**What (original issue):** The `_userEdited` flag on the directive textarea was set on `input` events and cleared 5 seconds after `blur`. If the 10-second `/api/projects` poll fired within that 5-second window, it overwrote the user's edit with the server's value. The user's changes were silently lost.
 
 **Why:** The `_userEdited` mechanism was designed to prevent overwriting while the user is actively typing, but the blur → 5s → clear window is too long for passive focus loss.
 
@@ -243,7 +253,9 @@ Changes to behavior that fix these limitations should reference the relevant sec
 
 ### 15i. No Local Echo for Sent Prompts
 
-**What:** When a user sends a prompt via the chatbox, the text disappears from the input but no entry appears in the log until the server processes it and sends back an `agent-prompt` event. On a slow connection, this feels like the message was lost.
+**Status: Fixed.** `sendPrompt()` now appends a "You: <text>" entry to the worker log immediately after validation, before the API call. On failure, an error entry is appended instead of using `alert()`.
+
+**What (original issue):** When a user sent a prompt via the chatbox, the text disappeared from the input but no entry appeared in the log until the server processed it.
 
 **Why:** The chatbox was designed for fast local interactions where the server echo arrives quickly. No optimistic update was implemented.
 
@@ -253,7 +265,9 @@ Changes to behavior that fix these limitations should reference the relevant sec
 
 ### 15j. `cmdHistory` and `removedAgents` Grow Without Bound
 
-**What:** `cmdHistory` (line 2243) pushes every command and never caps. `removedAgents` (line 112) adds project names on removal and only clears wholesale on project addition. Over very long sessions with many add/remove cycles, these can grow.
+**Status: Partially fixed.** `cmdHistory` is now capped at 100 entries (oldest entries are shifted). `removedAgents` retains its wholesale-clear-on-add behavior since its semantics require remembering removals.
+
+**What (original issue):** `cmdHistory` pushed every command and never capped. `removedAgents` adds project names on removal and only clears wholesale on project addition.
 
 **Why:** Originally designed for short-lived sessions where the set of agents is small. Not a practical issue in normal use, but technically unbounded.
 

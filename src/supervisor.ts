@@ -43,6 +43,7 @@ export type ProjectRole = {
 export type SupervisorLimits = {
   maxRestartsPerCycle?: number
   maxConsecutiveFailedCycles?: number
+  maxConsecutiveLlmFailures?: number
   restartBackoffBaseMs?: number
   maxConversationMessages?: number
   cyclePauseSeconds?: number
@@ -78,8 +79,8 @@ export type AgentSupervisorConfig = {
   softStop?: { requested: boolean }
   /** Callback when supervisor updates the directive */
   onDirectiveUpdate?: (newDirective: string) => void
-  /** Callback when supervisor stops with a failure (for escalation) */
-  onSupervisorStop?: (agentName: string, summary: string, isFailure: boolean) => void
+  /** Callback when supervisor stops with a failure (for escalation). reason indicates why: "llm-unreachable" for LLM circuit breaker trips. */
+  onSupervisorStop?: (agentName: string, summary: string, isFailure: boolean, reason?: string) => void
   /** Callback to get unread user comments on the directive */
   getUnreadComments?: () => string[]
   /** Max cycles before this supervisor exits (for sequential rotation). 0 = unlimited. */
@@ -651,6 +652,7 @@ export async function runAgentSupervisor(
 
   const MAX_RESTARTS_PER_CYCLE = limits.maxRestartsPerCycle ?? 3
   const MAX_CONSECUTIVE_FAILED_CYCLES = limits.maxConsecutiveFailedCycles ?? 3
+  const MAX_CONSECUTIVE_LLM_FAILURES = limits.maxConsecutiveLlmFailures ?? 5
   const RESTART_BACKOFF_BASE = limits.restartBackoffBaseMs ?? 30_000
   let consecutiveLlmFailures = 0 // tracks persistent Ollama failures across cycles
   let consecutive429s = 0 // tracks consecutive rate-limit (429) errors — distinct from other failures
@@ -702,7 +704,7 @@ export async function runAgentSupervisor(
           agentCapabilities = probeResponse.slice(0, 500)
           emit(`Capability probe result: ${agentCapabilities.slice(0, 200)}`)
           // Save as behavioral note for persistence
-          await addBehavioralNote(await loadBrainMemory(), agentName, `Available tools: ${agentCapabilities.slice(0, 300)}`)
+          try { await addBehavioralNote(await loadBrainMemory(), agentName, `Available tools: ${agentCapabilities.slice(0, 300)}`) } catch (err) { console.error(`[supervisor] Failed to save capability note:`, err); config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save capability note to memory: ${err}` }) }
         }
       }
     } catch {
@@ -1004,6 +1006,24 @@ export async function runAgentSupervisor(
         }
       }
 
+      // Circuit breaker: if LLM has been persistently failing, stop the supervisor
+      if (consecutiveLlmFailures >= MAX_CONSECUTIVE_LLM_FAILURES) {
+        emit(`CIRCUIT BREAKER: ${agentName} LLM persistently unreachable (${consecutiveLlmFailures} consecutive failures across cycles) — stopping supervisor`)
+        config.dashboardLog?.push({
+          type: "supervisor-alert",
+          agent: agentName,
+          text: `CIRCUIT BREAKER: LLM provider unreachable after ${consecutiveLlmFailures} attempts. Supervisor stopped. Check your LLM provider or model configuration.`,
+        })
+        logPerformance({
+          timestamp: Date.now(), projectName: directory, agentName, model,
+          event: "supervisor_stop", cycleNumber: cycleCount,
+          details: `circuit-breaker-llm (${consecutiveLlmFailures} consecutive failures)`,
+        })
+        config.onThinking?.(`CIRCUIT BREAKER: LLM provider unreachable after ${consecutiveLlmFailures} attempts. Stopping supervisor.`)
+        config.onSupervisorStop?.(agentName, `LLM provider unreachable (${consecutiveLlmFailures} consecutive failures)`, true, "llm-unreachable")
+        break
+      }
+
       if (llmBreakCycle || !llmResult) {
         if (llmBreakCycle) break
       } else {
@@ -1217,16 +1237,26 @@ Be specific with file paths, line numbers, and code snippets.`
           }
 
           case "note": {
-            memory = await addProjectNote(memory, agentName, cmd.text)
-            results.push(`Saved note: "${cmd.text}"`)
-            emit(`Note saved: ${cmd.text}`)
+            try {
+              memory = await addProjectNote(memory, agentName, cmd.text)
+              results.push(`Saved note: "${cmd.text}"`)
+              emit(`Note saved: ${cmd.text}`)
+            } catch (err) {
+              console.error(`[supervisor] Failed to save project note:`, err)
+              config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save project note to memory: ${err}` })
+            }
             break
           }
 
           case "note_behavior": {
-            memory = await addBehavioralNote(memory, agentName, cmd.text)
-            results.push(`Saved behavioral note: "${cmd.text}" — this will be injected into future system prompts.`)
-            emit(`Behavioral note saved: ${cmd.text}`)
+            try {
+              memory = await addBehavioralNote(memory, agentName, cmd.text)
+              results.push(`Saved behavioral note: "${cmd.text}" — this will be injected into future system prompts.`)
+              emit(`Behavioral note saved: ${cmd.text}`)
+            } catch (err) {
+              console.error(`[supervisor] Failed to save behavioral note:`, err)
+              config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save behavioral note to memory: ${err}` })
+            }
             break
           }
 
@@ -1560,7 +1590,7 @@ Be specific with file paths, line numbers, and code snippets.`
             console.error(`[${agentName}] Failed to force-reset agent status after stale detection: ${err}`)
           }
           cycleRestartCount++
-          await addBehavioralNote(memory, agentName, `Agent went stale (silent ${waitResult.silentSeconds}s while busy). May need simpler prompts or the opencode process may be unstable.`)
+          try { await addBehavioralNote(memory, agentName, `Agent went stale (silent ${waitResult.silentSeconds}s while busy). May need simpler prompts or the opencode process may be unstable.`) } catch (err) { console.error(`[supervisor] Failed to save behavioral note:`, err); config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save behavioral note (stale agent): ${err}` }) }
           continue // Skip response collection — retry with next round
         }
 
@@ -1614,7 +1644,7 @@ Be specific with file paths, line numbers, and code snippets.`
                 results.push(`Agent hit restart cap (${MAX_RESTARTS_PER_CYCLE} restarts this cycle). Ending cycle — will retry next cycle with longer pause.`)
                 // Only save behavioral note once per cap-hit (not every empty response)
                 if (!restartCapHit) {
-                  await addBehavioralNote(memory, agentName, `Agent hit restart cap (${MAX_RESTARTS_PER_CYCLE} restarts in cycle ${cycleCount}). Agent needs much simpler prompts — one action per prompt, no multi-step tasks.`)
+                  try { await addBehavioralNote(memory, agentName, `Agent hit restart cap (${MAX_RESTARTS_PER_CYCLE} restarts in cycle ${cycleCount}). Agent needs much simpler prompts — one action per prompt, no multi-step tasks.`) } catch (err) { console.error(`[supervisor] Failed to save behavioral note:`, err); config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save behavioral note (restart cap): ${err}` }) }
                 }
                 restartCapHit = true
                 break
@@ -1655,7 +1685,7 @@ Be specific with file paths, line numbers, and code snippets.`
                   })
                   // Only save behavioral note on first restart, not every one
                   if (cycleRestartCount === 1) {
-                    await addBehavioralNote(memory, agentName, `Agent non-responsive (${emptyCount} empty responses in cycle ${cycleCount}). Restarted session. Use short, single-action prompts. Avoid multi-step instructions.`)
+                    try { await addBehavioralNote(memory, agentName, `Agent non-responsive (${emptyCount} empty responses in cycle ${cycleCount}). Restarted session. Use short, single-action prompts. Avoid multi-step instructions.`) } catch (err) { console.error(`[supervisor] Failed to save behavioral note:`, err); config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save behavioral note (non-responsive agent): ${err}` }) }
                   }
                 } catch (err) {
                   results.push(`Agent non-responsive and restart failed: ${err}`)
@@ -1772,7 +1802,7 @@ Be specific with file paths, line numbers, and code snippets.`
           details: "circuit-breaker",
         })
         loggedStop = true
-        await addBehavioralNote(memory, agentName, `CRITICAL: Agent was persistently non-responsive across ${consecutiveFailedCycles} cycles. Circuit breaker triggered. This agent needs fundamentally different prompts — keep to one simple action, or consider restructuring the directive.`)
+        try { await addBehavioralNote(memory, agentName, `CRITICAL: Agent was persistently non-responsive across ${consecutiveFailedCycles} cycles. Circuit breaker triggered. This agent needs fundamentally different prompts — keep to one simple action, or consider restructuring the directive.`) } catch (err) { console.error(`[supervisor] Failed to save behavioral note:`, err); config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save behavioral note (circuit breaker): ${err}` }) }
         // Stop this supervisor — the project manager can restart it or the user can intervene
         config.onSupervisorStop?.(agentName, `Circuit breaker triggered after ${consecutiveFailedCycles} consecutive failed cycles — agent is persistently non-responsive`, true)
         break

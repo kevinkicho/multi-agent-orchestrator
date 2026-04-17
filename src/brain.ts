@@ -542,13 +542,18 @@ export async function runBrain(
           for (const [name] of orchestrator.agents) {
             agentLearnings[name] = memory.projectNotes[name]?.slice(-3) ?? []
           }
-          memory = await addMemoryEntry(memory, {
-            timestamp: Date.now(),
-            objective: config.objective,
-            summary: cmd.summary,
-            agentLearnings,
-          })
-          config.onThinking?.(`Brain: saved session summary — "${cmd.summary}"`)
+          try {
+            memory = await addMemoryEntry(memory, {
+              timestamp: Date.now(),
+              objective: config.objective,
+              summary: cmd.summary,
+              agentLearnings,
+            })
+            config.onThinking?.(`Brain: saved session summary — "${cmd.summary}"`)
+          } catch (err) {
+            console.error(`[brain] Failed to save memory entry:`, err)
+            config.dashboardLog?.push({ type: "brain-thinking", text: `WARNING: Failed to save memory entry: ${err}. Session summary lost — next cycle will start without this record.` })
+          }
           break
         }
       }

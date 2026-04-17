@@ -397,3 +397,44 @@ The `EventBus` class (`event-bus.ts:38-76`) uses a `buffer` array capped at 200 
 3. **Server-side: Performance archive files** — One file per day, auto-cleaned after 30 days. Archive files older than `MAX_ARCHIVE_AGE_DAYS` are deleted during `savePerformanceLog()`. Disk usage stays bounded at ~3MB for 30 days of archives.
 
 4. **Network: Poll loop HTTP requests** — 2 requests every 10 seconds (status + projects) plus 1 long-poll connection. This does NOT scale with agent count and is negligible for any reasonable deployment.
+
+## 21. Auto-Restart Exponential Backoff (Never Gives Up)
+
+### 21a. Behavior
+
+When a supervisor stops due to failure, `ProjectManager` auto-restarts it with escalating delays rather than giving up. The first 3 failures use a fixed schedule (10s, 30s, 60s); after that, delays follow exponential backoff (30s × 2^(n-3)) capped at 10 minutes. The count resets on any of:
+
+- Successful cycle completion (`onCycleComplete`)
+- Clean supervisor stop (`isFailure=false`)
+- Manual restart via `restartSupervisor()`
+- Project removal or shutdown
+
+### 21b. Tradeoff: Perpetual Retry on Permanent Failure
+
+A supervisor that will never succeed (e.g., broken directive, missing dependency) will be restarted every 10 minutes indefinitely. Each restart costs an LLM call (capability probe + first cycle) and occupies a process slot. There is no human-in-the-loop escalation after N attempts — the system assumes the problem may be transient and will eventually resolve.
+
+**Mitigation:** The dashboard logs the attempt number and delay on each restart (`"attempt 4, next restart in 60s"`). Operators monitoring the dashboard can manually pause or remove the project. A future improvement could add a configurable maximum attempt count that escalates to a notification channel.
+
+## 22. LLM Circuit Breaker with Cross-Restart Escalation
+
+### 22a. Behavior
+
+The supervisor tracks `consecutiveLlmFailures` across LLM calls within a single run. After 5 consecutive failures (configurable via `SupervisorLimits.maxConsecutiveLlmFailures`), the circuit breaker trips and the supervisor stops, calling `onSupervisorStop` with `reason="llm-unreachable"`.
+
+`ProjectManager` tracks `llmCircuitBreakerCounts` per project across restarts. Each breaker trip enforces a minimum cooldown: `5min × 2^(n-1)` for the nth consecutive trip (trip 1 = 5min, trip 2 = 10min, capped at 10min). This cooldown is applied on top of the normal auto-restart backoff via `max(normal_backoff, breaker_backoff)`.
+
+The breaker count resets when the supervisor completes a full cycle successfully (`onCycleComplete`), on clean stop, manual restart, project removal, or shutdown.
+
+### 22b. Tradeoff: Intermittent Recovery Hides Sustained Failure
+
+`consecutiveLlmFailures` resets to 0 on any single successful LLM call. If the LLM provider is flaky (e.g., succeeds 1 in 5 calls at random intervals), the counter keeps resetting and the breaker may never trip despite the provider being effectively unusable. The system tolerates intermittent instability rather than declaring the provider down.
+
+## 23. Dashboard Surfacing of Write Failures
+
+### 23. No Persistent Record of Write Failures
+
+Memory and conversation checkpoint write failures are surfaced to the `dashboardLog` as `supervisor-alert` (supervisor) or `brain-thinking` (brain) entries. These are in-memory only — if the server restarts, the alerts are lost. There is no persistent error log for write failures.
+
+The `console.error` calls that accompany each dashboard push provide server-side console output, but these are ephemeral unless the operator has configured process stdout capture (e.g., systemd journal, PM2 logs). A write failure means the supervisor continues operating with stale memory — it may make decisions based on outdated information without realizing it.
+
+**Mitigation:** Operators should monitor the dashboard for `WARNING:` prefixed messages. A future improvement could write failure records to a persistent error log file or integrate with structured logging.

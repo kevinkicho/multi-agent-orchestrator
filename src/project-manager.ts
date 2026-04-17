@@ -194,6 +194,14 @@ export class ProjectManager {
   private softStops = new Map<string, { requested: boolean }>()
   /** Pending auto-restart timers — tracked so they can be cancelled on remove/restart */
   private autoRestartTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  /** Track auto-restart counts per project — resets on successful cycle completion */
+  private autoRestartCounts = new Map<string, number>()
+  private static AUTO_RESTART_DELAYS = [10_000, 30_000, 60_000] // escalating: 10s, 30s, 60s for first 3 attempts
+  private static BACKOFF_BASE_MS = 30_000 // base delay for exponential backoff after initial attempts
+  private static BACKOFF_CAP_MS = 600_000 // cap at 10 minutes
+  /** Track consecutive LLM circuit breaker trips per project — resets on successful cycle completion */
+  private llmCircuitBreakerCounts = new Map<string, number>()
+  private static LLM_CIRCUIT_BREAKER_COOLDOWN_MS = 300_000 // 5-minute cooldown after LLM circuit breaker
   private pauseStates = new Map<string, PauseState>()
   /** Cycle limit callbacks — auto-pause after N cycles (used by A/B test) */
   private cycleLimitCallbacks = new Map<string, { maxCycles: number; count: number }>()
@@ -446,6 +454,9 @@ export class ProjectManager {
             return this.getUnreadComments(project.agentName)
           },
           onCycleComplete: (cycleNumber) => {
+            // Successful cycle — reset auto-restart count and LLM breaker count (failure was transient)
+            this.autoRestartCounts.delete(projectId)
+            this.llmCircuitBreakerCounts.delete(projectId)
             const limit = this.cycleLimitCallbacks.get(projectId)
             if (limit) {
               limit.count = cycleNumber
@@ -455,25 +466,57 @@ export class ProjectManager {
               }
             }
           },
-          onSupervisorStop: (agentName, summary, isFailure) => {
+          onSupervisorStop: (agentName, summary, isFailure, reason) => {
             if (isFailure) {
-              console.error(`${C.brightRed}${C.bold}[${agentName}] SUPERVISOR STOPPED (failure):${C.reset} ${C.red}${summary}${C.reset}`)
+              const prevCount = this.autoRestartCounts.get(projectId) ?? 0
+              const nextCount = prevCount + 1
+              this.autoRestartCounts.set(projectId, nextCount)
+
+              // Track LLM circuit breaker trips — each trip adds escalation
+              const isLlmBreaker = reason === "llm-unreachable"
+              const prevBreakerCount = this.llmCircuitBreakerCounts.get(projectId) ?? 0
+              const currentBreakerCount = isLlmBreaker ? prevBreakerCount + 1 : prevBreakerCount
+              if (isLlmBreaker) this.llmCircuitBreakerCounts.set(projectId, currentBreakerCount)
+
+              // Escalating delay: first 3 use fixed schedule, then exponential backoff
+              let delay = nextCount <= ProjectManager.AUTO_RESTART_DELAYS.length
+                ? ProjectManager.AUTO_RESTART_DELAYS[nextCount - 1]!
+                : Math.min(
+                    ProjectManager.BACKOFF_BASE_MS * Math.pow(2, nextCount - ProjectManager.AUTO_RESTART_DELAYS.length),
+                    ProjectManager.BACKOFF_CAP_MS,
+                  )
+
+              // LLM circuit breaker: enforce minimum cooldown and add per-trip escalation
+              if (isLlmBreaker) {
+                const breakerBackoff = ProjectManager.LLM_CIRCUIT_BREAKER_COOLDOWN_MS * Math.pow(2, currentBreakerCount - 1)
+                delay = Math.max(delay, breakerBackoff)
+                delay = Math.min(delay, ProjectManager.BACKOFF_CAP_MS)
+              }
+
+              const breakerInfo = isLlmBreaker
+                ? ` [LLM breaker trip #${currentBreakerCount}]`
+                : ""
+              console.error(`${C.brightRed}${C.bold}[${agentName}] SUPERVISOR STOPPED (failure, attempt ${nextCount})${breakerInfo}:${C.reset} ${C.red}${summary}${C.reset}`)
               this.dashLog.push({
                 type: "brain-thinking",
-                text: `ALERT: ${project.name} supervisor stopped due to failure: ${summary}. Consider restarting the project.`,
+                text: `ALERT: ${project.name} supervisor stopped (attempt ${nextCount}, next restart in ${Math.round(delay / 1000)}s)${breakerInfo}: ${summary}`,
               })
-              // Auto-restart supervisor after a delay if the agent process is still alive
-              // Track timer so it can be cancelled if the project is removed or manually restarted
+
+              // Auto-restart with escalating backoff — never fully gives up
               const timer = setTimeout(() => {
                 this.autoRestartTimers.delete(projectId)
                 const p = this.projects.get(projectId)
                 if (p && p.status !== "stopped" && this.processes.has(projectId)) {
-                  console.log(`${C.brightYellow}[${agentName}] Auto-restarting supervisor after failure...${C.reset}`)
-                  this.dashLog.push({ type: "brain-thinking", text: `Auto-restarting ${project.name} supervisor after failure...` })
+                  console.log(`${C.brightYellow}[${agentName}] Auto-restarting supervisor (attempt ${nextCount}) after ${Math.round(delay / 1000)}s backoff...${C.reset}`)
+                  this.dashLog.push({ type: "brain-thinking", text: `Auto-restarting ${project.name} supervisor (attempt ${nextCount})...` })
                   this.restartSupervisor(projectId)
                 }
-              }, 10_000) // 10s delay before auto-restart
+              }, delay)
               this.autoRestartTimers.set(projectId, timer)
+            } else {
+              // Clean stop — reset auto-restart count and breaker count
+              this.autoRestartCounts.delete(projectId)
+              this.llmCircuitBreakerCounts.delete(projectId)
             }
           },
         })
@@ -532,6 +575,8 @@ export class ProjectManager {
     // Cancel any pending auto-restart timer to prevent a zombie supervisor from starting
     const pendingTimer = this.autoRestartTimers.get(projectId)
     if (pendingTimer) { clearTimeout(pendingTimer); this.autoRestartTimers.delete(projectId) }
+    this.autoRestartCounts.delete(projectId)
+    this.llmCircuitBreakerCounts.delete(projectId)
 
     // Resume paused supervisor so it unblocks before abort
     const ps = this.pauseStates.get(projectId)
@@ -721,6 +766,9 @@ export class ProjectManager {
     // Cancel any pending auto-restart timer to prevent double-start
     const pendingTimer = this.autoRestartTimers.get(projectId)
     if (pendingTimer) { clearTimeout(pendingTimer); this.autoRestartTimers.delete(projectId) }
+    // Manual restart resets the auto-restart escalation count and LLM breaker count
+    this.autoRestartCounts.delete(projectId)
+    this.llmCircuitBreakerCounts.delete(projectId)
 
     // Stop existing supervisor
     const ac = this.supervisorAborts.get(projectId)
@@ -885,9 +933,11 @@ export class ProjectManager {
 
   /** Shut down everything — kills all child processes and waits for port release */
   shutdown() {
-    // Cancel all pending auto-restart timers
+    // Cancel all pending auto-restart timers and reset counts
     for (const timer of this.autoRestartTimers.values()) clearTimeout(timer)
     this.autoRestartTimers.clear()
+    this.autoRestartCounts.clear()
+    this.llmCircuitBreakerCounts.clear()
     this.hardStopAll()
     for (const proc of this.processes.values()) {
       killProcessTree(proc.pid).catch(() => {})

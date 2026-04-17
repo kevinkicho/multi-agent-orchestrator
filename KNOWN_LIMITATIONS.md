@@ -353,19 +353,19 @@ The `DashboardLog` class (`dashboard.ts:34-80`) maintains a `history` array capp
 
 The `EventBus` class (`event-bus.ts:38-76`) uses a `buffer` array capped at 200 entries. It uses `this.buffer.shift()` to trim, which is O(n) for 200 elements — negligible, but worth noting that a proper circular buffer would be O(1).
 
-### 20c. Performance Log Archive Files — Unbounded Disk Growth
+### 20c. Performance Log Archive Files — Self-Cleaning
 
-**This is the only server-side unbounded growth issue.** The `performance-log.ts` module (`src/performance-log.ts`) archives performance entries to daily files under `.orchestrator-performance-archive/`. Active entries are capped at 500, and entries older than 7 days are archived. But **archive files are never cleaned up** — they accumulate indefinitely at one file per day.
+**Status: Fixed.** Archive files older than 30 days are now deleted during `savePerformanceLog()`. The cleanup runs as a best-effort step after archiving, scanning the archive directory for `perf-*.json` files whose modification time exceeds `MAX_ARCHIVE_AGE_DAYS` (30).
 
-**Risk:** Low in practice (one small JSON file per day, typically <100KB each), but over months of continuous operation, this directory grows without bound.
+**What (original issue):** Performance log archive files under `.orchestrator-performance-archive/` accumulated indefinitely at one file per day, with no cleanup mechanism.
 
-**Recommended fix:** Add a cleanup step that deletes archive files older than 30 days.
+**Tradeoff:** Setting the retention period to 30 days balances keeping enough history for trend analysis against disk usage. Each daily file is typically <100KB (500 entries × ~200 bytes), so 30 days of archives is ~3MB. If longer retention is needed, `MAX_ARCHIVE_AGE_DAYS` can be increased or set to `Infinity` to disable cleanup.
 
-### 20d. pendingComments Array — No Hard Cap
+### 20d. pendingComments Array — Hard Cap at 50
 
-The `pendingComments` array in `ProjectState` (`project-manager.ts:66`) has no maximum size. Comments accumulate between supervisor reads. The supervisor drains the array each cycle via `getUnreadComments()`, so in practice it rarely holds more than a few entries. But there's no safety net if a user rapidly submits many comments before the supervisor reads them.
+**Status: Fixed.** `pendingComments` is now capped at 50 entries. When a new comment is pushed and the array exceeds 50, the oldest entries are discarded via `slice(-50)`.
 
-**Recommended fix:** Cap at 50 entries, dropping the oldest when exceeded.
+**What (original issue):** The `pendingComments` array in `ProjectState` had no maximum size. Comments accumulated between supervisor reads. The supervisor drains the array each cycle, so in practice it rarely held more than a few entries, but there was no safety net if a user rapidly submitted many comments.
 
 ### 20e. Memory Estimate for 5 Agents Over 8 Hours
 
@@ -394,6 +394,6 @@ The `pendingComments` array in `ProjectState` (`project-manager.ts:66`) has no m
 
 2. **Client-side: DOM creation during bursts** — `renderEntry()` creates new DOM nodes for every log entry. During a burst of 5 agents cycling simultaneously, 75-150 DOM node creations happen in rapid succession. The MAX_RENDERED=200 cap per panel prevents unbounded DOM growth, but the creation cost scales with event frequency. This is the most likely source of perceived lag.
 
-3. **Server-side: Performance archive files** — One file per day, never cleaned up. After months of operation, this directory could accumulate hundreds of files. Not a memory issue, but an unbounded disk concern.
+3. **Server-side: Performance archive files** — One file per day, auto-cleaned after 30 days. Archive files older than `MAX_ARCHIVE_AGE_DAYS` are deleted during `savePerformanceLog()`. Disk usage stays bounded at ~3MB for 30 days of archives.
 
 4. **Network: Poll loop HTTP requests** — 2 requests every 10 seconds (status + projects) plus 1 long-poll connection. This does NOT scale with agent count and is negligible for any reasonable deployment.

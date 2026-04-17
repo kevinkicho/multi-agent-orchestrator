@@ -769,7 +769,11 @@ export class ProjectManager {
       target.commentRead = false
     }
     // Push to fast-access queue so supervisor doesn't iterate full history
+    // Cap at 50 to prevent unbounded growth if supervisor is slow to read
     project.pendingComments.push(comment)
+    if (project.pendingComments.length > 50) {
+      project.pendingComments = project.pendingComments.slice(-50)
+    }
     this.saveProjects()
     this.dashLog.push({ type: "brain-thinking", text: `${project.name}: user commented on directive — "${comment.slice(0, 80)}..."` })
   }

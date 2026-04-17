@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync } from "fs"
-import { resolve } from "path"
+import { existsSync, mkdirSync, readdirSync, unlinkSync, statSync } from "fs"
+import { resolve, join } from "path"
 import { readJsonFile, writeJsonFile } from "./file-utils"
 
 export type PerformanceEntry = {
@@ -22,6 +22,7 @@ const PERF_FILE = "orchestrator-performance.json"
 const PERF_ARCHIVE_DIR = "orchestrator-performance-archive"
 const MAX_ACTIVE_ENTRIES = 500
 const ARCHIVE_AGE_DAYS = 7
+const MAX_ARCHIVE_AGE_DAYS = 30
 
 function getPerfPath(): string {
   return resolve(process.cwd(), PERF_FILE)
@@ -60,6 +61,24 @@ export async function savePerformanceLog(log: PerformanceLog): Promise<void> {
       console.error(`[performance-log] Failed to archive: ${err}`)
     }
   }
+
+  // Clean up archive files older than MAX_ARCHIVE_AGE_DAYS
+  try {
+    const archiveDir = getArchiveDir()
+    if (existsSync(archiveDir)) {
+      const maxAge = Date.now() - MAX_ARCHIVE_AGE_DAYS * 24 * 60 * 60 * 1000
+      for (const file of readdirSync(archiveDir)) {
+        if (!file.startsWith("perf-") || !file.endsWith(".json")) continue
+        try {
+          const filePath = join(archiveDir, file)
+          const stat = statSync(filePath)
+          if (stat.mtimeMs < maxAge) {
+            unlinkSync(filePath)
+          }
+        } catch { /* best-effort: skip files that disappear or are locked */ }
+      }
+    }
+  } catch { /* best-effort: archive directory may not exist */ }
 
   // Keep only recent entries in active log, capped at MAX_ACTIVE_ENTRIES
   log.entries = recent.slice(-MAX_ACTIVE_ENTRIES)

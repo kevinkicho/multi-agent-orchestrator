@@ -46,6 +46,7 @@ header h1 {
 .dot-disconnected { background: #ef4444; }
 .dot-error { background: #ef4444; }
 .dot-done { background: #60a5fa; }
+.dot-paused { background: #f59e0b; }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
@@ -123,6 +124,58 @@ header h1 {
   transition: opacity 0.15s;
 }
 .project-row-remove:hover { opacity: 1; background: #2a1010; }
+
+/* Directive / settings section */
+.directive-section {
+  padding: 0 12px 8px;
+  background: #111122;
+  border-bottom: 1px solid #2a2a3a;
+}
+.directive-toggle {
+  font-size: 10px;
+  color: #8b8bff;
+  cursor: pointer;
+  padding: 2px 0;
+  user-select: none;
+}
+.directive-toggle:hover { text-decoration: underline; }
+.directive-content {
+  display: none;
+  margin-top: 4px;
+}
+.directive-content.open { display: block; }
+.directive-text {
+  width: 100%;
+  min-height: 60px;
+  max-height: 150px;
+  background: #0a0a14;
+  color: #c0c0c0;
+  border: 1px solid #2a2a3a;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  resize: vertical;
+}
+.directive-text:focus { outline: none; border-color: #8b8bff; }
+.directive-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+.directive-save {
+  font-size: 10px;
+  padding: 3px 12px;
+  border: 1px solid #3a5a3a;
+  border-radius: 4px;
+  background: #1a2a1a;
+  color: #4ade80;
+  cursor: pointer;
+  font-family: inherit;
+  font-weight: 600;
+}
+.directive-save:hover { background: #2a3a2a; }
 
 /* Panels inside a project row */
 .project-row-body {

@@ -418,7 +418,7 @@ function isUnknownAgentError(err: unknown): boolean {
 /** Wait for a single agent to finish (not all agents) */
 type WaitResult = {
   /** Why the wait ended */
-  reason: "idle" | "timeout" | "stale" | "aborted" | "paused" | "disconnected"
+  reason: "idle" | "timeout" | "stale" | "aborted" | "paused" | "disconnected" | "user-feedback"
   /** Seconds the agent was silent (no SSE events) when wait ended. 0 if agent finished normally. */
   silentSeconds: number
 }
@@ -430,12 +430,17 @@ async function waitForAgent(
   orchestrator: Orchestrator,
   agentName: string,
   timeoutMs = 300_000,
-  opts?: { signal?: AbortSignal; pauseState?: PauseState },
+  opts?: { signal?: AbortSignal; pauseState?: PauseState; getUnreadComments?: () => string[] },
 ): Promise<WaitResult> {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
     if (opts?.signal?.aborted) return { reason: "aborted", silentSeconds: 0 }
     if (opts?.pauseState && isPauseRequested(opts.pauseState)) return { reason: "paused", silentSeconds: 0 }
+
+    // Break out of wait if user sent feedback — let the supervisor see it immediately
+    const comments = opts?.getUnreadComments?.() ?? []
+    if (comments.length > 0) return { reason: "user-feedback", silentSeconds: 0 }
+
     const statuses = await orchestrator.status()
     const s = statuses.get(agentName)
     if (!s) return { reason: "disconnected", silentSeconds: 0 }
@@ -534,6 +539,7 @@ export async function runAgentSupervisor(
 
   let loggedStop = false
   let pauseInjected = false
+  let pauseInjectedAtRound = -1  // track which round pause was injected
 
   // Agent capability probing — run once on startup
   let agentCapabilities = ""
@@ -698,9 +704,16 @@ export async function runAgentSupervisor(
         break
       }
 
+      // Pause hard break — if LLM didn't CYCLE_DONE within 2 rounds of pause injection, force-end
+      if (pauseInjected && pauseInjectedAtRound >= 0 && round - pauseInjectedAtRound >= 2) {
+        emit(`Pause grace period expired (${round - pauseInjectedAtRound} rounds since injection) — force-ending cycle.`)
+        break
+      }
+
       // Pause: inject wrap-up message once per pause request
       if (config.pauseState && isPauseRequested(config.pauseState) && !pauseInjected) {
         pauseInjected = true
+        pauseInjectedAtRound = round
         const pauseMsg = "IMPORTANT: A pause has been requested. Finish your current task plan — ensure the agent reaches a clean state (tests passing, code committed, no half-done changes), then issue CYCLE_DONE with a detailed summary. Do NOT start new tasks."
         messages.push({ role: "user", content: pauseMsg })
         emit(`Pause requested — injecting wrap-up directive into conversation.`)
@@ -710,6 +723,14 @@ export async function runAgentSupervisor(
           sessionId: analyticsSessionId ?? undefined,
           content: pauseMsg, tags: ["pause-request"],
         }).catch(() => {})
+      }
+
+      // Mid-cycle user feedback — check every round so users can redirect a stuck supervisor
+      const midCycleComments = config.getUnreadComments?.() ?? []
+      if (midCycleComments.length > 0) {
+        const feedbackMsg = `[USER FEEDBACK — READ THIS NOW]\nThe human user has sent you urgent feedback:\n${midCycleComments.map(c => `> "${c}"`).join("\n")}\n\nACT ON THIS IMMEDIATELY. Adjust your current approach based on this feedback. If the user says to ignore something, stop pursuing it and move on.`
+        messages.push({ role: "user", content: feedbackMsg })
+        emit(`Injected ${midCycleComments.length} user comment(s) mid-cycle`)
       }
 
       // Urgent events from bus — inject between rounds for fast cross-agent coordination
@@ -1049,6 +1070,7 @@ Be specific with file paths, line numbers, and code snippets.`
             // Also update directiveRef so TeamManager (or any external reader) sees the change
             if (config.directiveRef) config.directiveRef.value = cmd.text
             config.onDirectiveUpdate?.(cmd.text)
+            config.eventBus?.emit({ type: "directive-updated", source: "supervisor", agentName, data: { directive: cmd.text } })
             results.push(`Directive updated to: "${cmd.text.slice(0, 150)}..."`)
             emit(`Directive updated: ${cmd.text}`)
             break
@@ -1348,7 +1370,7 @@ Be specific with file paths, line numbers, and code snippets.`
       // Wait for agent to finish, then collect response
       if (shouldWait) {
         emit(`Waiting for ${agentName} to finish...`)
-        const waitResult = await waitForAgent(orchestrator, agentName, 300_000, { signal: config.signal, pauseState: config.pauseState })
+        const waitResult = await waitForAgent(orchestrator, agentName, 300_000, { signal: config.signal, pauseState: config.pauseState, getUnreadComments: config.getUnreadComments })
 
         // Stale-busy: agent claims busy but no SSE events — process likely dead
         if (waitResult.reason === "stale") {
@@ -1365,6 +1387,22 @@ Be specific with file paths, line numbers, and code snippets.`
           cycleRestartCount++
           await addBehavioralNote(memory, agentName, `Agent went stale (silent ${waitResult.silentSeconds}s while busy). May need simpler prompts or the opencode process may be unstable.`)
           continue // Skip response collection — retry with next round
+        }
+
+        if (waitResult.reason === "user-feedback") {
+          emit(`User feedback received — interrupting wait to process it immediately`)
+          // Abort current agent work so we can redirect
+          try { await orchestrator.prompt(agentName, "/abort") } catch {}
+          await new Promise(r => setTimeout(r, 1000))
+          // Don't collect response — go straight to next round where mid-cycle feedback injection will fire
+          results.push(`[USER FEEDBACK] Interrupted current work to process user feedback.`)
+          continue
+        }
+
+        // Pause: stop waiting and force-break the cycle — don't keep prompting the LLM
+        if (waitResult.reason === "paused") {
+          emit(`Pause active — breaking out of agent wait to end cycle.`)
+          break
         }
 
         if (waitResult.reason === "timeout") {

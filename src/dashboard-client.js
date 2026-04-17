@@ -110,6 +110,31 @@ function ensureAgent(name) {
         <button class="project-row-remove" onclick="event.stopPropagation();removeProject('${name}')" title="Stop supervisor, kill agent process, and remove this project">Remove</button>
       </div>
     </div>
+    <div class="directive-section" onclick="event.stopPropagation()">
+      <div class="directive-toggle" onclick="this.nextElementSibling.classList.toggle('open')">&#9660; Settings</div>
+      <div class="directive-content" id="dcontent-${name}">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+          <span style="font-size:10px;color:#888;min-width:40px;">Model:</span>
+          <select class="directive-text" id="msel-${name}" style="min-height:auto;height:26px;padding:2px 6px;flex:1;max-width:300px;">
+            <option value="">(global default)</option>
+          </select>
+          <button class="directive-save" onclick="saveModel('${name}')" style="white-space:nowrap;">Change Model</button>
+        </div>
+        <div style="margin-bottom:4px;font-size:10px;color:#888;">Directive:</div>
+        <textarea class="directive-text" id="dtxt-${name}" rows="3"></textarea>
+        <div class="directive-actions">
+          <button class="directive-save" onclick="saveDirective('${name}')">Save Directive &amp; Restart Supervisor</button>
+        </div>
+        <div style="margin-top:8px;display:flex;gap:6px;align-items:center;">
+          <input type="text" class="directive-text" id="dcmt-${name}" placeholder="Leave feedback for supervisor..." style="min-height:auto;height:26px;padding:2px 8px;flex:1;">
+          <button class="directive-save" onclick="sendComment('${name}')" style="white-space:nowrap;">Send Comment</button>
+        </div>
+        <div style="margin-top:8px;">
+          <div class="directive-toggle" onclick="toggleHistory('${name}')" id="dhist-toggle-${name}">&#9654; Directive History</div>
+          <div id="dhist-${name}" style="display:none;margin-top:4px;max-height:250px;overflow-y:auto;"></div>
+        </div>
+      </div>
+    </div>
     <div class="project-row-body">
       <div class="panel">
         <div class="panel-header">
@@ -117,7 +142,6 @@ function ensureAgent(name) {
             <span class="worker-icon">&#9881;</span>
             <span class="label">Worker</span>
             <span class="name">${escapeHtml(name)}</span>
-            <a class="view-link" id="link-${name}" href="#" target="_blank">open UI</a>
           </div>
           <span class="agent-badge badge-idle" id="badge-${name}">IDLE</span>
         </div>
@@ -151,6 +175,8 @@ function ensureAgent(name) {
     rowSupervisorBadge: row.querySelector('#sbadge-' + name),
     projStatusBadge: row.querySelector('#projstatus-' + name),
     branchBadge: row.querySelector('#branchbadge-' + name),
+    directiveText: row.querySelector('#dtxt-' + name),
+    modelSelect: row.querySelector('#msel-' + name),
     dirLabel: row.querySelector('#dir-' + name),
     link: row.querySelector('#link-' + name),
     chatInput: row.querySelector('#chat-' + name),
@@ -162,6 +188,15 @@ function ensureAgent(name) {
     project: row.querySelector('#dir-' + name),
     status: 'idle',
     supervisorStatus: 'idle',
+  }
+
+  // Track when user starts editing the directive textarea
+  if (data.directiveText) {
+    data.directiveText.addEventListener('input', function() { this._userEdited = true })
+    data.directiveText.addEventListener('blur', function() {
+      // Clear edit flag after a short delay so polling can update if user moved away
+      setTimeout(() => { this._userEdited = false }, 5000)
+    })
   }
 
   projectRows[name] = data
@@ -329,6 +364,7 @@ function statusToDot(status) {
     case 'disconnected': return 'dot-disconnected'
     case 'error': return 'dot-error'
     case 'completed': return 'dot-done'
+    case 'paused': return 'dot-paused'
     default: return 'dot-idle'
   }
 }
@@ -338,11 +374,21 @@ function statusToLabel(status) {
   return labels[status] || status
 }
 
+function effectiveStatus(a) {
+  // Combined project status: supervisor state takes priority over momentary worker idle
+  if (a.supervisorStatus === 'paused') return 'paused'
+  if (a.supervisorStatus === 'completed') return 'completed'
+  if (a.status === 'error' || a.status === 'disconnected') return a.status
+  if (a.supervisorStatus === 'busy') return 'busy'
+  return a.status
+}
+
 function updateStatusBar() {
   const items = Object.entries(projectRows).map(([name, a]) => {
-    const dotClass = statusToDot(a.status)
-    const label = statusToLabel(a.status)
-    const labelColor = dotClass === 'dot-busy' ? '#facc15' : dotClass === 'dot-disconnected' || dotClass === 'dot-error' ? '#ef4444' : dotClass === 'dot-done' ? '#60a5fa' : '#4ade80'
+    const combined = effectiveStatus(a)
+    const dotClass = statusToDot(combined)
+    const label = statusToLabel(combined)
+    const labelColor = dotClass === 'dot-busy' ? '#facc15' : dotClass === 'dot-disconnected' || dotClass === 'dot-error' ? '#ef4444' : dotClass === 'dot-done' ? '#60a5fa' : dotClass === 'dot-paused' ? '#f59e0b' : '#4ade80'
     return '<span><span class="status-dot ' + dotClass + '" aria-hidden="true"></span>' + name + '<span class="status-dot-label" style="color:' + labelColor + ';margin-left:4px;">' + label + '</span></span>'
   })
   statusBar.innerHTML = items.join('')
@@ -598,6 +644,13 @@ function applyProjectData(projects) {
     if (!agent) continue
     agent.projectId = proj.id
     agent.directive = proj.directive
+    // Populate directive textarea (unless user is actively editing)
+    if (agent.directiveText && !agent.directiveText._userEdited) {
+      agent.directiveText.value = proj.directive || ''
+    }
+    if (agent.modelSelect && proj.model) {
+      agent.modelSelect.value = proj.model
+    }
     // Update project-level status badge
     if (agent.projStatusBadge && proj.status) {
       setProjectStatus(agent.projStatusBadge, proj.status)
@@ -616,13 +669,18 @@ function setProjectStatus(badge, status) {
   const map = {
     starting: ['STARTING', 'badge-starting'],
     running: ['RUNNING', 'badge-running'],
-    supervising: ['SUPERVISING', 'badge-supervising'],
+    supervising: [null, null], // hidden — Worker/Supervisor badges already show this
     stopped: ['FINISHED', 'badge-stopped'],
     error: ['ERROR', 'badge-error'],
   }
   const [text, cls] = map[status] || [status.toUpperCase(), 'badge-idle']
-  badge.textContent = text
-  badge.className = 'agent-badge ' + cls
+  if (!text) {
+    badge.style.display = 'none'
+  } else {
+    badge.style.display = ''
+    badge.textContent = text
+    badge.className = 'agent-badge ' + cls
+  }
 }
 
 // --- Drag-to-annotate feedback system ---
@@ -1249,6 +1307,214 @@ function exportLogs() {
   a.click()
 }
 
+// -----------------------------------------------------------------------
+// Directive / Settings panel functions
+// -----------------------------------------------------------------------
+
+async function saveDirective(agentName) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) { alert('Project not found for ' + agentName); return }
+  const text = agent.directiveText.value.trim()
+  if (!text) { alert('Directive cannot be empty'); return }
+  try {
+    const res = await apiFetch('/api/projects/' + agent.projectId + '/directive', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ directive: text }),
+    })
+    const data = await res.json()
+    if (data.ok) {
+      agent.directiveText._userEdited = false
+      addLogEntry(agent.supervisorLog, 'status', 'Directive updated. Supervisor restarting...')
+    } else {
+      alert('Failed to save directive: ' + (data.error || 'Unknown error'))
+    }
+  } catch (err) {
+    alert('Error saving directive: ' + err)
+  }
+}
+
+async function saveModel(agentName) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) { alert('Project not found for ' + agentName); return }
+  const model = agent.modelSelect.value
+  try {
+    const res = await apiFetch('/api/projects/' + agent.projectId + '/model', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: model || 'default' }),
+    })
+    const data = await res.json()
+    if (data.ok) {
+      addLogEntry(agent.supervisorLog, 'status', 'Model changed to: ' + (model || '(global default)') + '. Supervisor restarting...')
+    } else {
+      alert('Failed to change model: ' + (data.error || 'Unknown error'))
+    }
+  } catch (err) {
+    alert('Error changing model: ' + err)
+  }
+}
+
+async function sendComment(agentName) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) { alert('Project not found'); return }
+  const input = document.getElementById('dcmt-' + agentName)
+  const comment = input.value.trim()
+  if (!comment) { alert('Please enter a comment.'); return }
+  try {
+    const res = await apiFetch('/api/projects/' + agent.projectId + '/directive-comment', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ comment }),
+    })
+    const data = await res.json()
+    if (data.ok) {
+      input.value = ''
+      addLogEntry(agent.supervisorLog, 'status', 'Comment sent to supervisor: "' + comment.slice(0, 80) + '"')
+      const histEl = document.getElementById('dhist-' + agentName)
+      if (histEl && histEl.style.display !== 'none') loadHistory(agentName)
+    } else {
+      alert('Failed: ' + (data.error || 'Unknown error'))
+    }
+  } catch (err) {
+    alert('Error: ' + err)
+  }
+}
+
+function toggleHistory(agentName) {
+  const histEl = document.getElementById('dhist-' + agentName)
+  const toggle = document.getElementById('dhist-toggle-' + agentName)
+  if (!histEl) return
+  if (histEl.style.display === 'none') {
+    histEl.style.display = 'block'
+    toggle.innerHTML = '&#9660; Directive History'
+    loadHistory(agentName)
+  } else {
+    histEl.style.display = 'none'
+    toggle.innerHTML = '&#9654; Directive History'
+  }
+}
+
+async function loadHistory(agentName) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) return
+  const histEl = document.getElementById('dhist-' + agentName)
+  if (!histEl) return
+  histEl.innerHTML = '<div style="color:#666;font-size:10px;">Loading...</div>'
+  try {
+    const res = await fetch('/api/projects/' + agent.projectId + '/directive-history')
+    const history = await res.json()
+    if (!history || history.length === 0) {
+      histEl.innerHTML = '<div style="color:#666;font-size:10px;">No history yet.</div>'
+      return
+    }
+    const reversed = [...history].reverse()
+    let html = ''
+    for (let i = 0; i < reversed.length; i++) {
+      const entry = reversed[i]
+      const isLatest = i === 0
+      const date = new Date(entry.timestamp)
+      const timeStr = date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      const sourceColor = entry.source === 'user' ? '#8b8bff' : '#fb923c'
+      const sourceLabel = entry.source === 'user' ? 'USER' : 'SUPERVISOR'
+      const borderColor = isLatest ? '#4ade80' : '#2a2a3a'
+      html += '<div style="border-left:2px solid ' + borderColor + ';padding:4px 0 8px 10px;margin-left:6px;font-size:10px;'
+        + (isLatest ? '' : 'opacity:0.7;') + '">'
+      html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px;">'
+      html += '<span style="color:' + sourceColor + ';font-weight:600;font-size:9px;text-transform:uppercase;">' + sourceLabel + '</span>'
+      html += '<span style="color:#555;">' + timeStr + '</span>'
+      if (isLatest) html += '<span style="color:#4ade80;font-size:9px;font-weight:600;">CURRENT</span>'
+      html += '</div>'
+      html += '<div style="color:#c0c0c0;line-height:1.4;white-space:pre-wrap;max-height:80px;overflow:hidden;">' + escapeHtml(entry.text.slice(0, 300)) + (entry.text.length > 300 ? '...' : '') + '</div>'
+      if (entry.comment) {
+        html += '<div style="margin-top:3px;padding:3px 6px;background:#1a1a2a;border-radius:3px;color:#8b8bff;font-style:italic;">'
+        html += '&#128172; ' + escapeHtml(entry.comment)
+        if (entry.commentRead) html += ' <span style="color:#4ade80;font-size:9px;">(read by supervisor)</span>'
+        else html += ' <span style="color:#facc15;font-size:9px;">(pending)</span>'
+        html += '</div>'
+      }
+      if (!isLatest) {
+        const origIdx = history.length - 1 - i
+        html += '<div style="margin-top:3px;display:flex;gap:8px;align-items:center;">'
+        html += '<span style="cursor:pointer;color:#6366f1;text-decoration:underline;font-size:9px;" onclick="revertDirective(\'' + agentName + '\', ' + origIdx + ')">Revert to this version</span>'
+        html += '<input type="text" id="hcmt-' + agentName + '-' + origIdx + '" placeholder="Add comment..." style="flex:1;font-size:9px;padding:2px 6px;background:#0a0a14;border:1px solid #2a2a3a;border-radius:3px;color:#c0c0c0;font-family:inherit;" onclick="event.stopPropagation()">'
+        html += '<span style="cursor:pointer;color:#4ade80;font-size:9px;font-weight:600;" onclick="sendHistoryComment(\'' + agentName + '\', ' + origIdx + ')">Send</span>'
+        html += '</div>'
+      }
+      html += '</div>'
+    }
+    histEl.innerHTML = html
+  } catch (err) {
+    histEl.innerHTML = '<div style="color:#ef4444;font-size:10px;">Error loading history: ' + err + '</div>'
+  }
+}
+
+function revertDirective(agentName, historyIndex) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) return
+  fetch('/api/projects/' + agent.projectId + '/directive-history').then(r => r.json()).then(history => {
+    if (!history[historyIndex]) return
+    const text = history[historyIndex].text
+    if (!confirm('Revert directive to:\n\n"' + text.slice(0, 200) + '"\n\nThis will restart the supervisor.')) return
+    agent.directiveText.value = text
+    agent.directiveText._userEdited = true
+    saveDirective(agentName)
+  })
+}
+
+async function sendHistoryComment(agentName, historyIndex) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) { alert('Project not found'); return }
+  const input = document.getElementById('hcmt-' + agentName + '-' + historyIndex)
+  if (!input) return
+  const comment = input.value.trim()
+  if (!comment) { alert('Please enter a comment.'); return }
+  try {
+    const res = await apiFetch('/api/projects/' + agent.projectId + '/directive-comment', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ comment, historyIndex }),
+    })
+    const data = await res.json()
+    if (data.ok) {
+      input.value = ''
+      addLogEntry(agent.supervisorLog, 'status', 'Comment sent on historical directive entry.')
+      loadHistory(agentName)
+    } else {
+      alert('Failed: ' + (data.error || 'Unknown error'))
+    }
+  } catch (err) {
+    alert('Error: ' + err)
+  }
+}
+
+// Fetch available Ollama models and populate selects
+let ollamaModels = []
+async function refreshOllamaModels() {
+  try {
+    const res = await fetch('/api/ollama-models')
+    const data = await res.json()
+    ollamaModels = data.models || []
+    for (const [name, agent] of Object.entries(projectRows)) {
+      if (!agent.modelSelect) continue
+      const current = agent.modelSelect.value
+      while (agent.modelSelect.options.length > 1) agent.modelSelect.remove(1)
+      for (const m of ollamaModels) {
+        const opt = document.createElement('option')
+        opt.value = m.name
+        const params = m.parameterSize || ''
+        const quant = m.quantization || ''
+        const detail = [params, quant].filter(Boolean).join(', ')
+        opt.textContent = m.name + (detail ? ' (' + detail + ')' : '')
+        agent.modelSelect.appendChild(opt)
+      }
+      if (current) agent.modelSelect.value = current
+    }
+  } catch {}
+}
+refreshOllamaModels()
+setInterval(refreshOllamaModels, 60000)
+
 // Remove project
 async function removeProject(agentName) {
   if (!confirm('Remove project "' + agentName + '"? This will stop the agent and supervisor.')) return
@@ -1342,6 +1608,9 @@ function updatePauseUI(agentName, pauseStatus, pauseRequestedAt) {
       badge.textContent = 'PAUSING...'
       badge.title = 'Requested ' + ago + 's ago'
     }
+    // Hide supervisor badge — pause badge shows the state
+    const sBadge = document.getElementById('sbadge-' + agentName)
+    if (sBadge) sBadge.style.display = 'none'
   } else if (pauseStatus === 'paused') {
     btn.textContent = 'Resume'
     btn.style.color = '#22d3ee'
@@ -1352,6 +1621,9 @@ function updatePauseUI(agentName, pauseStatus, pauseRequestedAt) {
       badge.textContent = 'PAUSED'
       badge.style.fontSize = '9px'
     }
+    // Hide supervisor badge — pause badge already shows the state
+    const sBadge = document.getElementById('sbadge-' + agentName)
+    if (sBadge) sBadge.style.display = 'none'
     // Add amber left border to project row
     const row = document.getElementById('row-' + agentName)
     if (row) row.style.borderLeft = '3px solid #f59e0b'
@@ -1360,6 +1632,9 @@ function updatePauseUI(agentName, pauseStatus, pauseRequestedAt) {
     btn.style.color = '#f59e0b'
     btn.style.borderColor = '#f59e0b'
     if (badge) badge.style.display = 'none'
+    // Restore supervisor badge visibility
+    const sBadge = document.getElementById('sbadge-' + agentName)
+    if (sBadge) sBadge.style.display = ''
     const row = document.getElementById('row-' + agentName)
     if (row) row.style.borderLeft = ''
   }
@@ -2190,6 +2465,16 @@ function connectSSE() {
     try {
       const evt = JSON.parse(e.data)
       appendEventToLog(evt)
+      // Live directive update from bus event
+      if (evt.type === 'directive-updated' && evt.agentName) {
+        const agent = projectRows[evt.agentName]
+        if (agent && evt.data?.directive) {
+          agent.directive = evt.data.directive
+          if (agent.directiveText && !agent.directiveText._userEdited) {
+            agent.directiveText.value = evt.data.directive
+          }
+        }
+      }
     } catch {}
   }
   sseSource.onerror = function() {

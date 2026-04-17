@@ -255,6 +255,7 @@ function ensureAgent(name) {
 const MAX_RENDERED = 200      // max DOM nodes per log panel
 const RENDER_BATCH = 60       // how many older entries to render on scroll-up
 const MAX_BACKING = 5000      // max entries kept in memory (older are discarded)
+const TRIM_BATCH = 100        // trim only when backing array exceeds MAX_BACKING by this much (amortizes O(n) splice)
 const logStores = new WeakMap() // logEl -> { entries: [], renderedStart: int }
 
 // Entry types for the backing store — lightweight data, not DOM nodes
@@ -371,8 +372,9 @@ function pushEntry(logEl, entry) {
   // Store data object, not DOM node
   store.entries.push(entry)
 
-  // Trim backing array if it exceeds the memory cap
-  if (store.entries.length > MAX_BACKING) {
+  // Trim backing array only when excess exceeds TRIM_BATCH to amortize O(n) splice cost.
+  // This avoids shifting 5000 elements on every single pushEntry once at capacity.
+  if (store.entries.length > MAX_BACKING + TRIM_BATCH) {
     const excess = store.entries.length - MAX_BACKING
     store.entries.splice(0, excess)
     store.renderedStart = Math.max(0, store.renderedStart - excess)
@@ -392,12 +394,20 @@ function pushEntry(logEl, entry) {
   const node = renderEntry(entry)
   logEl.appendChild(node)
 
-  const isHidden = logEl.offsetParent === null
+  // Defer scroll to next animation frame to batch layout reads/writes
   if (store.pinned) {
-    if (isHidden) {
-      logEl._needsScrollOnReveal = true
-    } else {
-      logEl.scrollTop = logEl.scrollHeight
+    if (store._scrollRaf == null) {
+      store._scrollRaf = requestAnimationFrame(() => {
+        store._scrollRaf = null
+        if (store.pinned) {
+          const hidden = logEl.offsetParent === null
+          if (hidden) {
+            logEl._needsScrollOnReveal = true
+          } else {
+            logEl.scrollTop = logEl.scrollHeight
+          }
+        }
+      })
     }
   }
 }
@@ -502,14 +512,18 @@ function effectiveStatus(a) {
 }
 
 function updateStatusBar() {
-  const items = Object.entries(projectRows).map(([name, a]) => {
-    const combined = effectiveStatus(a)
-    const dotClass = statusToDot(combined)
-    const label = statusToLabel(combined)
+  if (updateStatusBar._raf) return // already scheduled
+  updateStatusBar._raf = requestAnimationFrame(() => {
+    updateStatusBar._raf = null
+    const items = Object.entries(projectRows).map(([name, a]) => {
+      const combined = effectiveStatus(a)
+      const dotClass = statusToDot(combined)
+      const label = statusToLabel(combined)
     const labelColor = dotClass === 'dot-busy' ? '#facc15' : dotClass === 'dot-disconnected' || dotClass === 'dot-error' ? '#ef4444' : dotClass === 'dot-done' ? '#60a5fa' : dotClass === 'dot-paused' ? '#f59e0b' : dotClass === 'dot-stuck' ? '#fb923c' : '#4ade80'
-    return '<a href="javascript:void(0)" onclick="document.getElementById(\'row-' + name + '\')?.scrollIntoView({behavior:\'smooth\',block:\'center\'})" style="text-decoration:none;color:inherit;cursor:pointer"><span class="status-dot ' + dotClass + '" aria-hidden="true"></span>' + name + '<span class="status-dot-label" style="color:' + labelColor + ';margin-left:4px;">' + label + '</span></a>'
+      return '<a href="javascript:void(0)" onclick="document.getElementById(\'row-' + name + '\')?.scrollIntoView({behavior:\'smooth\',block:\'center\'})" style="text-decoration:none;color:inherit;cursor:pointer"><span class="status-dot ' + dotClass + '" aria-hidden="true"></span>' + name + '<span class="status-dot-label" style="color:' + labelColor + ';margin-left:4px;">' + label + '</span></a>'
+    })
+    statusBar.innerHTML = items.join('')
   })
-  statusBar.innerHTML = items.join('')
 }
 
 function handleEvent(event) {

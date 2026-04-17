@@ -271,4 +271,36 @@ Changes to behavior that fix these limitations should reference the relevant sec
 
 **Why:** Originally designed for short-lived sessions where the set of agents is small. Not a practical issue in normal use, but technically unbounded.
 
+---
+
+## 16. Dashboard Performance Under Load
+
+### 16a. Backing Store Trim Cost Amortized
+
+**Status: Fixed.** The `splice(0, excess)` call in `pushEntry` only fires when the backing array exceeds `MAX_BACKING + TRIM_BATCH` (5100 entries), trimming 100 entries at a time. This amortizes the O(n) cost of array shifting from O(n) per event to O(n) per 100 events.
+
+**What (original issue):** When a log panel's backing array reached 5,000 entries, every `pushEntry` call triggered `splice(0, 1)`, which shifts 4,999 elements. During active agent bursts (75+ events per cycle across 5 agents), this created O(5000) × 75 = ~375,000 element shifts per cycle. The UI became sluggish after 1-6 hours depending on cycle frequency.
+
+### 16b. Layout Thrashing in pushEntry
+
+**Status: Fixed.** `pushEntry` now defers `scrollTop` writes to `requestAnimationFrame`, batching layout reads and writes into a single frame. Previously, every log entry forced 1-2 synchronous layout computations via `offsetParent` and `scrollHeight`, causing 20-30 forced layouts per second during bursts.
+
+**What (original issue):** Every `pushEntry` call read `logEl.offsetParent` and wrote `logEl.scrollTop = logEl.scrollHeight` synchronously. During active agent bursts, this caused layout thrashing — the browser could not batch reads and writes, leading to jank and dropped frames.
+
+### 16c. Status Bar Rebuild on Every Status Event
+
+**Status: Fixed.** `updateStatusBar()` now uses `requestAnimationFrame` debouncing — multiple status events in the same frame collapse into a single DOM update.
+
+**What (original issue):** Every `agent-status` and `supervisor-status` event called `updateStatusBar()`, which rebuilds `innerHTML` for the entire status bar. With 5 active agents, this fired ~20 times per cycle burst, each destroying and recreating 5+ DOM nodes.
+
+### 16d. Performance Expectations for Long-Running Sessions
+
+With 5 agents running for 2+ hours:
+
+- **Backing store memory:** ~17.5 MB total (50,000 entries across 11 panels × ~350 bytes each). Acceptable for modern browsers.
+- **DOM node count:** ~2,550 nodes (5 agent rows × 70 static nodes + 5 × 2 × 200 virtual scroll + 200 brain + 200 events). Well within browser limits.
+- **Backing array trim:** After filling, each panel trims 100 entries every ~100 events. The O(5000) splice happens once per 100 pushes, amortizing the cost.
+- **Polling rate:** 3 fixed intervals (10s status, 60s models, 30s admin panels) + 1 persistent long-poll + 1 persistent SSE. Does NOT scale with agent count.
+- **Remaining concern:** The `renderEntry()` function creates a new DOM node for every log entry. During active bursts, this can create 75-150 DOM nodes per cycle. With MAX_RENDERED=200 cap per panel, old nodes are removed, but creation cost scales with event frequency.
+
 **Fix:** Cap `cmdHistory` at 100 entries. Keep `removedAgents` as-is (its semantics require remembering removals).

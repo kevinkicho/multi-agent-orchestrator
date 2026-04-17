@@ -462,14 +462,14 @@ export async function runBrain(
 
     // Record message counts before sending prompts so we can detect new responses
     const messageCountsBefore = new Map<string, number>()
-    for (const [name] of orchestrator.agents) {
+    await Promise.all(Array.from(orchestrator.agents.keys()).map(async (name) => {
       try {
         const msgs = await orchestrator.getMessages(name)
         messageCountsBefore.set(name, msgs.length)
       } catch { // Intentionally silent: best-effort baseline count, falls back to 0
         messageCountsBefore.set(name, 0)
       }
-    }
+    }))
 
     for (const cmd of commands) {
       switch (cmd.type) {
@@ -575,18 +575,20 @@ export async function runBrain(
 
       // Collect only NEW responses (after prompts were sent)
       const responses: string[] = []
-      for (const [name] of orchestrator.agents) {
+      const allResponses = await Promise.all(Array.from(orchestrator.agents.keys()).map(async (name) => {
         try {
           const msgs = await orchestrator.getMessages(name)
           const beforeCount = messageCountsBefore.get(name) ?? 0
           const newMsgs = msgs.slice(beforeCount)
           const text = extractLastAssistantText(newMsgs)
-          if (text) {
-            responses.push(`${name} response:\n${text.slice(0, 2000)}`)
-          }
+          return text ? `${name} response:\n${text.slice(0, 2000)}` : null
         } catch (err) {
           console.error(`[brain] Failed to collect response from ${name}: ${err}`)
+          return null
         }
+      }))
+      for (const r of allResponses) {
+        if (r) responses.push(r)
       }
       if (responses.length > 0) {
         results.push("Agent responses after waiting:\n\n" + responses.join("\n\n---\n\n"))

@@ -932,53 +932,62 @@ export async function runAgentSupervisor(
 
       let response: string = ""
       let llmBreakCycle = false
-      // LLM call with semaphore — withLlmSlot guarantees release even on error
-      const doLlmCall = async (): Promise<{ content: string; usage?: import("./brain").TokenUsage } | null> => {
-        try {
-          const result = await chatCompletionWithUsage(ollamaUrl, model, messages, { ...(config.structuredOutput ? { jsonMode: true } : {}), timeoutMs: LLM_CALL_TIMEOUT_MS })
-          consecutiveLlmFailures = 0
-          consecutive429s = 0
-          return result
-        } catch (err) {
-          if (isTimeoutError(err)) {
-            consecutiveLlmFailures++
-            emit(`LLM request timed out after ${Math.round(LLM_CALL_TIMEOUT_MS / 1000)}s (round ${round + 1}, failure #${consecutiveLlmFailures})`)
-            logPerformance({
-              timestamp: Date.now(), projectName: directory, agentName, model,
-              event: "cycle_error", cycleNumber: cycleCount,
-              details: `llm-timeout (${Math.round(LLM_CALL_TIMEOUT_MS / 1000)}s)`,
-            })
-            if (consecutiveLlmFailures >= 3) {
-              const pauseMs = Math.min(30_000 * consecutiveLlmFailures, 300_000)
-              emit(`LLM persistently timing out (${consecutiveLlmFailures} timeouts) — pausing ${Math.round(pauseMs / 1000)}s before next cycle`)
-              await new Promise(r => setTimeout(r, pauseMs))
-            }
-            llmBreakCycle = true
-            return null
+
+      // LLM call: semaphore is held only during the actual API call, not during backoff.
+      // On failure, we release the slot, back off, then re-acquire for retry.
+      const llmCallFn = () => chatCompletionWithUsage(ollamaUrl, model, messages, { ...(config.structuredOutput ? { jsonMode: true } : {}), timeoutMs: LLM_CALL_TIMEOUT_MS })
+
+      let llmResult: { content: string; usage?: import("./brain").TokenUsage } | null = null
+
+      try {
+        llmResult = config.resourceManager
+          ? await config.resourceManager.withLlmSlot(llmCallFn)
+          : await llmCallFn()
+        consecutiveLlmFailures = 0
+        consecutive429s = 0
+      } catch (err) {
+        if (isTimeoutError(err)) {
+          consecutiveLlmFailures++
+          emit(`LLM request timed out after ${Math.round(LLM_CALL_TIMEOUT_MS / 1000)}s (round ${round + 1}, failure #${consecutiveLlmFailures})`)
+          logPerformance({
+            timestamp: Date.now(), projectName: directory, agentName, model,
+            event: "cycle_error", cycleNumber: cycleCount,
+            details: `llm-timeout (${Math.round(LLM_CALL_TIMEOUT_MS / 1000)}s)`,
+          })
+          if (consecutiveLlmFailures >= 3) {
+            const pauseMs = Math.min(30_000 * consecutiveLlmFailures, 300_000)
+            emit(`LLM persistently timing out (${consecutiveLlmFailures} timeouts) — pausing ${Math.round(pauseMs / 1000)}s before next cycle`)
+            // Backoff happens OUTSIDE the semaphore slot — other agents can proceed
+            await new Promise(r => setTimeout(r, pauseMs))
           }
-          if (isRateLimitError(err)) {
-            consecutive429s++
-            config.resourceManager?.reportRateLimit(agentName)
-            const cooldownMs = Math.min(30_000 * Math.pow(2, consecutive429s - 1), 300_000)
-            emit(`RATE LIMITED (429) — attempt ${consecutive429s}, cooling down ${cooldownMs / 1000}s then skipping to next cycle`)
-            logPerformance({
-              timestamp: Date.now(), projectName: directory, agentName, model,
-              event: "cycle_error", cycleNumber: cycleCount,
-              details: `rate-limit-429 (consecutive: ${consecutive429s})`,
-            })
-            await new Promise(r => setTimeout(r, cooldownMs))
-            llmBreakCycle = true
-            return null
-          }
+          llmBreakCycle = true
+        } else if (isRateLimitError(err)) {
+          consecutive429s++
+          config.resourceManager?.reportRateLimit(agentName)
+          const cooldownMs = Math.min(30_000 * Math.pow(2, consecutive429s - 1), 300_000)
+          emit(`RATE LIMITED (429) — attempt ${consecutive429s}, cooling down ${cooldownMs / 1000}s then skipping to next cycle`)
+          logPerformance({
+            timestamp: Date.now(), projectName: directory, agentName, model,
+            event: "cycle_error", cycleNumber: cycleCount,
+            details: `rate-limit-429 (consecutive: ${consecutive429s})`,
+          })
+          // Backoff outside semaphore — other agents can use the slot
+          await new Promise(r => setTimeout(r, cooldownMs))
+          llmBreakCycle = true
+        } else {
           consecutiveLlmFailures++
           const retryDelay = Math.min(5000 * Math.pow(2, consecutiveLlmFailures - 1), 60_000)
           emit(`LLM request failed (round ${round + 1}, failure #${consecutiveLlmFailures}): ${err}`)
           emit(`Retrying in ${retryDelay / 1000}s...`)
+          // Backoff OUTSIDE the semaphore slot — release slot so other agents can proceed
           await new Promise(r => setTimeout(r, retryDelay))
           try {
-            const retryResult = await chatCompletionWithUsage(ollamaUrl, model, messages, { ...(config.structuredOutput ? { jsonMode: true } : {}), timeoutMs: LLM_CALL_TIMEOUT_MS })
+            // Re-acquire slot for retry attempt
+            const retryResult = config.resourceManager
+              ? await config.resourceManager.withLlmSlot(llmCallFn)
+              : await llmCallFn()
+            llmResult = retryResult
             consecutiveLlmFailures = 0
-            return retryResult
           } catch (retryErr) {
             emit(`LLM retry failed — skipping to next cycle: ${retryErr}`)
             logPerformance({
@@ -991,14 +1000,9 @@ export async function runAgentSupervisor(
               await new Promise(r => setTimeout(r, pauseMs))
             }
             llmBreakCycle = true
-            return null
           }
         }
       }
-
-      const llmResult = config.resourceManager
-        ? await config.resourceManager.withLlmSlot(doLlmCall)
-        : await doLlmCall()
 
       if (llmBreakCycle || !llmResult) {
         if (llmBreakCycle) break

@@ -158,9 +158,8 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
     console.log(`[orchestrator] ${connectedCount}/${config.agents.length} agents connected`)
   }
 
-  // Create sessions on all connected agents
-  for (const { name, healthy } of results) {
-    if (!healthy) continue
+  // Create sessions on all connected agents (in parallel)
+  await Promise.all(results.filter(r => r.healthy).map(async ({ name }) => {
     const agent = agents.get(name)!
     try {
       const sessionID = await agentCreateSession(agent)
@@ -168,7 +167,7 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
     } catch (err) {
       config.onStatusChange?.(name, "error", `Failed to create session: ${err}`)
     }
-  }
+  }))
 
   // Subscribe to SSE events from all agents
   for (const [name, agent] of agents) {

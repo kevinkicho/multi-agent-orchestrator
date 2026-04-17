@@ -2314,8 +2314,10 @@ async function pollEvents() {
       for (const event of data.events) {
         handleEvent(event)
       }
-      // Successful poll — but don't override SSE's disconnected state
-      if (connectionState !== 'disconnected' || pollConsecutiveFailures === 0) {
+      // Successful poll — only set connected if not in SSE disconnect state
+      // SSE disconnect is tracked by sseConnected=false while sseSource was previously active
+      if (sseConnected || !sseSource) {
+        // Either SSE is connected, or we don't use SSE — poll success means connected
         setConnectionState('connected')
       }
       pollConsecutiveFailures = 0
@@ -2794,12 +2796,16 @@ setInterval(() => {
 // ---- Per-project branch & validation UI helpers ----
 async function mergeBranch(projectId) {
   if (!confirm('Merge agent branch into main?')) return
-  // Find the merge button for this project
-  const mergeBtns = document.querySelectorAll('.project-row-remove')
+  // Find the merge button by looking for rows matching this projectId
   let mergeBtn = null
-  for (const btn of mergeBtns) {
-    if (btn.onclick?.toString().includes(projectId) && btn.textContent.trim() === 'Merge') {
-      mergeBtn = btn; break
+  for (const [name, agent] of Object.entries(projectRows)) {
+    if (agent.projectId === projectId) {
+      const row = document.getElementById('row-' + name)
+      if (row) {
+        const btns = row.querySelectorAll('.project-row-remove')
+        for (const btn of btns) { if (btn.textContent.trim() === 'Merge') { mergeBtn = btn; break } }
+      }
+      break
     }
   }
   if (mergeBtn) { mergeBtn.disabled = true; mergeBtn.textContent = 'Merging...' }

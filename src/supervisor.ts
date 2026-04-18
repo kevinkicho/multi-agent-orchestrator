@@ -344,7 +344,7 @@ function parseSocraticResponse(response: string): { commands: SupervisorCommand[
       case "intent": {
         const filesMatch = body.match(/\[files?:\s*([^\]]+)\]/)
         const files = filesMatch
-          ? filesMatch[1]!.split(",").map(f => f.trim()).filter(Boolean)
+          ? filesMatch[1]?.split(",").map(f => f.trim()).filter(Boolean) ?? []
           : []
         const description = body.replace(/\[files?:\s*[^\]]+\]/, "").trim()
         if (description) commands.push({ type: "intent", description, files })
@@ -353,7 +353,7 @@ function parseSocraticResponse(response: string): { commands: SupervisorCommand[
       case "share": {
         const shareFilesMatch = body.match(/\[files?:\s*([^\]]+)\]/)
         const shareFiles = shareFilesMatch
-          ? shareFilesMatch[1]!.split(",").map(f => f.trim()).filter(Boolean)
+          ? shareFilesMatch[1]?.split(",").map(f => f.trim()).filter(Boolean) ?? []
           : []
         const shareText = body.replace(/\[files?:\s*[^\]]+\]/, "").trim()
         // Default kind to "discovery" unless text starts with "LESSON:" or "OBSERVATION:"
@@ -419,7 +419,7 @@ function parseLegacyCommands(response: string): SupervisorCommand[] {
 
   const codeBlockMatch = cleaned.match(/```commands?\n([\s\S]*?)```/)
   const lines = codeBlockMatch
-    ? codeBlockMatch[1]!.split("\n")
+    ? codeBlockMatch[1]?.split("\n") ?? cleaned.split("\n")
     : cleaned.split("\n")
 
   let lastPrompt: { type: "prompt"; message: string } | null = null
@@ -463,7 +463,7 @@ function parseLegacyCommands(response: string): SupervisorCommand[] {
       const rest = trimmed.slice(7)
       const filesMatch = rest.match(/\[files?:\s*([^\]]+)\]/)
       const files = filesMatch
-        ? filesMatch[1]!.split(",").map(f => f.trim()).filter(Boolean)
+        ? filesMatch[1]?.split(",").map(f => f.trim()).filter(Boolean) ?? []
         : []
       const description = rest.replace(/\[files?:\s*[^\]]+\]/, "").trim()
       commands.push({ type: "intent", description, files })
@@ -1590,7 +1590,7 @@ Be specific with file paths, line numbers, and code snippets.`
               try {
                 // Collect new notes from this cycle
                 const newNotes = [
-                  ...((memory.projectNotes[agentName] ?? []).length > 0 ? [memory.projectNotes[agentName]!.slice(-1)[0]!] : []),
+                  ...((memory.projectNotes[agentName] ?? []).slice(-1)),
                   ...((memory.behavioralNotes?.[agentName] ?? []).slice(-2)),
                 ]
 

@@ -3007,6 +3007,17 @@ function appendEventToLog(evt) {
 // SSE auto-connects on page load
 setTimeout(() => { connectSSE() }, 1500)
 
+// Reconnect SSE immediately when page becomes visible after sleep/tab-switch
+document.addEventListener('visibilitychange', function() {
+  if (document.visibilityState !== 'visible') return
+  if (sseUserDisconnected) return
+  if (sseConnected) return // already connected — nothing to do
+  // Cancel any pending backoff and reconnect immediately
+  if (sseReconnectTimer) { clearTimeout(sseReconnectTimer); sseReconnectTimer = null }
+  sseReconnectDelay = SSE_BASE_DELAY
+  connectSSE()
+})
+
 // ---- Check for saved projects to restore ----
 setTimeout(async function() {
   try {

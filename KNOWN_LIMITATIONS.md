@@ -532,3 +532,23 @@ If the process crashes or loses power in that window:
 ### 27c. Accepted Risk
 
 The window is approximately 1-2 microseconds between `unlinkSync` and `renameSync`. This is orders of magnitude less likely than a crash during the much longer `Bun.write` that precedes it (which would leave the temp file but not affect the target). The consequences of loss are mild (no data corruption, just a fresh start). Alternatives that fully eliminate the window (double-write with verification, fsync before rename) add significant latency (5-50ms per write) to every persistence call, which occurs multiple times per supervisor cycle. The current approach is the correct tradeoff for the risk level.
+
+## §28 Dashboard UI: modals lack focus trapping
+
+### 28a. Limitation
+
+Modal dialogs (add project, annotation feedback, permission requests) do not trap keyboard focus. Pressing Tab while a modal is open cycles focus to background elements, and there is no `aria-modal` attribute.
+
+### 28b. Accepted Risk
+
+No known user workflow depends on keyboard-only modal interaction. The modals are primarily used with mouse input. Adding focus trapping and `aria-modal` would require a non-trivial overlay management layer. Accepted as low-priority accessibility debt.
+
+## §29 Dashboard UI: `aria-expanded` not toggled on project rows
+
+### 29a. Limitation
+
+Project detail rows use JS-driven expand/collapse, but the trigger elements do not update `aria-expanded` to reflect the current state.
+
+### 29b. Accepted Risk
+
+Screen reader users are the primary consumers of `aria-expanded`. The dashboard is a developer monitoring tool, not an end-user product. Adding `aria-expanded` is straightforward but low priority.

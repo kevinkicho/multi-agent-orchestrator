@@ -1370,3 +1370,11 @@ body.light .annotation-popup .ann-type label { color: #666; }
 body.light .annotation-toast { background: #e6f9ed; color: #16a34a; border-color: #16a34a; }
 body.light .empty-state h2 { color: #5b4bdf; }
 body.light .empty-state button { background: #5b4bdf; }
+
+:focus-visible {
+  outline: 2px solid #8b8bff;
+  outline-offset: 1px;
+}
+body.light :focus-visible {
+  outline-color: #5b4bdf;
+}

@@ -131,6 +131,22 @@ export async function startDashboard(
 
       // Require API token on all mutating requests
       if (req.method === "POST" || req.method === "PUT" || req.method === "DELETE") {
+        // Reject oversized or un-sized request bodies (1MB limit)
+        const contentLengthHeader = req.headers.get("content-length")
+        if (!contentLengthHeader) {
+          return Response.json(
+            { error: "Content-Length header required for mutating requests" },
+            { status: 411, headers: corsHeaders },
+          )
+        }
+        const contentLength = parseInt(contentLengthHeader, 10)
+        if (contentLength > 1_048_576) {
+          return Response.json(
+            { error: `Request body too large (${Math.round(contentLength / 1024 / 1024 * 10) / 10}MB). Maximum is 1MB.` },
+            { status: 413, headers: corsHeaders },
+          )
+        }
+
         const token = req.headers.get("x-api-token")
         if (token !== apiToken) {
           return Response.json(

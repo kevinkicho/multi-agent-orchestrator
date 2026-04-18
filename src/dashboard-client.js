@@ -494,6 +494,7 @@ function addLogEntry(logEl, className, html) {
 }
 
 function makeHeader(text, maxLen) {
+  if (text == null) return '(empty)'
   const firstLine = text.split('\n')[0].trim()
   if (firstLine.length <= maxLen) return firstLine
   return firstLine.slice(0, maxLen) + '...'
@@ -530,7 +531,7 @@ function setBadge(badge, status) {
     running: ['RUNNING', 'badge-running'],
     starting: ['STARTING', 'badge-starting'],
   }
-  const [text, cls] = map[status] || [status.toUpperCase(), 'badge-idle']
+  const [text, cls] = map[status] || [String(status ?? 'UNKNOWN').toUpperCase(), 'badge-idle']
   badge.textContent = text
   badge.className = 'agent-badge ' + cls
 }
@@ -629,6 +630,7 @@ function handleEvent(event) {
   }
 
   if (event.type === 'permission-request') {
+    if (!event.requestID) return
     notify(event.agent + ' needs permission', event.description || 'Review required')
     const agent = ensureAgent(event.agent)
     if (!agent) return
@@ -645,6 +647,7 @@ function handleEvent(event) {
   }
 
   if (event.type === 'permission-resolved') {
+    if (!event.requestID) return
     const id = 'perm-' + event.requestID.replace(/[^a-zA-Z0-9]/g, '_')
     const el = document.getElementById(id)
     if (el) {
@@ -787,6 +790,7 @@ function handleEvent(event) {
 
 // Fetch and apply status from backend
 function applyStatusData(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return
   for (const [name, info] of Object.entries(data)) {
     const agent = ensureAgent(name)
     if (!agent) continue
@@ -803,6 +807,7 @@ function applyStatusData(data) {
 
 // Fetch and apply project data (directives, projectIds, project status)
 function applyProjectData(projects) {
+  if (!Array.isArray(projects)) return
   for (const proj of projects) {
     const agent = projectRows[proj.agentName]
     if (!agent) continue
@@ -840,7 +845,7 @@ function setProjectStatus(badge, status) {
     stopped: ['FINISHED', 'badge-stopped'],
     error: ['ERROR', 'badge-error'],
   }
-  const [text, cls] = map[status] || [status.toUpperCase(), 'badge-idle']
+  const [text, cls] = map[status] || [String(status ?? 'UNKNOWN').toUpperCase(), 'badge-idle']
   if (!text) {
     badge.style.display = 'none'
   } else {
@@ -1092,6 +1097,7 @@ function fmtDuration(ms) {
 }
 
 function renderScoreBars(scores) {
+  if (!scores) return ''
   const dims = ['taskCompletion', 'codeQuality', 'correctness', 'progressEfficiency', 'overall']
   const labels = { taskCompletion: 'Task Completion', codeQuality: 'Code Quality', correctness: 'Correctness', progressEfficiency: 'Efficiency', overall: 'Overall' }
   let html = '<div style="display:flex;flex-direction:column;gap:4px;margin:8px 0;">'
@@ -1145,7 +1151,7 @@ function renderSessionCard(s, idx) {
   html += '<div class="analytics-detail" id="adetail-' + idx + '" style="display:none;margin-top:10px;border-top:1px solid #2a2a3a;padding-top:10px;">'
   if (s.evaluation) {
     html += renderScoreBars(s.evaluation.scores)
-    const fb = s.evaluation.feedback
+    const fb = s.evaluation.feedback || {}
     if (fb.summary) html += '<div style="font-size:11px;color:#ccc;margin:6px 0;">' + escapeHtml(fb.summary) + '</div>'
     if (fb.strengths?.length) {
       html += '<div style="font-size:10px;color:#4ade80;margin-top:4px;">Strengths:</div><ul style="font-size:10px;color:#aaa;margin:2px 0 4px 16px;">'
@@ -1712,6 +1718,7 @@ async function loadMemory(agentName) {
   el.innerHTML = '<em style="color:#555;">Loading memory...</em>'
   try {
     var res = await apiFetch('/api/memory/' + agentName)
+    if (!res.ok) throw new Error('HTTP ' + res.status)
     var data = await res.json()
     var html = ''
 
@@ -1789,6 +1796,7 @@ async function loadHistory(agentName) {
   histEl.innerHTML = '<div style="color:#666;font-size:10px;">Loading...</div>'
   try {
     const res = await fetch('/api/projects/' + agent.projectId + '/directive-history')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
     const history = await res.json()
     if (!history || history.length === 0) {
       histEl.innerHTML = '<div style="color:#666;font-size:10px;">No history yet.</div>'
@@ -2579,6 +2587,7 @@ var ollamaAvailableModels = [] // cached from /api/ollama-models
 async function refreshProviders() {
   try {
     const res = await apiFetch('/api/providers')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
     const data = await res.json()
     const container = document.getElementById('providers-list')
     if (!data.providers || data.providers.length === 0) {
@@ -2708,6 +2717,7 @@ async function refreshBusEvents() {
   if (typeFilter) url += '&type=' + encodeURIComponent(typeFilter)
   try {
     const res = await apiFetch(url)
+    if (!res.ok) throw new Error('HTTP ' + res.status)
     const events = await res.json()
     const container = document.getElementById('bus-events')
     const countEl = document.getElementById('bus-count')
@@ -2739,6 +2749,7 @@ async function refreshBusEvents() {
 async function refreshResources() {
   try {
     const res = await apiFetch('/api/resources/locks')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
     const data = await res.json()
     const llmEl = document.getElementById('llm-status')
     llmEl.innerHTML = '<span style="color:#8b5cf6;">LLM Slots:</span> ' +
@@ -2769,6 +2780,7 @@ async function refreshResources() {
 async function refreshIntents() {
   try {
     const res = await apiFetch('/api/resources/intents')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
     const data = await res.json()
     const container = document.getElementById('intents-list')
     const entries = Object.entries(data.intents)
@@ -2799,6 +2811,7 @@ async function refreshTeam() {
   const container = document.getElementById('team-content')
   try {
     const res = await fetch('/api/team/members')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
     const data = await res.json()
     if (!data.active) {
       container.innerHTML = '<em style="color:#555;">Team mode is not active. Start with "team-loop" command to enable.</em>'

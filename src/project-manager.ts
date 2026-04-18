@@ -359,7 +359,10 @@ export class ProjectManager {
           await restoreAgentMemory(agentName, resolvedDir)
           this.dashLog.push({ type: "brain-thinking", text: `Restored archived memory for ${agentName}` })
         }
-      } catch {}
+      } catch (err) {
+        console.error(`[project-manager] Failed to restore archived memory for ${agentName}:`, err)
+        this.dashLog.push({ type: "brain-thinking", text: `WARNING: Failed to restore archived memory for ${agentName}: ${err}` })
+      }
 
       this.dashLog.push({ type: "brain-thinking", text: `${projectName} agent ready. Starting supervisor...` })
 
@@ -903,6 +906,7 @@ export class ProjectManager {
     }
     writeJsonFile(resolve(process.cwd(), PROJECTS_FILE), data).catch(err => {
       console.error(`[project-manager] Failed to save projects file: ${err}`)
+      this.dashLog.push({ type: "brain-thinking", text: `WARNING: Failed to persist project state to disk. In-memory state may diverge from saved state on restart: ${err}` })
     })
   }
 

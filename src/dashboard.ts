@@ -147,7 +147,8 @@ export async function startDashboard(
       // SSE endpoint — long-poll style to avoid Bun chunked encoding issues
       if (url.pathname === "/api/events") {
         // Get cursor from query param (absolute index, survives history trimming)
-        const since = parseInt(url.searchParams.get("since") ?? "0", 10)
+        const sinceRaw = parseInt(url.searchParams.get("since") ?? "0", 10)
+        const since = Number.isNaN(sinceRaw) ? 0 : sinceRaw
         const { events: missed, cursor: newCursor } = log.getEventsSince(since)
 
         // If client is behind, send all missed events immediately

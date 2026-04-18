@@ -1463,12 +1463,17 @@ Be specific with file paths, line numbers, and code snippets.`
                   stderr: "pipe",
                 })
 
+                // Kill subprocess on supervisor abort to prevent orphaned processes
+                const onAbort = () => { try { proc.kill() } catch {} }
+                config.signal?.addEventListener("abort", onAbort, { once: true })
+
                 const timeoutId = setTimeout(() => { proc.kill() }, timeoutMs)
                 const [valStdout, valStderr] = await Promise.all([
                   new Response(proc.stdout).text(),
                   new Response(proc.stderr).text(),
                 ])
                 clearTimeout(timeoutId)
+                config.signal?.removeEventListener("abort", onAbort)
 
                 const exitCode = await proc.exited
                 const passed = exitCode === 0

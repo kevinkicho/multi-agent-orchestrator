@@ -515,3 +515,20 @@ The counter works alongside ResourceManager's global rate-limit cooldown, which 
 ### 26d. Tradeoff: No Distinction Between Provider-Down and Burst-Limit
 
 The counter doesn't distinguish between "provider entirely down" (infinite 429s) and "burst limit exceeded" (temporary 429s followed by recovery). A persistent counter treats both the same — it grows on every 429 and only shrinks on success. For a truly down provider, the counter caps at 10 (5-minute inter-cycle pause) and the supervisor keeps trying indefinitely, which is correct behavior. For a burst limit, the decay ensures rapid recovery once the quota resets.
+
+## 27. Session State and File Write Atomicity on Windows
+
+### 27a. Behavior
+
+`atomicWrite` (used by all JSON persistence — session state, projects, memory, shared knowledge) writes to a temp file, then replaces the target. On POSIX systems, `renameSync` atomically replaces the target. On Windows, `renameSync` cannot overwrite an existing file, so `atomicWrite` first deletes the target with `unlinkSync`, then renames. This creates a ~1-2 microsecond window where neither the old nor the new file exists at the target path.
+
+### 27b. Consequence
+
+If the process crashes or loses power in that window:
+- `.orchestrator-session.json` is lost — crash detection returns `{ crashed: false, state: null }` on next startup, and the supervisor starts fresh with no recovery prompt.
+- `.orchestrator-projects.json` is lost — projects aren't restored, the user must re-add them.
+- `.orchestrator-memory.json` or `.orchestrator-shared.json` is lost — agent memory and shared knowledge are reset.
+
+### 27c. Accepted Risk
+
+The window is approximately 1-2 microseconds between `unlinkSync` and `renameSync`. This is orders of magnitude less likely than a crash during the much longer `Bun.write` that precedes it (which would leave the temp file but not affect the target). The consequences of loss are mild (no data corruption, just a fresh start). Alternatives that fully eliminate the window (double-write with verification, fsync before rename) add significant latency (5-50ms per write) to every persistence call, which occurs multiple times per supervisor cycle. The current approach is the correct tradeoff for the risk level.

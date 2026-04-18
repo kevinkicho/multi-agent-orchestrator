@@ -438,3 +438,31 @@ Memory and conversation checkpoint write failures are surfaced to the `dashboard
 The `console.error` calls that accompany each dashboard push provide server-side console output, but these are ephemeral unless the operator has configured process stdout capture (e.g., systemd journal, PM2 logs). A write failure means the supervisor continues operating with stale memory — it may make decisions based on outdated information without realizing it.
 
 **Mitigation:** Operators should monitor the dashboard for `WARNING:` prefixed messages. A future improvement could write failure records to a persistent error log file or integrate with structured logging.
+
+## 24. Progress Assessment — Deterministic Signal Processing for Directive Evolution
+
+### 24a. Behavior
+
+After each supervisor cycle, `assessProgress()` computes a structured assessment from git diff stats, validation results, behavioral notes, and directive change tracking. The assessment produces:
+
+- A `[PROGRESS]` block summarizing the cycle: files changed, lines added/removed, validation pass/fail, behavioral notes, trend indicator (improving/declining/stable/stalled), and whether the directive changed
+- A `[DIRECTION]` suggestion block (when heuristics match): rule-based recommendations like "3 cycles with no changes — consider pivoting" or "validation failing consistently — simplify the directive"
+
+Both blocks are injected into the supervisor's system prompt at the start of the next cycle, before the directive. Assessments are persisted in `progressAssessments` in brain memory (capped at 10 per agent) and used for trend computation across recent cycles.
+
+### 24b. Tradeoff: Deterministic, Not Evaluative
+
+The progress assessor is deterministic signal processing — it detects patterns (no changes, failing tests, stagnant directive) but cannot assess qualitative aspects of code changes (whether a refactoring improved maintainability, whether a new feature adds user value, whether code is well-structured). It gives the LLM supervisor a compass (trend data + heuristic suggestions) but not a map (understanding of *why* the trend exists or *what* specific change would be most valuable).
+
+**Ruled out:** LLM-based evaluation (calling an LLM to assess cycle quality) because it would add latency and cost per cycle. The deterministic signals from git diffs and validation results are sufficient for steering directive evolution — the LLM supervisor itself provides the qualitative reasoning when it reads the `[PROGRESS]` and `[DIRECTION]` blocks and decides whether to use `@directive`.
+
+### 24c. Trend Window
+
+The trend indicator uses a window of the last 3 cycles. This means:
+- **Short-lived fluctuations** (1-2 bad cycles followed by recovery) will be reflected as "declining" or "improving" trends, which may be noise
+- **Gradual drifts** that span more than 3 cycles will only be partially captured — the trend shows recent direction, not long-term trajectory
+- **Missing cycles** (crashes, restarts) create gaps in the assessment history, so the trend may skip over important context
+
+### 24d. Heuristic Coverage
+
+The current heuristics cover: stalled cycles (no changes), declining validation, improving validation with stable directive, large uncommitted changes, stable directive for 5+ cycles, stuck-sounding behavioral notes, and committed-but-no-delta patterns. They do **not** cover: security vulnerability patterns, performance regressions, test coverage trends, dependency drift, or user satisfaction signals. These would require different evaluation mechanisms (static analysis, benchmarking, telemetry) that are outside the scope of deterministic git-based assessment.

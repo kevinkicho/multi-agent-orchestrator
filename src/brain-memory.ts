@@ -3,6 +3,7 @@ import { mkdirSync } from "fs"
 import { createHash } from "crypto"
 import { readJsonFile, writeJsonFile } from "./file-utils"
 import { readFileOrNull } from "./file-utils"
+import type { ProgressAssessment } from "./progress-assessor"
 
 export type BrainMemoryEntry = {
   timestamp: number
@@ -20,6 +21,8 @@ export type BrainMemoryStore = {
   projectNotes: Record<string, string[]>
   /** Behavioral notes about how agents work best (injected into supervisor system prompts) */
   behavioralNotes?: Record<string, string[]>
+  /** Per-agent progress assessments from the progress assessor, cap 10 each */
+  progressAssessments?: Record<string, ProgressAssessment[]>
 }
 
 export type AgentMemoryArchive = {
@@ -234,6 +237,41 @@ export async function addBehavioralNote(
     await saveBrainMemory(result)
     return result
   })
+}
+
+// ---------------------------------------------------------------------------
+// Progress assessment persistence
+// ---------------------------------------------------------------------------
+
+const MAX_ASSESSMENT_RECORDS = 10
+
+export async function saveProgressAssessment(
+  _store: BrainMemoryStore,
+  agentName: string,
+  assessment: ProgressAssessment,
+): Promise<BrainMemoryStore> {
+  return withWriteLock(async () => {
+    const fresh = await loadBrainMemory()
+    const existing = fresh.progressAssessments?.[agentName] ?? []
+    const updated = [...existing, assessment].slice(-MAX_ASSESSMENT_RECORDS)
+
+    const result: BrainMemoryStore = {
+      ...fresh,
+      progressAssessments: {
+        ...(fresh.progressAssessments ?? {}),
+        [agentName]: updated,
+      },
+    }
+    await saveBrainMemory(result)
+    return result
+  })
+}
+
+export function getProgressAssessments(
+  store: BrainMemoryStore,
+  agentName: string,
+): ProgressAssessment[] {
+  return store.progressAssessments?.[agentName] ?? []
 }
 
 // ---------------------------------------------------------------------------

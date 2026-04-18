@@ -7,6 +7,8 @@ import {
   addProjectNote,
   addBehavioralNote,
   formatMemoryForPrompt,
+  saveProgressAssessment,
+  getProgressAssessments,
 } from "./brain-memory"
 import { extractLastAssistantText, formatRecentMessages, trimConversation } from "./message-utils"
 import { logPerformance } from "./performance-log"
@@ -20,6 +22,7 @@ import type { EventBus, BusEvent, BusPattern } from "./event-bus"
 import type { ResourceManager } from "./resource-manager"
 import type { TokenTracker } from "./token-tracker"
 import { saveConversationCheckpoint, loadConversationCheckpoint, clearConversationCheckpoint } from "./conversation-checkpoint"
+import { assessProgress, parseGitDiffStat, addAssessmentRecord, type AssessmentRecord, type ValidationResult } from "./progress-assessor"
 import {
   type NudgeState, createNudgeState, resetNudge,
   buildEmptyNudge, buildNoParseNudge, fuzzyExtractCommands,
@@ -190,6 +193,9 @@ ${reviewAction}
 - @directive: <text> — Evolve the project direction as understanding deepens.
 - @broadcast: <text> — Send a message to all other supervisors.
 - @intent: <description> [files: f1, f2] — Declare planned work to avoid conflicts with other agents.
+
+### Progress signals
+After each cycle, you'll see a [PROGRESS] block summarizing what changed (files, tests, behavioral notes) and a trend indicator (improving, declining, stable, stalled). You may also see a [DIRECTION] suggestion — these are rule-based recommendations based on patterns across recent cycles (e.g., "3 cycles with no changes — consider pivoting"). Use these signals to inform your @directive decisions. You are not required to follow [DIRECTION] suggestions, but they represent patterns that experienced supervisors have found useful.
 
 ### Cycle control
 - @done: <summary> — End this cycle. Summary must be specific: what was accomplished, what's next.
@@ -728,6 +734,8 @@ export async function runAgentSupervisor(
     const cycleStartTime = Date.now()
     const injectedEventIds = new Set<string>() // Dedup urgent bus events within a cycle
     let cycleStartCommit = "" // Capture commit at cycle start for false-progress detection
+    let directiveChangedThisCycle = false // Track if @directive was used this cycle
+    let cycleValidationResult: { passed: boolean; command: string; exitCode: number; stdoutPreview: string } | null = null
     try { cycleStartCommit = await gitLatestCommit(directory) } catch { /* not a git repo */ }
     emit(`\n===== ${agentName} — CYCLE ${cycleCount} =====\n`)
     config.eventBus?.emit({
@@ -793,6 +801,15 @@ export async function runAgentSupervisor(
       ? `\n## Worker capabilities\n${agentCapabilities}\nKeep these in mind when thinking about what to ask the worker to do.`
       : ""
 
+    // Build progress assessment from previous cycles
+    const previousAssessments = getProgressAssessments(memory, agentName)
+    const progressBlock = previousAssessments.length > 0
+      ? "\n" + previousAssessments[previousAssessments.length - 1]!.assessmentText +
+        (previousAssessments[previousAssessments.length - 1]!.suggestionText
+          ? "\n" + previousAssessments[previousAssessments.length - 1]!.suggestionText
+          : "")
+      : ""
+
     const initialContent = [
       statusLine,
       memoryContext ? `\n## Memory from previous cycles\n${memoryContext}` : "",
@@ -801,6 +818,7 @@ export async function runAgentSupervisor(
       intentBlock,
       capabilityBlock,
       `\nDirective: ${directive}`,
+      progressBlock,
       isResume
         ? `\nThis is cycle #${cycleCount} (resuming). Start by understanding where things stand before deciding what to do next.`
         : `\nThis is cycle #${cycleCount}. Start by checking in with the worker (@check), then think about the best path forward.`,
@@ -1262,6 +1280,7 @@ Be specific with file paths, line numbers, and code snippets.`
 
           case "directive": {
             directive = cmd.text
+            directiveChangedThisCycle = true
             // Also update directiveRef so TeamManager (or any external reader) sees the change
             if (config.directiveRef) config.directiveRef.value = cmd.text
             config.onDirectiveUpdate?.(cmd.text)
@@ -1387,6 +1406,7 @@ Be specific with file paths, line numbers, and code snippets.`
 
                 const exitCode = await proc.exited
                 const passed = exitCode === 0
+                cycleValidationResult = { passed, command: val.command, exitCode, stdoutPreview: valStdout.slice(0, 500) }
                 const resultText = `[VALIDATION] POST-CYCLE ${passed ? "PASSED" : "FAILED"} (exit ${exitCode}):\n${valStdout.slice(0, 2000)}${valStderr ? "\nSTDERR: " + valStderr.slice(0, 1000) : ""}`
 
                 emit(resultText)
@@ -1480,6 +1500,58 @@ Be specific with file paths, line numbers, and code snippets.`
 
             // Clear intent on cycle end — agent will re-declare next cycle
             config.resourceManager?.clearIntent(agentName)
+
+            // --- Progress assessment ---
+            // Compute structured progress assessment for directive evolution
+            if (cycleDone) {
+              try {
+                // Collect new notes from this cycle
+                const newNotes = [
+                  ...((memory.projectNotes[agentName] ?? []).length > 0 ? [memory.projectNotes[agentName]!.slice(-1)[0]!] : []),
+                  ...((memory.behavioralNotes?.[agentName] ?? []).slice(-2)),
+                ]
+
+                // Get git delta for this cycle
+                let assessmentDelta: AssessmentRecord["gitDelta"] = { filesChanged: [], linesAdded: 0, linesRemoved: 0, isEmpty: true, hasNewCommits: false }
+                try {
+                  const diffResult = await gitDiffStat(directory)
+                  const latest = await gitLatestCommit(directory)
+                  assessmentDelta = parseGitDiffStat(diffResult.summary, cycleStartCommit !== "" && latest !== cycleStartCommit)
+                } catch { /* git unavailable — use empty delta */ }
+
+                // Build previous assessment records for trend computation
+                const prevRecords: AssessmentRecord[] = (getProgressAssessments(memory, agentName) ?? []).map(a => ({
+                  cycleNumber: a.cycleNumber,
+                  gitDelta: a.gitDelta,
+                  validation: a.validation,
+                  directiveChanged: a.directiveChanged,
+                  notesCount: a.newNotes.length,
+                }))
+
+                const assessment = assessProgress(
+                  cycleCount,
+                  assessmentDelta,
+                  cycleValidationResult,
+                  newNotes,
+                  directiveChangedThisCycle,
+                  prevRecords,
+                )
+
+                // Save assessment to brain memory
+                memory = await saveProgressAssessment(memory, agentName, assessment)
+                emit(`[progress] ${assessment.assessmentText}`)
+                config.dashboardLog?.push({
+                  type: "supervisor-thinking",
+                  agent: agentName,
+                  text: assessment.assessmentText,
+                })
+                if (assessment.suggestionText) {
+                  emit(`[direction] ${assessment.suggestionText}`)
+                }
+              } catch (err) {
+                console.error(`[${agentName}] Failed to compute progress assessment:`, err)
+              }
+            }
 
             // Emit cycle-done bus event
             config.eventBus?.emit({

@@ -9,6 +9,7 @@ import { spawn, type Subprocess } from "bun"
 import { existsSync, readFileSync } from "fs"
 import { resolve } from "path"
 import type { AgentConfig } from "./agent"
+import { resolveOpencode, buildOpencodeSpawnCmd, type OpencodeLaunch } from "./opencode-runtime"
 
 type LauncherConfig = {
   agents: (AgentConfig & { model?: string })[]
@@ -30,11 +31,6 @@ function loadConfig(): LauncherConfig {
   }
   throw new Error("No orchestrator.json found")
 }
-
-const OPENCODE_BASE = process.env.OPENCODE_DIR
-  ? resolve(process.env.OPENCODE_DIR)
-  : resolve(import.meta.dirname, "..", "..", "opencode")
-const OPENCODE_ENTRY = resolve(OPENCODE_BASE, "src", "index.ts")
 
 function extractPort(url: string): number {
   try {
@@ -65,11 +61,15 @@ async function main() {
   console.log("[launcher] === OpenCode Orchestrator Launcher ===")
   console.log(`[launcher] Starting ${config.agents.length} serve instances...\n`)
 
-  // Verify opencode entry point exists
-  if (!existsSync(OPENCODE_ENTRY)) {
-    console.error(`[launcher] Cannot find opencode at ${OPENCODE_ENTRY}`)
+  // Resolve opencode binary (or source checkout via OPENCODE_DIR)
+  let launch: OpencodeLaunch
+  try {
+    launch = resolveOpencode()
+  } catch (err) {
+    console.error(`[launcher] ${(err as Error).message}`)
     process.exit(1)
   }
+  console.log(`[launcher] Using opencode ${launch.mode === "binary" ? `binary at ${launch.bin}` : `source at ${launch.cwd}`}\n`)
 
   // Launch serve instances
   for (const agent of config.agents) {
@@ -81,17 +81,7 @@ async function main() {
 
     console.log(`[launcher] Starting ${agent.name} on port ${port}...`)
     const proc = spawn({
-      cmd: [
-        "bun",
-        "run",
-        "--cwd",
-        OPENCODE_BASE,
-        "--conditions=browser",
-        OPENCODE_ENTRY,
-        "serve",
-        "--port",
-        String(port),
-      ],
+      cmd: buildOpencodeSpawnCmd(launch, port),
       stdout: "pipe",
       stderr: "pipe",
       env: {

@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@opencode-ai/sdk": "^1.4.6",
+    "opencode-ai": "^1.4.11",
     "zod": "^4.1.8"
   },
   "devDependencies": {

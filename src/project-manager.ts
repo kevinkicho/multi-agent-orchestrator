@@ -1,7 +1,7 @@
 import { spawn, type Subprocess } from "bun"
 import { existsSync, readdirSync, statSync } from "fs"
 import { resolve, basename } from "path"
-import { homedir, platform } from "os"
+import { platform } from "os"
 import type { Orchestrator } from "./orchestrator"
 import type { DashboardLog } from "./dashboard"
 import { runAgentSupervisor, type ValidationPreset } from "./supervisor"
@@ -170,22 +170,8 @@ export function listDirectories(dirPath: string): Array<{ name: string; path: st
 // ProjectManager
 // ---------------------------------------------------------------------------
 
-// Resolve opencode location — override with OPENCODE_DIR env var, or auto-detect from common locations
-function findOpencodeDir(): string {
-  if (process.env.OPENCODE_DIR) return resolve(process.env.OPENCODE_DIR)
-  const candidates = [
-    resolve(import.meta.dirname, "..", "..", "opencode"),                          // sibling to orchestrator
-    resolve(import.meta.dirname, "..", "..", "opencode", "packages", "opencode"),  // monorepo layout
-    resolve(homedir(), "Desktop", "opencode", "packages", "opencode"),            // Desktop monorepo
-    resolve(homedir(), "Desktop", "opencode"),                                     // Desktop flat
-  ]
-  for (const dir of candidates) {
-    if (existsSync(resolve(dir, "src", "index.ts"))) return dir
-  }
-  return candidates[0]! // fall back to sibling (will error with clear message later)
-}
-const OPENCODE_DIR = findOpencodeDir()
-const OPENCODE_ENTRY = resolve(OPENCODE_DIR, "src", "index.ts")
+import { getOpencodeLaunch, buildOpencodeSpawnCmd } from "./opencode-runtime"
+
 const PROJECTS_FILE = "orchestrator-projects.json"
 
 export class ProjectManager {
@@ -287,19 +273,9 @@ export class ProjectManager {
 
     try {
       // Spawn opencode serve instance
-      if (!existsSync(OPENCODE_ENTRY)) {
-        throw new Error(`Cannot find opencode at ${OPENCODE_ENTRY}`)
-      }
-
+      const launch = getOpencodeLaunch()
       const proc = spawn({
-        cmd: [
-          "bun", "run",
-          "--cwd", OPENCODE_DIR,
-          "--conditions=browser",
-          OPENCODE_ENTRY,
-          "serve",
-          "--port", String(port),
-        ],
+        cmd: buildOpencodeSpawnCmd(launch, port),
         stdout: "pipe",
         stderr: "pipe",
         env: {

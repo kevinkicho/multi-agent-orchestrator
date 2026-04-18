@@ -2,7 +2,20 @@
 
 Orchestrate multiple AI coding agents with LLM-driven task planning, real-time supervision, and a live web dashboard.
 
-Multi-Agent Orchestrator spawns and manages multiple [opencode](https://github.com/nicepkg/opencode) instances as headless coding agents, each working on a separate project directory. A local LLM (via [Ollama](https://ollama.ai/) or cloud providers) acts as a "brain" that plans tasks, reviews agent output, and coordinates work across all agents autonomously.
+Multi-Agent Orchestrator spawns and manages multiple [opencode](https://github.com/sst/opencode) instances as headless coding agents, each working on a separate project directory. A local LLM (via [Ollama](https://ollama.ai/) or cloud providers) acts as a "brain" that plans tasks, reviews agent output, and coordinates work across all agents autonomously.
+
+> **Unofficial orchestration layer for opencode.** Opencode is distributed as the [`opencode-ai`](https://www.npmjs.com/package/opencode-ai) npm package and is a regular dependency of this repo — `bun install` installs the opencode binary into `node_modules/.bin/`. No separate clone or global install is required.
+
+## Quick Start
+
+```bash
+git clone https://github.com/kevinkicho/multi-agent-orchestrator.git
+cd multi-agent-orchestrator
+bun install
+bun run dev
+```
+
+Advanced: if you're hacking on opencode itself and want to run against a local source checkout, set `OPENCODE_DIR` to the checkout path and the orchestrator will launch from source instead of the bundled binary.
 
 ## Table of Contents
 
@@ -152,9 +165,10 @@ Each project gets:
 ## Prerequisites
 
 - **[Bun](https://bun.sh/)** -- JavaScript runtime (v1.0+)
-- **[opencode](https://github.com/nicepkg/opencode)** -- AI coding assistant with `serve` mode. Set `OPENCODE_DIR` environment variable to the opencode project root, or place it as a sibling directory.
 - **[Ollama](https://ollama.ai/)** -- Local LLM inference server. Other cloud providers (OpenAI, Anthropic, etc.) can also be configured.
 - **An Ollama model** -- Default is `glm-5.1:cloud`. Pull it with `ollama pull glm-5.1:cloud` or configure a different model.
+
+Opencode itself is installed automatically as an npm dependency (`opencode-ai`) during `bun install` — no separate install step is needed.
 
 ---
 
@@ -215,7 +229,7 @@ Configuration is loaded from `orchestrator.json` in the project root:
 
 | Variable | Description |
 |----------|-------------|
-| `OPENCODE_DIR` | Path to the opencode project root. Defaults to `../../opencode` relative to the orchestrator. |
+| `OPENCODE_DIR` | Optional. Path to an opencode **source checkout** for running from TypeScript source (fork development). When unset, the orchestrator uses the `opencode-ai` npm package binary from `node_modules/.bin`. |
 | `OPENCODE_PROJECT_DIR` | Set automatically per agent process to scope each opencode instance to its project directory. |
 
 ---

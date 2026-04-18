@@ -46,7 +46,7 @@ export class DashboardLog {
       this.baseOffset += trimCount
     }
     for (const listener of this.listeners) {
-      listener(event)
+      try { listener(event) } catch (err) { console.error('[dashboard] Event listener error:', err) }
     }
   }
 
@@ -159,6 +159,8 @@ export async function startDashboard(
       if (req.method === "OPTIONS") {
         return new Response(null, { headers: corsHeaders })
       }
+
+      try {
 
       // SSE endpoint — long-poll style to avoid Bun chunked encoding issues
       if (url.pathname === "/api/events") {
@@ -1149,6 +1151,13 @@ export async function startDashboard(
       }
 
       return new Response("Not Found", { status: 404, headers: corsHeaders })
+      } catch (err) {
+        console.error(`[dashboard] Unhandled error on ${req.method} ${url.pathname}:`, err)
+        return Response.json(
+          { error: "Internal server error", detail: err instanceof Error ? err.message : String(err) },
+          { status: 500, headers: corsHeaders },
+        )
+      }
     },
   })
 

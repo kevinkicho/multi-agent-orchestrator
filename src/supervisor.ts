@@ -2,6 +2,7 @@ import type { Orchestrator } from "./orchestrator"
 import type { DashboardLog } from "./dashboard"
 import { chatCompletion, chatCompletionWithUsage, warmupModel } from "./brain"
 import {
+  type BrainMemoryStore,
   loadBrainMemory,
   addMemoryEntry,
   addProjectNote,
@@ -771,7 +772,13 @@ export async function runAgentSupervisor(
       directive, status: "running", updatedAt: Date.now(),
     }).catch(err => console.error(`[${agentName}] Failed to checkpoint supervisor state: ${err}`))
 
-    let memory = await loadBrainMemory()
+    let memory: BrainMemoryStore
+    try {
+      memory = await loadBrainMemory()
+    } catch (err) {
+      emit(`WARNING: Failed to load brain memory, starting with empty store: ${err instanceof Error ? err.message : String(err)}`)
+      memory = { entries: [], agentEntries: {}, projectNotes: {} }
+    }
     const memoryContext = formatMemoryForPrompt(memory, agentName)
 
     // Extract behavioral notes for this agent to inject into system prompt

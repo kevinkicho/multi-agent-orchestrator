@@ -127,3 +127,58 @@ export async function gitIsClean(cwd: string): Promise<boolean> {
   const output = await gitExec(cwd, "status", "--porcelain")
   return output === ""
 }
+
+/** Get URL for a named remote (default origin), or null if the remote isn't configured. */
+export async function gitRemoteUrl(cwd: string, remote = "origin"): Promise<string | null> {
+  try {
+    const url = await gitExec(cwd, "remote", "get-url", remote)
+    return url.trim() || null
+  } catch {
+    return null
+  }
+}
+
+/** Check if a local branch with the given name exists. */
+export async function gitBranchExists(cwd: string, branch: string): Promise<boolean> {
+  try {
+    await gitExec(cwd, "rev-parse", "--verify", `refs/heads/${branch}`)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Check if a branch exists on the named remote. */
+export async function gitRemoteBranchExists(cwd: string, branch: string, remote = "origin"): Promise<boolean> {
+  try {
+    const output = await gitExec(cwd, "ls-remote", "--heads", remote, branch)
+    return output.trim().length > 0
+  } catch {
+    return false
+  }
+}
+
+/** List local branches matching an optional glob pattern (e.g. `agent/foo-*`).
+ *  Returns an empty array if the pattern matches nothing or git is unavailable. */
+export async function gitListBranches(cwd: string, pattern?: string): Promise<string[]> {
+  try {
+    const args = ["branch", "--list", "--format=%(refname:short)"]
+    if (pattern) args.push(pattern)
+    const output = await gitExec(cwd, ...args)
+    return output.split("\n").map(s => s.trim()).filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+/** Count commits on `head` that are not on `base` (i.e. how far `head` is ahead of `base`).
+ *  Returns 0 if either ref is missing or the comparison fails. */
+export async function gitCommitsAhead(cwd: string, base: string, head: string): Promise<number> {
+  try {
+    const output = await gitExec(cwd, "rev-list", "--count", `${base}..${head}`)
+    const n = parseInt(output.trim(), 10)
+    return Number.isFinite(n) ? n : 0
+  } catch {
+    return 0
+  }
+}

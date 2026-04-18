@@ -9,7 +9,20 @@ import { readJsonFile, writeJsonFile } from "./file-utils"
 import { formatThought, C } from "./tui-format"
 import { createPauseState, requestPause, requestResume, type PauseState } from "./pause-service"
 import { clearAgentKnowledge } from "./shared-knowledge"
-import { gitExec, gitCurrentBranch, gitCreateBranch, gitCheckout, gitMerge, gitDeleteBranch, gitForceDeleteBranch } from "./git-utils"
+import {
+  gitExec,
+  gitCurrentBranch,
+  gitCreateBranch,
+  gitCheckout,
+  gitMerge,
+  gitDeleteBranch,
+  gitForceDeleteBranch,
+  gitRemoteUrl,
+  gitBranchExists,
+  gitRemoteBranchExists,
+  gitCommitsAhead,
+} from "./git-utils"
+import { isOrchestratorRepo, canonicalAgentName } from "./repo-identity"
 import type { EventBus } from "./event-bus"
 import type { ResourceManager } from "./resource-manager"
 import { archiveAgentMemory, hasAgentArchive, restoreAgentMemory } from "./brain-memory"
@@ -73,8 +86,20 @@ export type ProjectState = {
   pausedAt?: number
   /** Git branch this agent works on (for branch isolation) */
   agentBranch?: string
+  /** Base branch the agent branch was cut from — used as merge target and for unmerged-work detection. */
+  baseBranch?: string
   /** Post-cycle validation config */
   postCycleValidation?: { command?: string; preset?: ValidationPreset; timeoutMs?: number; failAction?: "warn" | "inject" | "pause" }
+}
+
+/** Optional knobs passed to addProject. Any callers that don't set these get
+ *  the previous behavior — except `allowSelfIngest` which defaults to false
+ *  (new guard refuses to add the orchestrator's own repo). */
+export type AddProjectOptions = {
+  /** Branch to cut the agent branch off of. Falls back to current HEAD when absent. */
+  baseBranch?: string
+  /** Permit adding the orchestrator's own repo. Default false. */
+  allowSelfIngest?: boolean
 }
 
 type SavedProjects = {
@@ -84,6 +109,7 @@ type SavedProjects = {
     directive: string
     model?: string
     directiveHistory?: DirectiveHistoryEntry[]
+    baseBranch?: string
   }>
 }
 
@@ -207,7 +233,13 @@ export class ProjectManager {
 
   /** Add a project: spawns a worker agent and starts its supervisor.
    *  Uses a promise-chain mutex so concurrent mutations queue up instead of racing. */
-  async addProject(directory: string, directive: string, name?: string, restoreHistory?: DirectiveHistoryEntry[]): Promise<ProjectState> {
+  async addProject(
+    directory: string,
+    directive: string,
+    name?: string,
+    restoreHistory?: DirectiveHistoryEntry[],
+    opts?: AddProjectOptions,
+  ): Promise<ProjectState> {
     let resolve!: () => void
     const nextLock = new Promise<void>(r => { resolve = r })
     const prev = this.projectLock
@@ -217,21 +249,44 @@ export class ProjectManager {
     await prev
 
     try {
-      return await this._addProjectInner(directory, directive, name, restoreHistory)
+      return await this._addProjectInner(directory, directive, name, restoreHistory, opts)
     } finally {
       resolve()
     }
   }
 
-  private async _addProjectInner(directory: string, directive: string, name?: string, restoreHistory?: DirectiveHistoryEntry[]): Promise<ProjectState> {
+  private async _addProjectInner(
+    directory: string,
+    directive: string,
+    name?: string,
+    restoreHistory?: DirectiveHistoryEntry[],
+    opts?: AddProjectOptions,
+  ): Promise<ProjectState> {
     const resolvedDir = resolve(directory)
     if (!existsSync(resolvedDir)) {
       throw new Error(`Directory does not exist: ${resolvedDir}`)
     }
 
+    // Self-ingest guard — refuse to add the orchestrator's own repo unless explicitly opted in.
+    // Protects against a confusing state where the orchestrator creates agent branches
+    // inside its own working tree (see KNOWN_LIMITATIONS "Self-ingest guard").
+    if (!opts?.allowSelfIngest) {
+      const isSelf = await isOrchestratorRepo(resolvedDir, {
+        getOriginUrl: (cwd) => gitRemoteUrl(cwd),
+      })
+      if (isSelf) {
+        throw new Error(
+          `Refusing to add ${resolvedDir}: it is the orchestrator's own repo. ` +
+          `Pass allowSelfIngest=true only if you really mean to run the orchestrator on itself.`,
+        )
+      }
+    }
+
     const projectName = name || basename(resolvedDir)
     const id = `proj-${++this.idCounter}`
-    let agentName = projectName.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-")
+    let agentName = await canonicalAgentName(resolvedDir, projectName, {
+      getOriginUrl: (cwd) => gitRemoteUrl(cwd),
+    })
 
     // Check for duplicate directory — clean up dead entries, block truly active ones
     for (const [existingId, p] of this.projects.entries()) {
@@ -310,20 +365,48 @@ export class ProjectManager {
       try {
         const currentBranch = await gitCurrentBranch(resolvedDir)
         const branchName = `agent/${agentName}`
+
+        // Resolve the base branch: explicit option wins; otherwise fall back to current HEAD.
+        // If the requested base isn't present locally, try to materialize it from origin.
+        let fromBranch = currentBranch
+        const requestedBase = opts?.baseBranch?.trim()
+        if (requestedBase) {
+          if (await gitBranchExists(resolvedDir, requestedBase)) {
+            fromBranch = requestedBase
+          } else if (await gitRemoteBranchExists(resolvedDir, requestedBase)) {
+            await gitExec(resolvedDir, "fetch", "origin", `${requestedBase}:${requestedBase}`).catch(() => {})
+            if (await gitBranchExists(resolvedDir, requestedBase)) {
+              fromBranch = requestedBase
+              this.dashLog.push({ type: "brain-thinking", text: `Fetched ${requestedBase} from origin for ${projectName}` })
+            } else {
+              this.dashLog.push({
+                type: "brain-thinking",
+                text: `Requested base branch ${requestedBase} not available — branching from ${currentBranch} instead`,
+              })
+            }
+          } else {
+            this.dashLog.push({
+              type: "brain-thinking",
+              text: `Requested base branch ${requestedBase} not found locally or on origin — branching from ${currentBranch} instead`,
+            })
+          }
+        }
+
         // Delete stale branch if it already exists (from a previous run that wasn't cleaned up)
         const existingBranches = await gitExec(resolvedDir, "branch", "--list", branchName).catch(() => "")
         if (existingBranches.trim()) {
           await gitForceDeleteBranch(resolvedDir, branchName).catch(() => {})
         }
-        await gitCreateBranch(resolvedDir, branchName, currentBranch)
+        await gitCreateBranch(resolvedDir, branchName, fromBranch)
         project.agentBranch = branchName
-        this.dashLog.push({ type: "brain-thinking", text: `Created branch ${branchName} for ${projectName}` })
+        project.baseBranch = fromBranch
+        this.dashLog.push({ type: "brain-thinking", text: `Created branch ${branchName} from ${fromBranch} for ${projectName}` })
         this.eventBus?.emit({
           type: "branch-created",
           source: "project-manager",
           agentName,
           projectId: id,
-          data: { branch: branchName, from: currentBranch },
+          data: { branch: branchName, from: fromBranch },
         })
       } catch (err) {
         // Non-fatal — branch isolation is optional (may not be a git repo)
@@ -582,15 +665,36 @@ export class ProjectManager {
     const ac = this.supervisorAborts.get(projectId)
     if (ac) ac.abort()
 
-    // Clean up agent branch (non-fatal)
+    // Clean up agent branch (non-fatal). Before deleting, check whether the agent
+    // branch has commits that never landed on the base branch — `git branch -d`
+    // already refuses to delete unmerged work, but the failure was silent.
+    // We emit a structured event and a dashboard warning so the user knows
+    // work is being preserved rather than lost.
     if (project.agentBranch) {
       try {
+        const base = project.baseBranch || "main"
+        const ahead = await gitCommitsAhead(project.directory, base, project.agentBranch).catch(() => 0)
+        if (ahead > 0) {
+          const msg = `WARNING: ${project.agentBranch} has ${ahead} commit(s) not on ${base} — branch is being preserved. Review or merge before deleting.`
+          this.dashLog.push({ type: "brain-thinking", text: msg })
+          this.eventBus?.emit({
+            type: "unmerged-agent-branch",
+            source: "project-manager",
+            agentName: project.agentName,
+            projectId,
+            data: { branch: project.agentBranch, baseBranch: base, commitsAhead: ahead },
+          })
+        }
         const currentBranch = await gitCurrentBranch(project.directory)
         if (currentBranch === project.agentBranch) {
-          await gitCheckout(project.directory, "main").catch(() =>
-            gitCheckout(project.directory, "master")
+          await gitCheckout(project.directory, base).catch(() =>
+            gitCheckout(project.directory, "main").catch(() =>
+              gitCheckout(project.directory, "master"),
+            ),
           )
         }
+        // Non-force delete: succeeds only when the branch is fully merged.
+        // Unmerged branches stay in place (preserving work) — the warning above tells the user.
         await gitDeleteBranch(project.directory, project.agentBranch).catch(() => {})
       } catch { /* non-fatal */ }
     }
@@ -894,6 +998,7 @@ export class ProjectManager {
           name: p.name, directory: p.directory, directive: p.directive,
           ...(p.model ? { model: p.model } : {}),
           ...(p.directiveHistory.length > 1 ? { directiveHistory: p.directiveHistory } : {}),
+          ...(p.baseBranch ? { baseBranch: p.baseBranch } : {}),
         })),
     }
     writeJsonFile(resolve(process.cwd(), PROJECTS_FILE), data).catch(err => {
@@ -922,7 +1027,9 @@ export class ProjectManager {
 
     for (const p of saved) {
       try {
-        await this.addProject(p.directory, p.directive, p.name, p.directiveHistory)
+        await this.addProject(p.directory, p.directive, p.name, p.directiveHistory, {
+          baseBranch: p.baseBranch,
+        })
         restored.push(p.name)
       } catch (err) {
         failed.push(`${p.name}: ${err}`)

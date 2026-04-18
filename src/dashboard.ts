@@ -411,7 +411,14 @@ export async function startDashboard(
         const pm = opts?.projectManager
         if (!pm) return Response.json({ error: "Project manager not available" }, { status: 500, headers: corsHeaders })
         try {
-          const body = await req.json() as { directory: string; directive?: string; name?: string; directiveHistory?: any[] }
+          const body = await req.json() as {
+            directory: string
+            directive?: string
+            name?: string
+            directiveHistory?: any[]
+            baseBranch?: string
+            allowSelfIngest?: boolean
+          }
           if (!body.directory?.trim()) {
             return Response.json({ error: "Directory is required" }, { status: 400, headers: corsHeaders })
           }
@@ -420,11 +427,18 @@ export async function startDashboard(
             body.directive?.trim() || "Work on this project. Review the codebase, fix bugs, add features, and improve code quality.",
             body.name?.trim() || undefined,
             body.directiveHistory || undefined,
+            {
+              baseBranch: body.baseBranch?.trim() || undefined,
+              allowSelfIngest: body.allowSelfIngest === true,
+            },
           )
           return Response.json({ ok: true, project }, { headers: corsHeaders })
         } catch (err) {
           const msg = String(err)
-          const status = msg.includes("already active") ? 409 : msg.includes("does not exist") ? 404 : 500
+          const status = msg.includes("already active") ? 409
+            : msg.includes("does not exist") ? 404
+            : msg.includes("orchestrator's own repo") ? 409
+            : 500
           return Response.json({ ok: false, error: msg }, { status, headers: corsHeaders })
         }
       }

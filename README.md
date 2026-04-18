@@ -123,7 +123,9 @@ Each project gets:
 
 - **Event bus** -- System-wide in-memory pub/sub with ring buffer (200 events), pattern-matched subscriptions, and SSE streaming to the dashboard
 - **Resource manager** -- Advisory file locks prevent agents from stepping on each other's files. LLM concurrency semaphore throttles parallel Ollama requests. Work intent declarations enable conflict detection before work begins
-- **Git branch isolation** -- Each project works on an `agent/<name>` branch. Merge back via dashboard or CLI when work is complete
+- **Git branch isolation** -- Each project works on an `agent/<name>` branch cut from a configurable base (defaults to current HEAD; missing branches are materialized from `origin` when possible). Canonical `<name>` is derived from the `origin` remote slug when available so two clones of the same repo share one agent identity. Merge back via dashboard or CLI when work is complete
+- **Self-ingest guard** -- `addProject` refuses the orchestrator's own repo (detected via matching path or shared `origin` URL) unless `allowSelfIngest: true` is passed, preventing the confusing state of the orchestrator mutating its own working tree
+- **Unmerged-work warning** -- When a project is removed, commits on its agent branch that haven't landed on the base branch trigger an `unmerged-agent-branch` event and dashboard warning; the branch is preserved (non-force delete) so nothing is silently lost
 - **Rate-limit coordination** -- Shared 429 cooldown with escalating backoff across all agents
 - **Token tracking** -- Per-agent token usage accounting with budget limits
 
@@ -382,11 +384,13 @@ When the orchestrator is running, the interactive REPL accepts:
 ### Project Lifecycle
 
 1. **Add a project** -- via dashboard or `project add <directory>`. The ProjectManager:
+   - Refuses the orchestrator's own repo (detected via matching path or shared `origin` URL) unless `allowSelfIngest: true` is passed
+   - Derives a canonical agent name from the `origin` remote slug when available, so two clones of the same repo share one agent identity (falls back to folder basename)
    - Finds a free random port (10000–60000) to avoid conflicts with other local services
    - Spawns an `opencode serve` instance pointed at the project directory
    - Waits for the health check to pass
    - Registers the agent with the orchestrator
-   - Creates an isolated `agent/<name>` git branch (if git is available)
+   - Creates an isolated `agent/<name>` git branch cut from a configurable `baseBranch` (defaults to current HEAD; missing branches materialized from `origin` when possible)
    - Starts an autonomous supervisor loop for that project
 
 2. **Supervision cycle** -- Each project's supervisor runs in a Socratic dialogue loop:
@@ -409,7 +413,7 @@ When the orchestrator is running, the interactive REPL accepts:
 
 4. **Failure recovery** -- If a supervisor stops due to failure, the project manager auto-restarts after 10 seconds. The command recovery system nudges the LLM with escalating hints when it fails to produce valid commands.
 
-5. **Remove a project** -- Stops the supervisor, kills the opencode process, releases the port, merges or deletes the agent branch, removes from the orchestrator.
+5. **Remove a project** -- Stops the supervisor, kills the opencode process, releases the port, and attempts a non-force delete of the agent branch. If the branch has commits not on its `baseBranch`, it's preserved and an `unmerged-agent-branch` event is emitted (dashboard shows a warning) so work is never silently lost.
 
 ### Team Mode
 
@@ -571,7 +575,7 @@ The dashboard server exposes these REST endpoints. `GET` requests are unauthenti
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/api/projects` | List active projects |
-| `POST` | `/api/projects` | Add a project (`{ directory, directive?, name? }`). Returns 409 if already active, 404 if directory missing |
+| `POST` | `/api/projects` | Add a project (`{ directory, directive?, name?, baseBranch?, allowSelfIngest? }`). Returns 409 if already active or if the directory is the orchestrator's own repo (unless `allowSelfIngest: true`), 404 if directory missing |
 | `DELETE` | `/api/projects/<id>` | Remove a project |
 | `PUT` | `/api/projects/<id>/directive` | Update directive and restart supervisor (`{ directive }`) |
 | `PUT` | `/api/projects/<id>/model` | Update model and restart supervisor (`{ model }`) |
@@ -717,7 +721,7 @@ Persistent, queryable log of every prompt at every level of the orchestration hi
 ## Testing
 
 ```bash
-# Run all tests (319 tests across 16 files)
+# Run all tests (406 tests across 23 files)
 bun test
 
 # Run a specific test file
@@ -734,17 +738,25 @@ The test suite covers:
 | `core.test.ts` | Conversation trimming, message extraction, formatting |
 | `brain-commands.test.ts` | Brain and supervisor command parsers |
 | `brain-memory.test.ts` | Behavioral note deduplication |
+| `brain-memory-archive.test.ts` | Memory archival and trimming policies |
 | `command-recovery.test.ts` | Nudge system, circuit breaker, fuzzy command extraction |
 | `dashboard-api.test.ts` | HTTP endpoints: routing, auth, CORS, events, resources |
 | `dashboard-ui.test.ts` | DOM rendering: badges, status dots, toasts, filtering, ARIA, sidebar |
 | `event-bus.test.ts` | Event emission, subscription, pattern matching, ring buffer |
 | `file-utils.test.ts` | Atomic writes, JSON read/write, error handling |
+| `git-utils-branches.test.ts` | Branch existence, remote URL, branch listing, commits-ahead (real temp repo) |
 | `integration-supervisor.test.ts` | End-to-end supervisor cycle with mock LLM |
 | `message-utils-priority.test.ts` | Priority-aware message trimming |
+| `opencode-runtime.test.ts` | Opencode launch resolution and runtime paths |
 | `pause-service.test.ts` | Pause state transitions, await/resume, abort signal |
+| `progress-assessor.test.ts` | False-progress detection heuristics |
+| `promptAll-isolation.test.ts` | Cross-agent prompt isolation |
 | `providers.test.ts` | Provider management, model listing, API key resolution |
+| `rate-limit-backoff.test.ts` | 429 cooldown and escalating backoff |
+| `repo-identity.test.ts` | Git URL normalization, repo slug, canonical agent name, self-ingest detection |
 | `resource-manager.test.ts` | File locks, contention, LLM semaphore, work intents, rate limits |
 | `session-state.test.ts` | Session state, crash detection, checkpointing |
+| `shared-knowledge.test.ts` | Cross-agent broadcast store |
 | `supervisor-commands.test.ts` | Supervisor command parsing edge cases |
 
 ---

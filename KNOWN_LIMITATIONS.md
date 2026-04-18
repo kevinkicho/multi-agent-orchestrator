@@ -552,3 +552,63 @@ Project detail rows use JS-driven expand/collapse, but the trigger elements do n
 ### 29b. Accepted Risk
 
 Screen reader users are the primary consumers of `aria-expanded`. The dashboard is a developer monitoring tool, not an end-user product. Adding `aria-expanded` is straightforward but low priority.
+
+## §30 Dashboard Fetch Handler Error Boundary
+
+### 30a. Limitation
+
+The dashboard HTTP handler now has a top-level `try/catch` that returns a generic 500 JSON response for unhandled exceptions. This catches errors from routes that previously had no individual error handling (archives, browse, status, events/stream, team, resources).
+
+### 30b. Tradeoff: Generic 500 Hides Context
+
+The 500 response includes only the error message (`err.message`), not the full stack trace. This is intentional — stack traces in API responses can leak implementation details. The full error is logged to the server console via `console.error` with the request method and URL for debugging. The tradeoff is that a developer seeing a 500 in the browser must check the server console for the full context. An alternative would be to include the stack trace in the response body behind a debug flag, but this adds complexity for a local development tool where console access is always available.
+
+### 30c. DashboardLog Listener Error Isolation
+
+`DashboardLog.push()` now wraps each listener call in `try/catch`. A buggy listener (e.g., SSE stream write to a disconnected client) can no longer crash the code that called `push()` — which is typically the supervisor or brain. The tradeoff is that listener errors are silently swallowed and logged to console. There is no mechanism for listeners to report errors back to the caller, and no UI notification. This is acceptable because listeners are passive consumers (SSE streams, event log) and their failure should not affect the orchestrator's core loop. The event bus (`EventBus.emit`) already follows this pattern.
+
+### 30d. Supervisor loadBrainMemory Guard
+
+The initial `loadBrainMemory()` call at cycle start is now wrapped in `try/catch`. If it throws (corrupted file, disk I/O error, migration failure), the supervisor falls back to an empty memory store and emits a WARNING. The tradeoff is that the supervisor loses all accumulated context — behavioral notes, project notes, and session history — for that cycle. Subsequent cycles will re-read the file, so if the error was transient, memory recovers on the next cycle. If the file is persistently corrupted, the supervisor operates with empty memory indefinitely. A more sophisticated approach would be to attempt a backup/restore from the archive, but this adds complexity for an edge case that is both rare and self-recovering.
+
+## §31 SSE Manual Disconnect and Reconnect Resilience
+
+### 31a. Problem
+
+When a user clicked "Disconnect" on the SSE stream, the `EventSource.close()` triggered an `onerror` event, which called `disconnectSSE()` and then scheduled an auto-reconnect after a backoff delay. The user's disconnect was immediately undone. Additionally, `disconnectSSE()` set the status to "disconnected" which was then overwritten by `onerror`'s "reconnecting..." — a fragile ordering dependency.
+
+### 31b. Fix
+
+Introduced `sseUserDisconnected` flag to distinguish user-initiated disconnect from error-triggered disconnect. The `onerror` handler now checks this flag and skips auto-reconnect if set. `disconnectSSE()` clears any pending reconnect timer. A new `updateSSEStatusUI()` function centralizes status text and button updates, eliminating the fragile ordering.
+
+### 31c. Visibility Reconnect
+
+Added `visibilitychange` listener that reconnects SSE immediately when the page becomes visible after sleep/tab-switch. Resets backoff delay to base value. Skips reconnect if user manually disconnected SSE.
+
+## §32 Dashboard UI Error Boundaries
+
+### 32a. Null/Undefined Crash Guards
+
+Multiple dashboard UI functions crashed on null/undefined inputs:
+- `applyStatusData(null)` — `Object.entries(null)` throws
+- `applyProjectData(null)` — `for...of null` throws
+- `setBadge(undefined)` — `.toUpperCase()` on undefined throws
+- `makeHeader(null)` — `.split()` on null throws
+- `event.requestID` undefined in permission handlers — `.replace()` throws
+- `evaluation.feedback` undefined in `renderSessionCard` — property access on undefined throws
+- `renderScoreBars(null)` — property access on null throws
+- `refreshBusEvents`, `refreshPerformance`, etc. — `getElementById(...).value` throws if element missing
+
+All fixed with null guards, optional chaining, and default values.
+
+### 32b. HTTP Response Checks
+
+Six refresh functions (`refreshProviders`, `refreshBusEvents`, `refreshResources`, `refreshIntents`, `loadMemory`, `loadHistory`, `refreshTeam`) called `res.json()` without checking `res.ok`, so a 404/500 response produced an opaque JSON parse error. All now check `res.ok` and throw a descriptive error.
+
+### 32c. Event Delegation Error Boundary
+
+The `data-action` click handler switch had no try-catch. A sync throw in any action function (saveDirective, sendPrompt, mergeBranch, etc.) would propagate to `window.onerror` as a generic "Unexpected error" toast with no context. Now wrapped in try-catch with `showNotification` that includes the action name.
+
+### 32d. Body Size Limit
+
+Dashboard mutating endpoints now require a `Content-Length` header (rejects chunked transfers with 411) and enforce a 1MB limit (413). This prevents unbounded request body consumption on the local HTTP server.

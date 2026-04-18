@@ -26,6 +26,7 @@ import { saveConversationCheckpoint, loadConversationCheckpoint, clearConversati
 import { isTruncated } from "./providers"
 import { assessProgress, parseGitDiffStat, addAssessmentRecord, type AssessmentRecord, type ValidationResult } from "./progress-assessor"
 import { loadSharedKnowledge, publishNote, publishProgress, formatRelevantKnowledge, clearAgentKnowledge } from "./shared-knowledge"
+import { extractLessonsFromReview } from "./lesson-extractor"
 import {
   type NudgeState, createNudgeState, resetNudge,
   buildEmptyNudge, buildNoParseNudge, fuzzyExtractCommands,
@@ -117,6 +118,10 @@ export type AgentSupervisorConfig = {
   resourceManager?: ResourceManager
   /** Use JSON-mode for LLM calls (reduces parse failures). Default: false */
   structuredOutput?: boolean
+  /** Auto-extract behavioral lessons from @review responses (inspired by
+   *  Hermes Agent / Nous Research). Default: true. Set to false to skip the
+   *  extra LLM call per review. */
+  lessonExtraction?: boolean
   /** Token usage tracker — records tokens per call for budget monitoring */
   tokenTracker?: TokenTracker
   /** Probe agent capabilities on first cycle. Default: true */
@@ -1275,6 +1280,29 @@ Be specific with file paths, line numbers, and code snippets.`
                 sessionId: analyticsSessionId ?? undefined,
                 content: reviewText, tags: ["review"],
               }).catch(() => {}) // Intentionally silent: best-effort prompt ledger
+
+              // Post-review lesson extraction (inspired by Hermes Agent / Nous Research).
+              // Best-effort: failures must not block the supervisor loop.
+              if (config.lessonExtraction !== false) {
+                try {
+                  const lessons = await extractLessonsFromReview({
+                    agentName,
+                    directory,
+                    reviewText: trimmedReview,
+                    model: config.model,
+                    ollamaUrl: config.ollamaUrl,
+                  })
+                  for (const lesson of lessons) {
+                    memory = await addBehavioralNote(memory, agentName, lesson)
+                    emit(`Lesson captured: ${lesson}`)
+                  }
+                  if (lessons.length > 0) {
+                    results.push(`Captured ${lessons.length} lesson(s) from this review — they'll appear in "Lessons from Previous Cycles" on future cycles.`)
+                  }
+                } catch (err) {
+                  console.error(`[supervisor] Lesson extraction failed:`, err)
+                }
+              }
             } else {
               results.push("Review produced no output.")
               // Fallback: surface tool-only/reasoning-only review turns so they don't vanish.

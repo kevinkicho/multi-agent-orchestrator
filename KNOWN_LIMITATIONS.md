@@ -466,3 +466,34 @@ The trend indicator uses a window of the last 3 cycles. This means:
 ### 24d. Heuristic Coverage
 
 The current heuristics cover: stalled cycles (no changes), declining validation, improving validation with stable directive, large uncommitted changes, stable directive for 5+ cycles, stuck-sounding behavioral notes, and committed-but-no-delta patterns. They do **not** cover: security vulnerability patterns, performance regressions, test coverage trends, dependency drift, or user satisfaction signals. These would require different evaluation mechanisms (static analysis, benchmarking, telemetry) that are outside the scope of deterministic git-based assessment.
+
+## 25. Shared Knowledge Store — Relevance Filtering and Persistence
+
+### 25a. Behavior
+
+Cross-agent knowledge is stored in `.orchestrator-shared.json`, separate from per-agent memory (`.orchestrator-memory.json`). Two write paths populate the store:
+
+- **Auto-published progress summaries**: after each `@done:`, the supervisor's `ProgressAssessment` (trend, git delta, validation) is written to the shared store, replacing any previous entry for that agent. All other agents see progress summaries unconditionally in their system prompts.
+- **Explicit `@share:` notes**: supervisors publish discoveries, lessons, or observations with optional `[files: ...]` tags. Notes are filtered for relevance before injection into other agents' prompts.
+
+At cycle start, `formatRelevantKnowledge()` scores each note using a weighted heuristic: file-path overlap (10 points per overlapping file), recency (5 points if <5 minutes old, 2 points if <1 hour), and kind (3 points for lessons, 1 for discoveries). Notes scoring below 1 are dropped. Up to 10 relevant notes are injected. The store is capped at 50 notes and 20 progress entries, oldest evicted first.
+
+### 25b. Tradeoff: Relevance Scoring Is Heuristic, Not Semantic
+
+The file-overlap scoring determines relevance using path matching: exact match, directory prefix (e.g., `src/` overlaps `src/auth.ts`), and filename stem matching (e.g., `auth.ts` overlaps `auth.test.ts`). This is a structural heuristic — it has no understanding of *why* a note is relevant or whether the content applies to the reading agent's task.
+
+**Consequences:**
+
+- A note tagged `[files: src/auth.ts]` about a rate limiter race condition will be shown to agents working on `src/auth.ts`, even if the note is about an API endpoint they're not touching. The heuristic can't distinguish "auth endpoint" relevance from "file editing" relevance.
+- Notes with no file tags and no recency (older than 1 hour, no overlap) score 0 and are silently dropped. This means a genuinely relevant but poorly-tagged note — e.g., `@share: the database migrations are flaky on Windows` with no file tags — will not reach agents who should see it. Supervisors must use `[files:]` tags for the relevance filter to work.
+- The recency bias (5 points for <5 minutes, 2 for <1 hour) favors fresh notes over old ones. In long-running sessions, useful discoveries from hours ago may be suppressed in favor of recent but less important observations.
+
+**Ruled out:** LLM-based relevance scoring (calling an LLM to evaluate whether a note applies to the current directive) would add latency and cost to every cycle start. The file-overlap heuristic is deterministic, fast, and requires no additional LLM calls. A future improvement could use embedding similarity between the note text and the current directive text, but this requires an embedding service that doesn't currently exist in the stack.
+
+### 25c. Persistence and Consistency
+
+The shared knowledge store uses the same write-lock pattern as brain memory (`withWriteLock`), serializing concurrent writes from multiple supervisors. However, the read path (`formatRelevantKnowledge`) operates on an in-memory snapshot loaded at cycle start. If two agents' cycles overlap significantly, Agent B may see Agent A's progress from the previous cycle but not the current one. This is acceptable because progress summaries are low-frequency (one per cycle) and slightly stale data is better than blocking for fresh data.
+
+### 25d. `@share:` Requires Supervisor Judgment
+
+`@share:` is explicit, not automatic. Behavioral notes (`@lesson:`) are still per-agent in brain memory — they're subjective observations about how a specific worker operates best, which may not apply to other agents. The supervisor must decide whether a discovery is worth broadcasting. This prevents the shared store from filling with low-value notes, but it means important discoveries may go unshared if the supervisor doesn't think to use `@share:`. Progress summaries, by contrast, are auto-published because they're structured and low-noise.

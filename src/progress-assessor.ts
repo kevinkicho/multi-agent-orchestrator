@@ -76,9 +76,9 @@ export function parseGitDiffStat(
 
     // Try to parse insertions/deletions from summary line like "5 files changed, 12 insertions(+), 3 deletions(-)"
     const insMatch = line.match(/(\d+)\s+insertions?/)
-    if (insMatch) linesAdded += parseInt(insMatch[1], 10)
+    if (insMatch?.[1]) linesAdded += parseInt(insMatch[1], 10)
     const delMatch = line.match(/(\d+)\s+deletions?/)
-    if (delMatch) linesRemoved += parseInt(delMatch[1], 10)
+    if (delMatch?.[1]) linesRemoved += parseInt(delMatch[1], 10)
   }
 
   return {

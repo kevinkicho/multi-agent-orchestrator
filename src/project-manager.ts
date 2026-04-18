@@ -8,6 +8,7 @@ import { runAgentSupervisor, type ValidationPreset } from "./supervisor"
 import { readJsonFile, writeJsonFile } from "./file-utils"
 import { formatThought, C } from "./tui-format"
 import { createPauseState, requestPause, requestResume, type PauseState } from "./pause-service"
+import { clearAgentKnowledge } from "./shared-knowledge"
 import { gitExec, gitCurrentBranch, gitCreateBranch, gitCheckout, gitMerge, gitDeleteBranch, gitForceDeleteBranch } from "./git-utils"
 import type { EventBus } from "./event-bus"
 import type { ResourceManager } from "./resource-manager"
@@ -601,6 +602,11 @@ export class ProjectManager {
 
     // Release file locks
     this.resourceManager?.releaseFiles(project.agentName)
+
+    // Clear shared knowledge entries for this agent
+    await clearAgentKnowledge(project.agentName).catch((err: unknown) => {
+      console.error(`[project-manager] Failed to clear shared knowledge for ${project.agentName}: ${err}`)
+    })
 
     // Mark as stopped BEFORE killing process to prevent monitorProcess
     // from detecting the intentional kill as an unexpected crash

@@ -23,6 +23,7 @@ import type { ResourceManager } from "./resource-manager"
 import type { TokenTracker } from "./token-tracker"
 import { saveConversationCheckpoint, loadConversationCheckpoint, clearConversationCheckpoint } from "./conversation-checkpoint"
 import { assessProgress, parseGitDiffStat, addAssessmentRecord, type AssessmentRecord, type ValidationResult } from "./progress-assessor"
+import { loadSharedKnowledge, publishNote, publishProgress, formatRelevantKnowledge, clearAgentKnowledge } from "./shared-knowledge"
 import {
   type NudgeState, createNudgeState, resetNudge,
   buildEmptyNudge, buildNoParseNudge, fuzzyExtractCommands,
@@ -193,9 +194,13 @@ ${reviewAction}
 - @directive: <text> — Evolve the project direction as understanding deepens.
 - @broadcast: <text> — Send a message to all other supervisors.
 - @intent: <description> [files: f1, f2] — Declare planned work to avoid conflicts with other agents.
+- @share: <text> [files: f1, f2] — Share a discovery or lesson with other agents. Use [files:] to tag relevant files so agents working on similar files see it. Prefix with LESSON: for best practices, or OBSERVATION: for general notes.
 
 ### Progress signals
 After each cycle, you'll see a [PROGRESS] block summarizing what changed (files, tests, behavioral notes) and a trend indicator (improving, declining, stable, stalled). You may also see a [DIRECTION] suggestion — these are rule-based recommendations based on patterns across recent cycles (e.g., "3 cycles with no changes — consider pivoting"). Use these signals to inform your @directive decisions. You are not required to follow [DIRECTION] suggestions, but they represent patterns that experienced supervisors have found useful.
+
+### Shared knowledge
+At the start of each cycle, you may see a "### Shared Knowledge from Other Agents" section with discoveries, lessons, and progress summaries from other agents working on related files. This is filtered by file-path relevance to your current work. Use @share: to publish your own discoveries to other agents, especially things they'd benefit from knowing (e.g., "LESSON: rate limiting needs exponential backoff", "@share: [files: src/auth.ts] found race condition in token refresh").
 
 ### Cycle control
 - @done: <summary> — End this cycle. Summary must be specific: what was accomplished, what's next.
@@ -248,6 +253,7 @@ type SupervisorCommand =
   | { type: "directive"; text: string }
   | { type: "notify"; message: string }
   | { type: "intent"; description: string; files: string[] }
+  | { type: "share"; text: string; files: string[]; kind: "discovery" | "lesson" | "observation" }
   | { type: "cycle_done"; summary: string }
   | { type: "stop"; summary: string }
 
@@ -267,6 +273,7 @@ const SOCRATIC_MARKERS = [
   { prefix: "@directive:", type: "directive" as const, hasBody: true },
   { prefix: "@broadcast:", type: "broadcast" as const, hasBody: true },
   { prefix: "@intent:", type: "intent" as const, hasBody: true },
+  { prefix: "@share:", type: "share" as const, hasBody: true },
   { prefix: "@done:", type: "cycle_done" as const, hasBody: true },
   { prefix: "@stop:", type: "stop" as const, hasBody: true },
 ] as const
@@ -340,6 +347,19 @@ function parseSocraticResponse(response: string): { commands: SupervisorCommand[
           : []
         const description = body.replace(/\[files?:\s*[^\]]+\]/, "").trim()
         if (description) commands.push({ type: "intent", description, files })
+        break
+      }
+      case "share": {
+        const shareFilesMatch = body.match(/\[files?:\s*([^\]]+)\]/)
+        const shareFiles = shareFilesMatch
+          ? shareFilesMatch[1]!.split(",").map(f => f.trim()).filter(Boolean)
+          : []
+        const shareText = body.replace(/\[files?:\s*[^\]]+\]/, "").trim()
+        // Default kind to "discovery" unless text starts with "LESSON:" or "OBSERVATION:"
+        let kind: "discovery" | "lesson" | "observation" = "discovery"
+        if (shareText.startsWith("LESSON:") || shareText.startsWith("lesson:")) kind = "lesson"
+        else if (shareText.startsWith("OBSERVATION:") || shareText.startsWith("observation:")) kind = "observation"
+        if (shareText) commands.push({ type: "share", text: shareText, files: shareFiles, kind })
         break
       }
       case "cycle_done":
@@ -810,6 +830,25 @@ export async function runAgentSupervisor(
           : "")
       : ""
 
+    // Build shared knowledge from other agents
+    let sharedKnowledgeBlock = ""
+    try {
+      const sharedStore = await loadSharedKnowledge()
+      // Collect relevant files: current intent + active file locks
+      const currentIntent = config.resourceManager?.getAllIntents()?.get(agentName)
+      const currentLocks = config.resourceManager?.getActiveLocks()?.get(agentName)
+      const relevantFiles = [
+        ...(currentIntent?.files ?? []),
+        ...(currentLocks?.files ?? []),
+      ]
+      const knowledgeText = formatRelevantKnowledge(sharedStore, agentName, relevantFiles)
+      if (knowledgeText) {
+        sharedKnowledgeBlock = "\n## Knowledge from Other Agents\n" + knowledgeText
+      }
+    } catch {
+      // shared knowledge unavailable — skip silently
+    }
+
     const initialContent = [
       statusLine,
       memoryContext ? `\n## Memory from previous cycles\n${memoryContext}` : "",
@@ -819,6 +858,7 @@ export async function runAgentSupervisor(
       capabilityBlock,
       `\nDirective: ${directive}`,
       progressBlock,
+      sharedKnowledgeBlock,
       isResume
         ? `\nThis is cycle #${cycleCount} (resuming). Start by understanding where things stand before deciding what to do next.`
         : `\nThis is cycle #${cycleCount}. Start by checking in with the worker (@check), then think about the best path forward.`,
@@ -1335,6 +1375,26 @@ Be specific with file paths, line numbers, and code snippets.`
             break
           }
 
+          case "share": {
+            try {
+              const sharedStore = await loadSharedKnowledge()
+              await publishNote(sharedStore, agentName, cmd.text, cmd.files, cmd.kind)
+              const fileList = cmd.files.length > 0 ? ` [files: ${cmd.files.join(", ")}]` : ""
+              results.push(`Shared with other agents: "${cmd.text.slice(0, 120)}"${fileList}`)
+              emit(`SHARED: ${cmd.text.slice(0, 120)}${fileList}`)
+              config.eventBus?.emit({
+                type: "agent-notification",
+                source: "supervisor",
+                agentName,
+                data: { message: cmd.text, files: cmd.files, kind: cmd.kind },
+              })
+            } catch (err) {
+              console.error(`[supervisor] Failed to publish shared note:`, err)
+              config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to share knowledge with other agents: ${err}` })
+            }
+            break
+          }
+
           case "cycle_done": {
             // Summary validation — reject garbage summaries
             if (cmd.summary.length < 20 || /^(cycle|done|completed|analyzing|working|start)/i.test(cmd.summary.trim())) {
@@ -1547,6 +1607,14 @@ Be specific with file paths, line numbers, and code snippets.`
                 })
                 if (assessment.suggestionText) {
                   emit(`[direction] ${assessment.suggestionText}`)
+                }
+
+                // Auto-publish progress summary to shared knowledge store
+                try {
+                  const sharedStore = await loadSharedKnowledge()
+                  await publishProgress(sharedStore, agentName, assessment)
+                } catch (err) {
+                  console.error(`[${agentName}] Failed to publish progress to shared knowledge:`, err)
                 }
               } catch (err) {
                 console.error(`[${agentName}] Failed to compute progress assessment:`, err)

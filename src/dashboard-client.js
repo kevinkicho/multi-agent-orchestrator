@@ -2889,16 +2889,33 @@ async function refreshTeam() {
 // ---- Live Event Stream (SSE) ----
 let sseSource = null
 let sseConnected = false
+let sseUserDisconnected = false // true when user clicked Disconnect — prevents auto-reconnect
 let sseReconnectDelay = 1000 // Start with 1s, exponential backoff up to 60s
+let sseReconnectTimer = null
 const SSE_MAX_DELAY = 60000
 const SSE_BASE_DELAY = 1000
 
 function toggleSSE() {
-  if (sseConnected) disconnectSSE()
-  else connectSSE()
+  if (sseConnected || sseSource) {
+    // User explicitly disconnected — prevent auto-reconnect
+    sseUserDisconnected = true
+    disconnectSSE()
+  } else {
+    sseUserDisconnected = false
+    connectSSE()
+  }
+}
+
+function updateSSEStatusUI(text, color) {
+  const el = document.getElementById('sse-status')
+  if (el) { el.textContent = text; el.style.color = color }
+  const btn = document.getElementById('sse-toggle-btn')
+  if (btn) btn.textContent = sseConnected ? 'Disconnect' : (sseUserDisconnected ? 'Connect' : 'Reconnecting...')
 }
 
 function connectSSE() {
+  sseUserDisconnected = false
+  if (sseReconnectTimer) { clearTimeout(sseReconnectTimer); sseReconnectTimer = null }
   const typeFilter = document.getElementById('sse-type-filter').value
   const url = '/api/events/stream' + (typeFilter ? '?type=' + encodeURIComponent(typeFilter) : '')
   sseSource = new EventSource(url)
@@ -2906,9 +2923,7 @@ function connectSSE() {
     sseConnected = true
     sseReconnectDelay = SSE_BASE_DELAY // Reset backoff on successful connection
     setConnectionState('connected')
-    document.getElementById('sse-status').textContent = 'connected'
-    document.getElementById('sse-status').style.color = '#22c55e'
-    document.getElementById('sse-toggle-btn').textContent = 'Disconnect'
+    updateSSEStatusUI('connected', '#22c55e')
   }
   sseSource.onmessage = function(e) {
     try {
@@ -2926,26 +2941,37 @@ function connectSSE() {
     } catch {} // Intentionally silent: best-effort SSE event parsing
   }
   sseSource.onerror = function() {
-    disconnectSSE()
-    // Exponential backoff with jitter
+    // Clean up socket — do NOT call disconnectSSE() which would imply user intent
+    if (sseSource) { sseSource.close(); sseSource = null }
+    sseConnected = false
+    if (sseUserDisconnected) {
+      // User chose to disconnect — leave disconnected
+      updateSSEStatusUI('disconnected', '#555')
+      return
+    }
+    // Auto-reconnect with exponential backoff + jitter
     const delay = Math.min(sseReconnectDelay, SSE_MAX_DELAY) + Math.random() * 1000
     sseReconnectDelay = sseReconnectDelay * 2
-    document.getElementById('sse-status').textContent = 'reconnecting...'
-    document.getElementById('sse-status').style.color = '#f59e0b'
-    setTimeout(function() { if (!sseConnected) connectSSE() }, delay)
+    setConnectionState('degraded')
+    updateSSEStatusUI('reconnecting...', '#f59e0b')
+    sseReconnectTimer = setTimeout(function() {
+      sseReconnectTimer = null
+      if (!sseConnected && !sseUserDisconnected) connectSSE()
+    }, delay)
   }
 }
 
 function disconnectSSE() {
   if (sseSource) { sseSource.close(); sseSource = null }
   sseConnected = false
-  document.getElementById('sse-status').textContent = 'disconnected'
-  document.getElementById('sse-status').style.color = '#555'
-  document.getElementById('sse-toggle-btn').textContent = 'Connect'
+  if (sseReconnectTimer) { clearTimeout(sseReconnectTimer); sseReconnectTimer = null }
+  updateSSEStatusUI('disconnected', '#555')
 }
 
 function reconnectSSE() {
-  if (sseConnected) { disconnectSSE(); connectSSE() }
+  sseUserDisconnected = false
+  if (sseConnected) disconnectSSE()
+  connectSSE()
 }
 
 function clearEventLog() {

@@ -236,19 +236,24 @@ function ensureAgent(name) {
     if (!btn) return
     e.stopPropagation()
     const action = btn.dataset.action
-    switch (action) {
-      case 'pause': togglePause(name); break
-      case 'merge': mergeBranch(projectRows[name]?.projectId); break
-      case 'validate': setValidation(projectRows[name]?.projectId); break
-      case 'ab': openABTestModal(name); break
-      case 'remove': removeProject(name); break
-      case 'drawer-tab': switchDrawerTab(name, btn.dataset.tab, btn); break
-      case 'save-model': saveModel(name); break
-      case 'save-directive': saveDirective(name); break
-      case 'send-comment': sendComment(name); break
-      case 'send-prompt': sendPrompt(name); break
-      case 'perm-approve': replyPermission(btn.dataset.agent, btn.dataset.reqid, 'approve', btn.dataset.id); break
-      case 'perm-deny': replyPermission(btn.dataset.agent, btn.dataset.reqid, 'deny', btn.dataset.id); break
+    try {
+      switch (action) {
+        case 'pause': togglePause(name); break
+        case 'merge': mergeBranch(projectRows[name]?.projectId); break
+        case 'validate': setValidation(projectRows[name]?.projectId); break
+        case 'ab': openABTestModal(name); break
+        case 'remove': removeProject(name); break
+        case 'drawer-tab': switchDrawerTab(name, btn.dataset.tab, btn); break
+        case 'save-model': saveModel(name); break
+        case 'save-directive': saveDirective(name); break
+        case 'send-comment': sendComment(name); break
+        case 'send-prompt': sendPrompt(name); break
+        case 'perm-approve': replyPermission(btn.dataset.agent, btn.dataset.reqid, 'approve', btn.dataset.id); break
+        case 'perm-deny': replyPermission(btn.dataset.agent, btn.dataset.reqid, 'deny', btn.dataset.id); break
+      }
+    } catch (err) {
+      console.error('[orchestrator-dashboard] Action handler error for', action, err)
+      showNotification('Action failed: ' + action + ' — ' + err, 'error')
     }
   })
 
@@ -1322,6 +1327,7 @@ function renderTrends(sessions) {
 
 window.refreshAnalytics = async function() {
   const sessEl = document.getElementById('analytics-sessions')
+  if (!sessEl) return
   sessEl.innerHTML = 'Loading...'
   try {
     const [sessRes, timelineRes] = await Promise.all([
@@ -1615,7 +1621,7 @@ async function saveDirective(agentName) {
   const agent = projectRows[agentName]
   if (!agent || !agent.projectId) { alert('Project not found for ' + agentName); return }
   const btn = agent.directiveText?.closest('.directive-section')?.querySelector('.directive-save')
-  const text = agent.directiveText.value.trim()
+  const text = (agent.directiveText?.value || '').trim()
   if (!text) { alert('Directive cannot be empty'); return }
   if (btn) { btn.disabled = true; btn.textContent = 'Saving...' }
   try {
@@ -1641,7 +1647,7 @@ async function saveDirective(agentName) {
 async function saveModel(agentName) {
   const agent = projectRows[agentName]
   if (!agent || !agent.projectId) { alert('Project not found for ' + agentName); return }
-  const model = agent.modelSelect.value
+  const model = agent.modelSelect?.value
   if (!model) {
     addLogEntry(agent.supervisorLog, 'status', 'Model already set to global default — no change needed.')
     return
@@ -2310,12 +2316,13 @@ async function submitProject() {
 let browseOpen = false
 async function toggleBrowse() {
   browseOpen = !browseOpen
-  if (!browseOpen) { browsePanel.classList.remove('open'); return }
-  const current = document.getElementById('proj-dir').value.trim() || (navigator.platform.startsWith('Win') ? 'C:\\Users' : '/')
+  if (!browseOpen) { browsePanel?.classList.remove('open'); return }
+  const current = document.getElementById('proj-dir')?.value?.trim() || (navigator.platform.startsWith('Win') ? 'C:\\Users' : '/')
   await loadBrowse(current)
 }
 
 async function loadBrowse(path) {
+  if (!browsePanel) return
   try {
     const res = await fetch('/api/browse?path=' + encodeURIComponent(path))
     if (!res.ok) {

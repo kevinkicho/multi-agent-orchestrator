@@ -793,7 +793,7 @@ function applyStatusData(data) {
     const dirParts = (info.directory || '').replace(/\\/g, '/').split('/')
     const dirName = dirParts[dirParts.length - 1] || ''
     agent.dirLabel.textContent = info.directory || ''
-    agent.link.href = info.url || '#'
+    if (agent.link) agent.link.href = info.url || '#'
     agent.status = info.status
     setBadge(agent.workerBadge, info.status)
     setBadge(agent.rowWorkerBadge, info.status)

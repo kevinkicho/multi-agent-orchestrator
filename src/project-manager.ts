@@ -206,7 +206,8 @@ export class ProjectManager {
   private pauseStates = new Map<string, PauseState>()
   /** Cycle limit callbacks — auto-pause after N cycles (used by A/B test) */
   private cycleLimitCallbacks = new Map<string, { maxCycles: number; count: number }>()
-  private addLock: Promise<void> = Promise.resolve()
+  /** Lock that serializes all project mutations (add/remove/restart) to prevent races */
+  private projectLock: Promise<void> = Promise.resolve()
   private idCounter = 0
 
   constructor(
@@ -219,14 +220,14 @@ export class ProjectManager {
   ) {}
 
   /** Add a project: spawns a worker agent and starts its supervisor.
-   *  Uses a promise-chain mutex so concurrent calls queue up instead of racing. */
+   *  Uses a promise-chain mutex so concurrent mutations queue up instead of racing. */
   async addProject(directory: string, directive: string, name?: string, restoreHistory?: DirectiveHistoryEntry[]): Promise<ProjectState> {
     let resolve!: () => void
     const nextLock = new Promise<void>(r => { resolve = r })
-    const prev = this.addLock
-    this.addLock = nextLock
+    const prev = this.projectLock
+    this.projectLock = nextLock
 
-    // Wait for previous add to finish before starting ours
+    // Wait for previous mutation to finish before starting ours
     await prev
 
     try {
@@ -566,8 +567,23 @@ export class ProjectManager {
     }).catch(() => {})
   }
 
-  /** Remove a project: stops supervisor, kills agent process */
+  /** Remove a project: stops supervisor, kills agent process.
+   *  Serialized with addProject to prevent concurrent add/remove races. */
   async removeProject(projectId: string): Promise<void> {
+    let resolve!: () => void
+    const nextLock = new Promise<void>(r => { resolve = r })
+    const prev = this.projectLock
+    this.projectLock = nextLock
+    await prev
+
+    try {
+      return await this._removeProjectInner(projectId)
+    } finally {
+      resolve()
+    }
+  }
+
+  private async _removeProjectInner(projectId: string): Promise<void> {
     const project = this.projects.get(projectId)
     if (!project) throw new Error(`Unknown project: ${projectId}`)
 

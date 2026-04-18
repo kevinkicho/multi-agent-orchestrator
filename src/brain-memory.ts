@@ -4,6 +4,7 @@ import { createHash } from "crypto"
 import { readJsonFile, writeJsonFile } from "./file-utils"
 import { readFileOrNull } from "./file-utils"
 import type { ProgressAssessment } from "./progress-assessor"
+import { parseSummarySections, SUMMARY_SECTIONS } from "./transcript-compressor"
 
 export type BrainMemoryEntry = {
   timestamp: number
@@ -275,6 +276,59 @@ export function getProgressAssessments(
 }
 
 // ---------------------------------------------------------------------------
+// Structured session summaries
+//
+// Session summaries (BrainMemoryEntry.summary) are free-form strings, but the
+// supervisor and brain prompts now ask for a seven-section markdown schema
+// shared with transcript-compressor. parseSessionSummary detects when a
+// summary follows that schema so downstream rendering (and, later,
+// meta-reflection) can operate on structured fields rather than raw prose.
+// Legacy prose summaries are returned as { raw } with no sections.
+// ---------------------------------------------------------------------------
+
+export type StructuredSessionSummary = {
+  raw: string
+  sections?: Record<string, string>
+}
+
+const MIN_STRUCTURED_SECTIONS = 2
+
+export function parseSessionSummary(raw: string): StructuredSessionSummary {
+  if (!raw) return { raw: "" }
+  const sections = parseSummarySections(raw)
+  if (Object.keys(sections).length >= MIN_STRUCTURED_SECTIONS) {
+    return { raw, sections }
+  }
+  return { raw }
+}
+
+/** Render a session summary for injection into an LLM prompt. For structured
+ *  summaries, surface the highest-signal sections; fall back to raw prose. */
+function renderSummaryForPrompt(raw: string): string {
+  const parsed = parseSessionSummary(raw)
+  if (!parsed.sections) return raw.trim()
+  const preferred = ["Active Task", "Completed Actions", "Active State", "Remaining Work"] as const
+  const lines: string[] = []
+  for (const section of preferred) {
+    const body = parsed.sections[section]
+    if (body && body.toLowerCase() !== "(none)") {
+      lines.push(`**${section}:** ${body.replace(/\n+/g, " ").trim()}`)
+    }
+  }
+  // If none of the preferred sections had content, fall back to any available section
+  if (lines.length === 0) {
+    for (const section of SUMMARY_SECTIONS) {
+      const body = parsed.sections[section]
+      if (body && body.toLowerCase() !== "(none)") {
+        lines.push(`**${section}:** ${body.replace(/\n+/g, " ").trim()}`)
+        break
+      }
+    }
+  }
+  return lines.length > 0 ? lines.join("\n") : raw.trim()
+}
+
+// ---------------------------------------------------------------------------
 // Format for LLM context
 // ---------------------------------------------------------------------------
 
@@ -299,7 +353,7 @@ export function formatMemoryForPrompt(store: BrainMemoryStore, agentName?: strin
     for (const entry of recent) {
       const date = new Date(entry.timestamp).toLocaleString()
       lines.push(`\n### ${date} — "${entry.objective}"`)
-      lines.push(entry.summary)
+      lines.push(renderSummaryForPrompt(entry.summary))
       if (agentName) {
         const learnings = entry.agentLearnings[agentName]
         if (learnings?.length) {

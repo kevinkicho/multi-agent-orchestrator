@@ -221,7 +221,17 @@ After each cycle, you'll see a [PROGRESS] block summarizing what changed (files,
 At the start of each cycle, you may see a "### Shared Knowledge from Other Agents" section with discoveries, lessons, and progress summaries from other agents working on related files. This is filtered by file-path relevance to your current work. Use @share: to publish your own discoveries to other agents, especially things they'd benefit from knowing (e.g., "LESSON: rate limiting needs exponential backoff", "@share: [files: src/auth.ts] found race condition in token refresh").
 
 ### Cycle control
-- @done: <summary> — End this cycle. Summary must be specific: what was accomplished, what's next.
+- @done: <summary> — End this cycle. Summary must be specific and use these markdown section headers so future cycles can navigate it:
+  \`\`\`
+  ## Active Task
+  ## Goal
+  ## Completed Actions
+  ## Active State
+  ## Resolved Questions
+  ## Pending Asks
+  ## Remaining Work
+  \`\`\`
+  Write "(none)" inside a section that has nothing to report. A plain prose summary is accepted as a fallback but structured form is strongly preferred.
 - @stop: <summary> — Permanently stop supervising this worker.
 
 ## Your approach
@@ -245,7 +255,7 @@ At the start of each cycle, you may see a "### Shared Knowledge from Other Agent
 - Don't send 5+ messages to an unresponsive worker — escalate.
 - NEVER tell the worker to start background processes with "&". Use single commands: "node server.js & sleep 2 && npx playwright test; kill %1"
 - Prioritize: bugs > missing features > code quality > polish
-- @done summaries must be specific: "Fixed auth bypass in /api/login. Worker implementing rate limiting. 12/15 tests passing." NOT "Done." or "Cycle completed."
+- @done summaries must be specific. Prefer the seven-section structured format above; prose like "Fixed auth bypass in /api/login. Worker implementing rate limiting. 12/15 tests passing." is only a fallback. NEVER just "Done." or "Cycle completed."
 - You manage ONLY this worker — give it your full attention.
 `
 }

@@ -47,7 +47,10 @@ You can issue these commands (one per line, in a \`\`\`commands code block):
   MESSAGES <agent-name>             — Read recent messages from an agent
   WAIT                              — Wait for busy agents to finish before deciding
   NOTE <agent-name> <text>          — Save a persistent note about a project/agent
-  DONE <summary>                    — You've completed the objective (include a brief summary of what was accomplished)
+  DONE <summary>                    — You've completed the objective. The summary should use these markdown section headers so future sessions can navigate it:
+                                    ## Active Task / ## Goal / ## Completed Actions / ## Active State /
+                                    ## Resolved Questions / ## Pending Asks / ## Remaining Work.
+                                    If a section has nothing to report, write "(none)". Skip empty sections only if truly nothing applies.
 
 Rules:
 - You can issue multiple commands in one response.
@@ -55,7 +58,7 @@ Rules:
 - When agents are busy (WAIT), you'll be notified when they finish with their responses.
 - Review agent responses carefully before sending follow-ups.
 - If an agent's work has issues, send corrections.
-- When all agents have completed their tasks satisfactorily, issue DONE with a summary.
+- When all agents have completed their tasks satisfactorily, issue DONE with a structured summary (see format above).
 - Think step by step about what each agent should do.
 - Be specific in your prompts to agents — include file paths, requirements, and acceptance criteria.
 - Use NOTE to save important discoveries about projects for future sessions.

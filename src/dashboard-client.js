@@ -1024,6 +1024,7 @@ document.addEventListener('keydown', function(e) {
 // Performance comparison
 window.refreshPerformance = async function() {
   const el = document.getElementById('perf-content')
+  if (!el) return
   el.innerHTML = 'Loading...'
   try {
     const res = await fetch('/api/performance')
@@ -2712,7 +2713,8 @@ async function addCustomProvider() {
 
 // ---- Event Bus ----
 async function refreshBusEvents() {
-  const typeFilter = document.getElementById('bus-type-filter').value
+  const typeFilterEl = document.getElementById('bus-type-filter')
+  const typeFilter = typeFilterEl ? typeFilterEl.value : ''
   let url = '/api/events/bus/recent?limit=100'
   if (typeFilter) url += '&type=' + encodeURIComponent(typeFilter)
   try {
@@ -3078,10 +3080,18 @@ setTimeout(async function() {
 // Refresh all data panels every 30 seconds
 setInterval(() => {
   // Only refresh panels that are currently open to save bandwidth
-  if (document.getElementById('perf-section')?.classList.contains('open')) refreshPerformance()
-  if (document.getElementById('eventbus-section')?.classList.contains('open')) refreshBusEvents()
-  if (document.getElementById('resources-section')?.classList.contains('open')) refreshResources()
-  if (document.getElementById('intents-section')?.classList.contains('open')) refreshIntents()
+  try {
+    if (document.getElementById('perf-section')?.classList.contains('open')) refreshPerformance()
+  } catch (e) { console.error('[orchestrator-dashboard] refreshPerformance error:', e) }
+  try {
+    if (document.getElementById('eventbus-section')?.classList.contains('open')) refreshBusEvents()
+  } catch (e) { console.error('[orchestrator-dashboard] refreshBusEvents error:', e) }
+  try {
+    if (document.getElementById('resources-section')?.classList.contains('open')) refreshResources()
+  } catch (e) { console.error('[orchestrator-dashboard] refreshResources error:', e) }
+  try {
+    if (document.getElementById('intents-section')?.classList.contains('open')) refreshIntents()
+  } catch (e) { console.error('[orchestrator-dashboard] refreshIntents error:', e) }
 }, 30000)
 
 // ---- Per-project branch & validation UI helpers ----

@@ -27,6 +27,7 @@ import { isTruncated } from "./providers"
 import { assessProgress, parseGitDiffStat, addAssessmentRecord, type AssessmentRecord, type ValidationResult } from "./progress-assessor"
 import { loadSharedKnowledge, publishNote, publishProgress, formatRelevantKnowledge, clearAgentKnowledge } from "./shared-knowledge"
 import { extractLessonsFromReview } from "./lesson-extractor"
+import { compressTranscript, createCompressorState, type CompressorState } from "./transcript-compressor"
 import {
   type NudgeState, createNudgeState, resetNudge,
   buildEmptyNudge, buildNoParseNudge, fuzzyExtractCommands,
@@ -122,6 +123,16 @@ export type AgentSupervisorConfig = {
    *  Hermes Agent / Nous Research). Default: true. Set to false to skip the
    *  extra LLM call per review. */
   lessonExtraction?: boolean
+  /** Structured transcript compression for long supervisor loops (inspired by
+   *  Hermes Agent / Nous Research). When message-token estimate crosses
+   *  `thresholdTokens`, middle messages are replaced by a structured summary.
+   *  Head/tail are preserved. Falls through to trimConversation on failure. */
+  transcriptCompression?: {
+    enabled?: boolean
+    thresholdTokens?: number
+    /** Aux model for the summary call. Defaults to config.model. */
+    auxModel?: string
+  }
   /** Token usage tracker — records tokens per call for budget monitoring */
   tokenTracker?: TokenTracker
   /** Probe agent capabilities on first cycle. Default: true */
@@ -678,6 +689,7 @@ export async function runAgentSupervisor(
   const maxConversationMessages = limits.maxConversationMessages ?? 60
   const hasReviewer = !!reviewerAgent
   let cycleCount = 0
+  const compressorState: CompressorState = createCompressorState()
   let consecutiveEmptyResponses = 0
   let consecutiveIdleCycles = 0 // tracks cycles where agent was idle/no work done
   let cycleRestartCount = 0 // restarts within the current cycle (capped)
@@ -986,6 +998,24 @@ export async function runAgentSupervisor(
           sessionId: analyticsSessionId ?? undefined,
           content: lastMsg.content,
         }).catch(() => {}) // Intentionally silent: best-effort prompt ledger
+      }
+
+      // Structured compression first (best-effort, falls through on failure);
+      // trimConversation remains as the hard-cap safety net.
+      if (config.transcriptCompression?.enabled !== false) {
+        try {
+          const result = await compressTranscript(messages, compressorState, {
+            model: config.transcriptCompression?.auxModel ?? model,
+            ollamaUrl,
+            thresholdTokens: config.transcriptCompression?.thresholdTokens,
+            emit,
+          })
+          if (result.outcome === "failed") {
+            emit(`Transcript compression failed (${result.reason}) — falling back to trimConversation`)
+          }
+        } catch (err) {
+          emit(`Transcript compression threw unexpectedly: ${err instanceof Error ? err.message : String(err)}`)
+        }
       }
 
       trimConversation(messages, maxConversationMessages)

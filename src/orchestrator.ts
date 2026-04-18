@@ -242,7 +242,7 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
 
     if (config.autoApprove) {
       try {
-        await agentReplyPermission(agent, requestID, { type: "approve" })
+        await agentReplyPermission(agent, requestID, "once")
         config.onStatusChange?.(name, "permission-approved", `Auto-approved: ${requestID}`)
       } catch (err) {
         console.error(`[${name}] Failed to auto-approve permission:`, err)
@@ -253,7 +253,7 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
     if (config.onPermissionRequest) {
       try {
         const decision = await config.onPermissionRequest(name, properties)
-        await agentReplyPermission(agent, requestID, { type: decision })
+        await agentReplyPermission(agent, requestID, decision === "approve" ? "once" : "reject")
         config.onStatusChange?.(name, `permission-${decision}d`, requestID)
       } catch (err) {
         console.error(`[${name}] Failed to handle permission:`, err)

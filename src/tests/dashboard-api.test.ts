@@ -95,7 +95,7 @@ describe("Dashboard API endpoints", () => {
     expect(res.status).toBe(200)
     expect(res.headers.get("content-type")).toContain("text/html")
     const text = await res.text()
-    expect(text).toContain("OpenCode Orchestrator")
+    expect(text).toContain("Multi-Agent Orchestrator")
   })
 
   test("serves CSS at /dashboard-client.css", async () => {

@@ -9,7 +9,7 @@ import { resolve } from "path"
 import { loadTaskQueue, addTask, formatQueueForPrompt } from "./task-queue"
 import { extractLastAssistantText, formatRecentMessages } from "./message-utils"
 import { formatThought, C } from "./tui-format"
-import { detectCrash, initSessionState, markCleanShutdown, formatCrashReport } from "./session-state"
+import { detectCrash, initSessionState, markCleanShutdown, formatCrashReport, tryLiberatePort } from "./session-state"
 import { recordPrompt } from "./prompt-ledger"
 
 /** Tunable supervisor limits — all optional with sensible defaults */
@@ -103,6 +103,7 @@ function parseArgs(): {
   concurrency: number
   cyclesPerRotation: number
   team?: TeamConfigFile
+  tui: boolean
 } {
   const args = process.argv.slice(2)
   let autoApprove = false
@@ -110,6 +111,7 @@ function parseArgs(): {
   let dashboardPort = 4000
   let dashboardPortExplicit = false
   let configPath: string | undefined
+  let tui = false
   const agents: AgentConfig[] = []
 
   for (let i = 0; i < args.length; i++) {
@@ -118,11 +120,18 @@ function parseArgs(): {
       autoApprove = true
     } else if (arg === "--verbose" || arg === "-v") {
       verbose = true
+    } else if (arg === "--tui") {
+      tui = true
     } else if ((arg === "--config" || arg === "-c") && args[i + 1]) {
       configPath = args[++i]!
-    } else if (arg === "--dashboard-port" && args[i + 1]) {
-      dashboardPort = parseInt(args[++i]!, 10)
-      dashboardPortExplicit = true
+    } else if (arg === "--dashboard-port" && args[i + 1] && !args[i + 1]!.startsWith("--")) {
+      const parsed = parseInt(args[++i]!, 10)
+      if (Number.isFinite(parsed) && parsed > 0 && parsed <= 65535) {
+        dashboardPort = parsed
+        dashboardPortExplicit = true
+      } else {
+        console.warn(`[cli] Ignoring invalid --dashboard-port value: ${args[i]}`)
+      }
     } else if (arg === "--agent" && args[i + 1]) {
       const parts = args[++i]!.split("=")
       if (parts.length >= 2) {
@@ -164,6 +173,7 @@ function parseArgs(): {
     concurrency: fileConfig?.concurrency ?? 1,
     cyclesPerRotation: fileConfig?.cyclesPerRotation ?? 2,
     team: fileConfig?.team,
+    tui,
   }
 }
 
@@ -191,7 +201,7 @@ function statusIcon(status: string): string {
 }
 
 async function main() {
-  const { agents, autoApprove, verbose, dashboardPort, mode, brain: brainConfig, supervisor: supervisorLimits, projects, scheduling, concurrency, cyclesPerRotation, team: teamConfig } = parseArgs()
+  const { agents, autoApprove, verbose, dashboardPort, mode, brain: brainConfig, supervisor: supervisorLimits, projects, scheduling, concurrency, cyclesPerRotation, team: teamConfig, tui } = parseArgs()
 
   // Dashboard event log — shared between orchestrator callbacks and the web UI
   const dashLog = new DashboardLog()
@@ -199,7 +209,7 @@ async function main() {
   // Soft-stop flag — set by the "stop" command to finish current cycle then exit
   let activeSoftStop: { requested: boolean } | null = null
 
-  console.log(`${C.brightMagenta}${C.bold}=== OpenCode Orchestrator ===${C.reset}`)
+  console.log(`${C.brightMagenta}${C.bold}=== Multi-Agent Orchestrator ===${C.reset}`)
 
   // --- Crash detection: check if previous session exited uncleanly ---
   const { crashed, state: prevState } = await detectCrash()
@@ -212,6 +222,22 @@ async function main() {
       type: "brain-thinking",
       text: `⚠ Previous session (PID ${prevState.pid}) crashed. ${Object.keys(prevState.supervisors).length} supervisor(s) were active. Use "Restore Saved" to resume.`,
     })
+  }
+
+  // If the previous session crashed while holding our target port, try to
+  // terminate its process so the new dashboard can bind. Only acts when the
+  // port's current holder PID matches prevState.pid — unrelated processes
+  // sharing the port by coincidence are left alone.
+  if (prevState) {
+    try {
+      const liberated = await tryLiberatePort(dashboardPort, prevState)
+      if (liberated === false) {
+        // Non-fatal — startDashboard will still print the actionable error below
+        console.log(`[startup] Could not auto-liberate port ${dashboardPort}. Proceeding; dashboard startup will report details if the port is still occupied.`)
+      }
+    } catch (err) {
+      console.warn(`[startup] Port liberation attempt failed: ${err}`)
+    }
   }
 
   // Write session state for this run (enables crash detection on next startup)
@@ -1029,7 +1055,19 @@ async function main() {
     gracefulShutdown("unhandledRejection")
   })
 
-  // --- Interactive REPL ---
+  console.log(`${C.dim}Mode: ${C.reset}${C.brightMagenta}${mode}${C.reset} ${C.dim}| Scheduling: ${C.reset}${C.brightCyan}${scheduling}${C.reset} ${C.dim}(concurrency=${concurrency}, cyclesPerRotation=${cyclesPerRotation})${C.reset}`)
+  console.log("")
+
+  if (!tui) {
+    // Log-only mode: skip the interactive REPL so async writes stream cleanly.
+    // Drive the orchestrator from the web dashboard. Re-enable the REPL with --tui.
+    console.log(`${C.dim}Running in log-only mode. Use the dashboard at ${C.reset}${C.brightCyan}http://127.0.0.1:${dashboardPort}${C.reset}${C.dim} to drive the orchestrator.${C.reset}`)
+    console.log(`${C.dim}Pass ${C.reset}${C.brightCyan}--tui${C.reset}${C.dim} to re-enable the interactive REPL. Ctrl+C to quit.${C.reset}`)
+    console.log("")
+    return
+  }
+
+  // --- Interactive REPL (opt-in via --tui) ---
   reader = require("readline").createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -1056,8 +1094,6 @@ async function main() {
   helpCmd("status", "Show agent status")
   helpCmd("messages <agent-name>", "Show recent messages")
   helpCmd("quit", "Exit")
-  console.log("")
-  console.log(`${C.dim}Mode: ${C.reset}${C.brightMagenta}${mode}${C.reset} ${C.dim}| Scheduling: ${C.reset}${C.brightCyan}${scheduling}${C.reset} ${C.dim}(concurrency=${concurrency}, cyclesPerRotation=${cyclesPerRotation})${C.reset}`)
   console.log("")
 
   reader.prompt()

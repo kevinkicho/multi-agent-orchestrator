@@ -55,10 +55,12 @@ async function waitForServer(url: string, timeoutMs = 30_000): Promise<boolean> 
 async function main() {
   const config = loadConfig()
   const procs: Subprocess[] = []
-  const args = process.argv.slice(2)
-  const extraArgs = args.filter((a) => a === "--auto-approve" || a === "--verbose" || a.startsWith("--dashboard-port"))
+  // Forward all user-supplied CLI args to cli.ts verbatim. The previous
+  // filter-based approach dropped the value after `--dashboard-port`,
+  // resulting in `NaN` when a custom port was passed.
+  const extraArgs = process.argv.slice(2)
 
-  console.log("[launcher] === OpenCode Orchestrator Launcher ===")
+  console.log("[launcher] === Multi-Agent Orchestrator Launcher ===")
   console.log(`[launcher] Starting ${config.agents.length} serve instances...\n`)
 
   // Resolve opencode binary (or source checkout via OPENCODE_DIR)
@@ -112,14 +114,16 @@ async function main() {
     console.log("[launcher] Continuing with available servers...\n")
   }
 
-  // Build CLI args for orchestrator
+  // Build CLI args for orchestrator. Config-derived args go first; the
+  // user-supplied `extraArgs` are appended last so duplicated flags
+  // (e.g. `--dashboard-port`) resolve in favor of the CLI override.
   const cliArgs: string[] = []
   for (const agent of config.agents) {
     cliArgs.push("--agent", `${agent.name}=${agent.url}=${agent.directory}`)
   }
-  cliArgs.push(...extraArgs)
   if (config.autoApprove) cliArgs.push("--auto-approve")
   if (config.dashboardPort) cliArgs.push("--dashboard-port", String(config.dashboardPort))
+  cliArgs.push(...extraArgs)
 
   console.log("\n[launcher] Starting orchestrator...\n")
 

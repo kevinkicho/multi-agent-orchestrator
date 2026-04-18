@@ -138,12 +138,86 @@ export function removeSessionState(): void {
 }
 
 /** Check if a process with the given PID is alive */
-function isProcessAlive(pid: number): boolean {
+export function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0) // signal 0 = test if process exists
     return true
   } catch {
     return false
+  }
+}
+
+/**
+ * Find the PID of whatever is currently listening on the given TCP port.
+ * Returns `null` if nothing is listening or the lookup fails.
+ *
+ * Uses `netstat -ano` on Windows and `lsof -ti` on unix. Best-effort —
+ * callers should treat `null` as "can't tell" rather than "port is free."
+ */
+export async function findPortHolder(port: number): Promise<number | null> {
+  try {
+    if (process.platform === "win32") {
+      const proc = Bun.spawn(["netstat", "-ano", "-p", "tcp"], { stdout: "pipe", stderr: "ignore" })
+      const out = await new Response(proc.stdout).text()
+      await proc.exited
+      for (const line of out.split(/\r?\n/)) {
+        if (!/LISTENING/.test(line)) continue
+        // "  TCP    0.0.0.0:4000    0.0.0.0:0    LISTENING    12345"
+        const m = line.match(/:(\d+)\s+\S+\s+LISTENING\s+(\d+)/)
+        if (m && parseInt(m[1]!, 10) === port) return parseInt(m[2]!, 10)
+      }
+      return null
+    }
+    const proc = Bun.spawn(["lsof", "-ti", `:${port}`, "-sTCP:LISTEN"], { stdout: "pipe", stderr: "ignore" })
+    const out = await new Response(proc.stdout).text()
+    await proc.exited
+    const first = out.trim().split(/\s+/)[0]
+    return first ? parseInt(first, 10) : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * If `port` is still occupied by `prevState.pid`, terminate that process
+ * and wait up to 5s for the OS to release the socket. Only acts when the
+ * port holder's PID matches the recorded session — we refuse to kill a
+ * random unrelated process that happens to occupy the port.
+ *
+ * Returns true if the port was successfully liberated (or was already free).
+ */
+export async function tryLiberatePort(port: number, prevState: SessionState | null): Promise<boolean> {
+  if (!isPortBound(port)) return true
+  if (!prevState || prevState.dashboardPort !== port) return false
+
+  const holderPid = await findPortHolder(port)
+  if (!holderPid) return false
+
+  // Only kill if the holder matches the previous orchestrator's PID
+  if (holderPid !== prevState.pid) {
+    console.warn(`[startup] Port ${port} is held by PID ${holderPid}, which does not match the previous orchestrator (PID ${prevState.pid}). Leaving it alone.`)
+    return false
+  }
+
+  console.log(`[startup] Port ${port} is held by orphaned orchestrator (PID ${holderPid}) — terminating it to free the port.`)
+  try { process.kill(holderPid) } catch { /* already dead */ }
+
+  // Poll up to 5s for the socket to release
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 250))
+    if (!isPortBound(port)) return true
+  }
+  return !isPortBound(port)
+}
+
+/** Probe whether anything is currently bound to `port` on localhost. */
+function isPortBound(port: number): boolean {
+  try {
+    const probe = Bun.serve({ port, hostname: "127.0.0.1", fetch: () => new Response("") })
+    probe.stop(true)
+    return false
+  } catch {
+    return true
   }
 }
 

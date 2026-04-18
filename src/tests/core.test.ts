@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test"
-import { trimConversation, extractLastAssistantText, formatRecentMessages } from "../message-utils"
+import { trimConversation, extractLastAssistantText, summarizeLastAssistantTurn, formatRecentMessages } from "../message-utils"
 
 // ---------------------------------------------------------------------------
 // trimConversation
@@ -96,6 +96,58 @@ describe("extractLastAssistantText", () => {
       { info: { role: "assistant" }, parts: [{ type: "tool-use", tool: "edit" }] },
     ]
     expect(extractLastAssistantText(msgs)).toBe("real answer")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// summarizeLastAssistantTurn
+// ---------------------------------------------------------------------------
+
+describe("summarizeLastAssistantTurn", () => {
+  test("prefers text when present", () => {
+    const msgs = [
+      { info: { role: "assistant" }, parts: [{ type: "text", text: "hello" }, { type: "tool", tool: "Read" }] },
+    ]
+    expect(summarizeLastAssistantTurn(msgs)).toBe("hello")
+  })
+
+  test("falls back to reasoning when no text", () => {
+    const msgs = [
+      { info: { role: "assistant" }, parts: [{ type: "reasoning", text: "thinking..." }] },
+    ]
+    expect(summarizeLastAssistantTurn(msgs)).toContain("reasoning only")
+    expect(summarizeLastAssistantTurn(msgs)).toContain("thinking...")
+  })
+
+  test("falls back to tool-call summary when only tool parts (type=tool)", () => {
+    const msgs = [
+      { info: { role: "assistant" }, parts: [{ type: "tool", tool: "Read" }, { type: "tool", tool: "Edit" }] },
+    ]
+    expect(summarizeLastAssistantTurn(msgs)).toBe("(tool calls only: Read, Edit)")
+  })
+
+  test("falls back to tool-call summary when only tool parts (type=tool-use)", () => {
+    const msgs = [
+      { info: { role: "assistant" }, parts: [{ type: "tool-use", tool: "Bash" }] },
+    ]
+    expect(summarizeLastAssistantTurn(msgs)).toBe("(tool calls only: Bash)")
+  })
+
+  test("summarizes the LAST assistant turn, not a prior one", () => {
+    const msgs = [
+      { info: { role: "assistant" }, parts: [{ type: "text", text: "old text" }] },
+      { info: { role: "assistant" }, parts: [{ type: "tool", tool: "Grep" }] },
+    ]
+    expect(summarizeLastAssistantTurn(msgs)).toBe("(tool calls only: Grep)")
+  })
+
+  test("returns null for empty array", () => {
+    expect(summarizeLastAssistantTurn([])).toBeNull()
+  })
+
+  test("returns null when no assistant messages", () => {
+    const msgs = [{ info: { role: "user" }, parts: [{ type: "text", text: "hi" }] }]
+    expect(summarizeLastAssistantTurn(msgs)).toBeNull()
   })
 })
 

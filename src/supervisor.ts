@@ -11,7 +11,7 @@ import {
   saveProgressAssessment,
   getProgressAssessments,
 } from "./brain-memory"
-import { extractLastAssistantText, formatRecentMessages, trimConversation } from "./message-utils"
+import { extractLastAssistantText, summarizeLastAssistantTurn, formatRecentMessages, smartTrim, trimConversation } from "./message-utils"
 import { logPerformance } from "./performance-log"
 import { checkpointSupervisor } from "./session-state"
 import { startSession, recordCycle, endSession } from "./analytics"
@@ -23,6 +23,7 @@ import type { EventBus, BusEvent, BusPattern } from "./event-bus"
 import type { ResourceManager } from "./resource-manager"
 import type { TokenTracker } from "./token-tracker"
 import { saveConversationCheckpoint, loadConversationCheckpoint, clearConversationCheckpoint } from "./conversation-checkpoint"
+import { isTruncated } from "./providers"
 import { assessProgress, parseGitDiffStat, addAssessmentRecord, type AssessmentRecord, type ValidationResult } from "./progress-assessor"
 import { loadSharedKnowledge, publishNote, publishProgress, formatRelevantKnowledge, clearAgentKnowledge } from "./shared-knowledge"
 import {
@@ -1118,6 +1119,22 @@ export async function runAgentSupervisor(
 
       emit(`--- ${agentName} cycle ${cycleCount}, round ${round + 1} ---\n${response}\n`)
 
+      // Arbitrator: supervisor's own LLM response hit max_tokens. Don't execute
+      // potentially half-formed commands — ask supervisor to retry more concisely.
+      if (isTruncated(response)) {
+        emit(`[ARBITRATOR] ${agentName} supervisor response was truncated (max_tokens hit) — skipping command execution and requesting concise retry`)
+        config.dashboardLog?.push({
+          type: "supervisor-alert",
+          agent: agentName,
+          text: `[ARBITRATOR] Supervisor response was truncated — skipping commands, requesting concise retry.`,
+        })
+        messages.push({
+          role: "user",
+          content: `[VALIDATION] Your previous response was truncated because it hit the model's max_tokens limit. The commands in that response may be incomplete and were NOT executed. Please respond again — be more concise, issue fewer commands per round, or shorten any long messages inside PROMPT commands.`,
+        })
+        continue
+      }
+
       let commands = config.structuredOutput
         ? parseJsonCommands(response)
         : parseSupervisorCommands(response)
@@ -1246,8 +1263,11 @@ Be specific with file paths, line numbers, and code snippets.`
             const reviewMsgs = await orchestrator.getMessages(targetAgent)
             const reviewText = extractLastAssistantText(reviewMsgs)
             if (reviewText) {
-              const truncated = reviewText.slice(0, 5000)
-              results.push(`Review from ${targetAgent}:\n\n${truncated}\n\nConsider: do you agree with this review? Are there points the reviewer missed, or do they raise valid concerns that should be addressed?`)
+              const trimmedReview = smartTrim(reviewText, 20000)
+              const reviewTruncNote = isTruncated(reviewText)
+                ? `\n\n[ARBITRATOR NOTE: This review was cut off mid-generation (upstream max_tokens hit). If you need the full review, send a follow-up PROMPT asking the reviewer to continue.]`
+                : ""
+              results.push(`Review from ${targetAgent}:\n\n${trimmedReview}${reviewTruncNote}\n\nConsider: do you agree with this review? Are there points the reviewer missed, or do they raise valid concerns that should be addressed?`)
               config.dashboardLog?.push({ type: "agent-response", agent: targetAgent, text: reviewText })
               recordPrompt({
                 source: "agent", target: "supervisor", direction: "inbound",
@@ -1257,6 +1277,11 @@ Be specific with file paths, line numbers, and code snippets.`
               }).catch(() => {}) // Intentionally silent: best-effort prompt ledger
             } else {
               results.push("Review produced no output.")
+              // Fallback: surface tool-only/reasoning-only review turns so they don't vanish.
+              const reviewSummary = summarizeLastAssistantTurn(reviewMsgs)
+              if (reviewSummary) {
+                config.dashboardLog?.push({ type: "agent-response", agent: targetAgent, text: reviewSummary })
+              }
             }
             emitStatus("running")
             break
@@ -1772,9 +1797,15 @@ Be specific with file paths, line numbers, and code snippets.`
           continue
         }
 
-        // Pause: stop waiting and force-break the cycle — don't keep prompting the LLM
+        // Pause: stop waiting, abort the worker's in-flight task, and force-break the cycle.
+        // Without the abort, the opencode worker keeps executing its current prompt and
+        // keeps emitting SSE events — which makes pause feel unresponsive to the user.
         if (waitResult.reason === "paused") {
-          emit(`Pause active — breaking out of agent wait to end cycle.`)
+          emit(`Pause active — aborting ${agentName} and breaking out of agent wait to end cycle.`)
+          try { await orchestrator.abortAgent(agentName) } catch (err) {
+            // Best-effort abort: if it fails, we still break out of the wait
+            emit(`Abort on pause failed: ${err}`)
+          }
           break
         }
 
@@ -1791,7 +1822,10 @@ Be specific with file paths, line numbers, and code snippets.`
             consecutiveEmptyResponses = 0
             cycleHadProgress = true
             // Present worker response as dialogue for Socratic engagement
-            results.push(`Worker ${agentName} replied:\n\n${lastText.slice(0, 5000)}\n\nReflect on this response. What did the worker do well? What might they have missed? What should happen next?`)
+            const workerTruncNote = isTruncated(lastText)
+              ? `\n\n[ARBITRATOR NOTE: Worker's reply was cut off mid-generation (upstream max_tokens hit). If needed, prompt ${agentName} to continue from where they left off.]`
+              : ""
+            results.push(`Worker ${agentName} replied:\n\n${smartTrim(lastText, 20000)}${workerTruncNote}\n\nReflect on this response. What did the worker do well? What might they have missed? What should happen next?`)
             config.dashboardLog?.push({ type: "agent-response", agent: agentName, text: lastText })
             recordPrompt({
               source: "agent", target: "supervisor", direction: "inbound",
@@ -1803,6 +1837,14 @@ Be specific with file paths, line numbers, and code snippets.`
             // Agent responded with empty content — track and escalate
             consecutiveEmptyResponses++
             emit(`WARNING: ${agentName} returned empty response (${consecutiveEmptyResponses} consecutive)`)
+
+            // Surface a summary of the turn (reasoning or tool calls) to the dashboard so
+            // the user sees *something* happened. extractLastAssistantText requires TextPart
+            // and returns null for tool-only turns; summarizeLastAssistantTurn falls back.
+            const turnSummary = summarizeLastAssistantTurn(newMsgs)
+            if (turnSummary) {
+              config.dashboardLog?.push({ type: "agent-response", agent: agentName, text: turnSummary })
+            }
 
             if (consecutiveEmptyResponses >= 3) {
               // Check restart cap FIRST — before attempting any restart

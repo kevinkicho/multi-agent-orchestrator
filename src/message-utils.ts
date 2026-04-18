@@ -2,6 +2,30 @@
 
 type LLMMessage = { role: "system" | "user" | "assistant"; content: string }
 
+/** Trim text to at most `maxChars` characters while preserving both ends.
+ *  When trimming is needed, the head (first 45%) and tail (last 55%) are kept
+ *  with an elision marker in the middle so callers see the conclusion of a
+ *  response (often where the action/summary lives) rather than having it
+ *  hard-cut off by a naive `.slice(0, N)`. For short inputs, returns as-is. */
+export function smartTrim(text: string, maxChars: number): string {
+  if (!text) return ""
+  if (text.length <= maxChars) return text
+  // Reserve room for the elision marker
+  const marker = (dropped: number) => `\n\n[... ${dropped} chars trimmed — full response preserved in prompt ledger ...]\n\n`
+  const placeholder = marker(text.length) // upper-bound length
+  const budget = Math.max(0, maxChars - placeholder.length)
+  if (budget <= 0) {
+    // maxChars is so small the marker doesn't fit — just tail-trim
+    return text.slice(-maxChars)
+  }
+  const headLen = Math.floor(budget * 0.45)
+  const tailLen = budget - headLen
+  const head = text.slice(0, headLen)
+  const tail = text.slice(text.length - tailLen)
+  const dropped = text.length - headLen - tailLen
+  return head + marker(dropped) + tail
+}
+
 /** Shape of an OpenCode message (from the SDK). We only type the fields we use. */
 type OpenCodeMessage = {
   info?: { role?: string }
@@ -142,8 +166,35 @@ export function extractLastAssistantText(messages: unknown[]): string | null {
   return null
 }
 
-/** Format recent messages into a readable summary for LLM context */
-export function formatRecentMessages(messages: unknown[], count = 6, maxLen = 3000): string[] {
+/** Summarize the most recent assistant turn, even when it contains no TextPart.
+ *  Preference order: text → reasoning → tool-call list. Returns null only when
+ *  there are no assistant messages or the last one is completely empty.
+ *  Used for dashboard visibility so tool-only turns don't vanish — the
+ *  supervisor's own context logic still uses extractLastAssistantText. */
+export function summarizeLastAssistantTurn(messages: unknown[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as OpenCodeMessage
+    if (m?.info?.role !== "assistant") continue
+    const texts: string[] = []
+    const reasonings: string[] = []
+    const toolNames: string[] = []
+    for (const p of m.parts ?? []) {
+      if (p.type === "text" && p.text) texts.push(p.text)
+      else if (p.type === "reasoning" && p.text) reasonings.push(p.text)
+      else if (p.type === "tool" || p.type === "tool-use") toolNames.push(p.tool || p.name || "?")
+    }
+    if (texts.length > 0) return texts.join("\n")
+    if (reasonings.length > 0) return `[reasoning only]\n\n${reasonings.join("\n")}`
+    if (toolNames.length > 0) return `(tool calls only: ${toolNames.join(", ")})`
+    return null
+  }
+  return null
+}
+
+/** Format recent messages into a readable summary for LLM context.
+ *  maxLen default raised from 3000 → 8000 chars and replaced with smartTrim
+ *  (head+tail preservation) to stop cutting sentences mid-paragraph. */
+export function formatRecentMessages(messages: unknown[], count = 6, maxLen = 8000): string[] {
   const recent = messages.slice(-count)
   const formatted: string[] = []
   for (const msg of recent) {
@@ -157,7 +208,7 @@ export function formatRecentMessages(messages: unknown[], count = 6, maxLen = 30
       else if (p.type === "tool-result") texts.push(`[tool-result]`)
     }
     const content = texts.join("\n") || "(no text)"
-    formatted.push(`[${role}] ${content.slice(0, maxLen)}`)
+    formatted.push(`[${role}] ${smartTrim(content, maxLen)}`)
   }
   return formatted
 }

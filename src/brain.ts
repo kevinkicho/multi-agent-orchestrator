@@ -6,9 +6,9 @@ import {
   addProjectNote,
   formatMemoryForPrompt,
 } from "./brain-memory"
-import { extractLastAssistantText, formatRecentMessages, trimConversation } from "./message-utils"
+import { extractLastAssistantText, formatRecentMessages, smartTrim, trimConversation } from "./message-utils"
 import { recordPrompt } from "./prompt-ledger"
-import { llmCall, parseModelRef, type LLMResponse } from "./providers"
+import { llmCall, parseModelRef, isTruncated, type LLMResponse } from "./providers"
 import {
   type NudgeState, type CircuitBreakerState,
   createNudgeState, resetNudge, createCircuitBreaker,
@@ -424,6 +424,18 @@ export async function runBrain(
 
     config.onThinking?.(`\n--- Brain (round ${round + 1}) ---\n${response}\n`)
 
+    // Arbitrator: brain's own LLM call hit max_tokens and was cut off.
+    // Don't execute potentially half-formed commands — ask brain to regenerate.
+    if (isTruncated(response)) {
+      config.onThinking?.(`[ARBITRATOR] Brain's round-${round + 1} response was truncated (max_tokens hit). Skipping command execution and asking brain to retry concisely.`)
+      config.dashboardLog?.push({ type: "brain-thinking", text: `[ARBITRATOR] Previous brain response was truncated — skipping commands, requesting concise retry.` })
+      messages.push({
+        role: "user",
+        content: `[VALIDATION] Your previous response was truncated because it hit the model's max_tokens limit. The commands in that response may be incomplete and were NOT executed. Please respond again — be more concise, issue fewer commands per round, or shorten any long messages inside PROMPT commands.`,
+      })
+      continue
+    }
+
     // Parse and execute commands
     let commands = parseCommands(response)
 
@@ -586,7 +598,12 @@ export async function runBrain(
           const beforeCount = messageCountsBefore.get(name) ?? 0
           const newMsgs = msgs.slice(beforeCount)
           const text = extractLastAssistantText(newMsgs)
-          return text ? `${name} response:\n${text.slice(0, 2000)}` : null
+          if (!text) return null
+          const trimmed = smartTrim(text, 10000)
+          if (isTruncated(text)) {
+            return `${name} response (⚠ was truncated upstream):\n${trimmed}\n\n[ARBITRATOR NOTE: ${name}'s response above was cut off mid-generation. If you need the rest, send a follow-up PROMPT asking them to continue from where they left off.]`
+          }
+          return `${name} response:\n${trimmed}`
         } catch (err) {
           console.error(`[brain] Failed to collect response from ${name}: ${err}`)
           return null

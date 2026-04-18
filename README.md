@@ -31,7 +31,6 @@ Advanced: if you're hacking on opencode itself and want to run against a local s
 - [File Reference](#file-reference)
 - [API Endpoints](#api-endpoints)
 - [Pause Service](#pause-service)
-- [A/B Testing](#ab-testing)
 - [Prompt Ledger](#prompt-ledger)
 - [Testing](#testing)
 - [License](#license)
@@ -140,7 +139,6 @@ Each project gets:
 ### Dashboard and Observability
 
 - **Live web dashboard** -- Real-time streaming logs, permission approval, command palette, sidebar navigation, global search, toast notifications, team hierarchy visualization
-- **A/B testing** -- Compare two model/directive variants on the same project with automated git state management and AI evaluation
 - **Analytics and session tracking** -- Cycle summaries, git snapshots, AI-powered evaluation, cross-session comparison, timeline visualization
 - **Prompt ledger** -- Persistent, queryable log of every prompt at every level with filters and pagination
 - **Performance logging** -- Per-model cycle stats with automatic archival of entries older than 7 days
@@ -296,7 +294,6 @@ The dashboard is served at `http://127.0.0.1:4000` (configurable) and provides:
 - **Event Bus panel** -- Live event log with type/source filters
 - **Resources panel** -- File locks table, LLM queue depth, contention warnings
 - **Work Intents panel** -- Declared agent work intents with file overlap detection
-- **A/B testing modal** -- Two-column configuration (model, directive, cycle count per variant)
 - **Prompt Log section** -- Filterable, paginated table of all prompts with color-coded source labels
 - **Analytics section** -- Session cards, cycle details, score bars, evaluation, comparison, timeline chart
 - **Export logs** -- Download all logs as a text file organized by project
@@ -454,7 +451,6 @@ The analytics store (`orchestrator-analytics.json`) tracks:
 - **Sessions** -- Each supervisor run with cycle summaries and command counts
 - **Snapshots** -- Point-in-time git state captures (branch, commit hash, diff stats)
 - **Comparisons** -- AI-generated side-by-side session comparisons
-- **A/B Tests** -- Complete test results with variant configs, session IDs, and comparisons
 
 ### Performance Logging
 
@@ -476,7 +472,7 @@ Performance events logged to `orchestrator-performance.json`: `supervisor_start`
 | `supervisor.ts` | ~1800 | Socratic supervisor loop: free-thinking LLM dialogue with `@` marker parsing, per-agent cycles, stale-busy detection, pause hard-break, validation, false progress detection, resource contention, event bus emissions, command recovery. Legacy UPPERCASE command fallback. |
 | `brain.ts` | 594 | Higher-level brain: coordinates multiple agents toward a single objective. Dynamic model context size detection. |
 | `brain-memory.ts` | 215 | Persistent memory store: session summaries, project notes, behavioral notes with async write locks. |
-| `project-manager.ts` | 894 | Dynamic project provisioning: random port allocation (10000–60000), ghost project cleanup, branch isolation, directive history, pause/resume, save/restore, A/B test tracking. |
+| `project-manager.ts` | 894 | Dynamic project provisioning: random port allocation (10000–60000), ghost project cleanup, branch isolation, directive history, pause/resume, save/restore. |
 | `team-manager.ts` | 814 | Team mode: LLM-powered manager coordinating multiple agents with hiring/dissolution, role assignment, and event bus integration. |
 | `dashboard.ts` | 1144 | Web dashboard HTTP server: REST API endpoints, memory API, project restore, long-poll event streaming, SSE, static asset serving, API token authentication. |
 | `dashboard.html` | 418 | Dashboard HTML shell: command palette with 35+ commands, markup structure referencing external CSS and JS. |
@@ -489,7 +485,9 @@ Performance events logged to `orchestrator-performance.json`: `supervisor_start`
 | `command-recovery.ts` | ~210 | Command recovery: nudge state machine (Socratic `@` marker guidance), circuit breaker, fuzzy command extraction, command constants for both Socratic and legacy formats. |
 | `token-tracker.ts` | 155 | Token usage tracking per agent with budget limits. |
 | `conversation-checkpoint.ts` | 78 | Save/restore supervisor conversation state for warm restarts. |
-| `analytics.ts` | 844 | Analytics engine: session tracking, git snapshots, AI evaluation, cross-session comparison, A/B test orchestration. |
+| `analytics.ts` | ~620 | Analytics engine: session tracking, git snapshots, AI evaluation, cross-session comparison. |
+| `chat-log.ts` | ~140 | Per-agent append-only chat history persistence with JSONL rotation at 25 MB. |
+| `responsibilities.ts` | ~160 | Per-agent responsibility catalog (planning, git, validation, review, testing) backing the dashboard's responsibility-checklist UI. |
 | `session-state.ts` | 186 | Crash recovery: session state tracking, supervisor checkpointing, crash detection. |
 | `performance-log.ts` | 169 | Performance logging with write lock and automatic archival. |
 | `prompt-ledger.ts` | 145 | Persistent prompt log: write-locked append, query/filter/paginate, stats. |
@@ -528,7 +526,8 @@ Performance events logged to `orchestrator-performance.json`: `supervisor_start`
 | `orchestrator-projects.json` | Auto-saved project list for restore on restart. |
 | `.orchestrator-memory.json` | Persistent memory (session summaries, project notes, behavioral notes). |
 | `orchestrator-tasks.json` | Task queue state. |
-| `orchestrator-analytics.json` | Analytics: sessions, snapshots, comparisons, A/B test results. |
+| `orchestrator-analytics.json` | Analytics: sessions, snapshots, comparisons. |
+| `.orchestrator-chat-log/` | Per-agent JSONL chat history (rotated at 25 MB). |
 | `.orchestrator-ledger.json` | Prompt ledger (capped at 2000 entries). |
 | `.orchestrator-session.json` | Session state for crash recovery. |
 | `orchestrator-performance.json` | Active performance log (last 500 entries). |
@@ -586,8 +585,6 @@ The dashboard server exposes these REST endpoints. `GET` requests are unauthenti
 | `GET` | `/api/projects/<id>/branch` | Get the agent's git branch name |
 | `POST` | `/api/projects/<id>/merge` | Merge agent branch (`{ targetBranch? }`) |
 | `POST` | `/api/projects/<id>/validation` | Set validation config (`{ command?, preset?, failAction? }`) |
-| `POST` | `/api/projects/<id>/ab-test` | Start an A/B test (`{ variants: [...] }`) |
-| `GET` | `/api/projects/<id>/ab-test` | Get A/B test results for a project |
 | `GET` | `/api/projects/saved` | Load saved project configs for restore |
 | `POST` | `/api/projects/restore` | Restore all saved projects |
 | `GET` | `/api/memory/<agent>` | Agent memory: behavioral notes, project notes, session summaries |
@@ -643,7 +640,6 @@ The dashboard server exposes these REST endpoints. `GET` requests are unauthenti
 | `GET` | `/api/analytics/timeline` | Cycle timeline data for charts |
 | `GET` | `/api/ledger?source=&agentName=&search=&tags=&since=&until=&limit=&offset=` | Query the prompt ledger |
 | `GET` | `/api/ledger/stats` | Ledger statistics by source, agent, hour |
-| `GET` | `/api/ab-tests` | List all A/B test results |
 | `GET` | `/api/crash-info` | Crash recovery information |
 | `GET` | `/api/browse?path=<dir>` | Browse directories for folder picker |
 
@@ -666,31 +662,6 @@ The pause service provides graceful suspension of project supervisors, distinct 
 4. **Block at cycle boundary** -- After the cycle ends, the supervisor enters a blocked state instead of starting the next cycle
 5. **Dashboard feedback** -- PAUSING badge (amber) while wrapping up, then PAUSED (blue) once blocked. Tooltips show time since request
 6. **Resume** -- via dashboard, CLI, or API. The supervisor immediately starts the next cycle
-
----
-
-## A/B Testing
-
-Compare two model/directive variants on the same project with automated orchestration:
-
-### Flow
-
-1. **Pause for baseline** -- The current supervisor is paused at a clean checkpoint
-2. **Verify clean git state** -- `git status --porcelain` must be empty
-3. **Capture baseline** -- Record the current commit hash and branch
-4. **Run Variant A** -- Restart supervisor with variant A's model and directive; auto-pause after N cycles
-5. **Reset to baseline** -- Stash variant A's changes, create a temp branch from the baseline commit
-6. **Run Variant B** -- Same flow with variant B's config
-7. **Restore** -- Check out the original branch, pop the stash, delete the temp branch
-8. **Compare** -- AI evaluation compares both sessions across dimensions
-9. **Store results** -- A/B test result stored in analytics
-
-### Dashboard UI
-
-Click the **A/B** button on any project row to open the configuration modal:
-- Two columns: Variant A and Variant B
-- Each column: model dropdown, directive textarea, cycle count (1-20)
-- Progress updates stream into the brain log panel
 
 ---
 
@@ -721,7 +692,7 @@ Persistent, queryable log of every prompt at every level of the orchestration hi
 ## Testing
 
 ```bash
-# Run all tests (406 tests across 23 files)
+# Run all tests (417 tests across 25 files)
 bun test
 
 # Run a specific test file

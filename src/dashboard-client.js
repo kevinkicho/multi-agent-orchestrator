@@ -25,6 +25,17 @@ function apiFetch(url, opts) {
 }
 
 // Sidebar navigation
+function flashSectionHeader(section) {
+  if (!section) return
+  var header = section.querySelector(':scope > .brain-header')
+  if (!header) return
+  header.classList.remove('highlight-flash')
+  // Force reflow so the animation restarts even on repeated clicks
+  void header.offsetWidth
+  header.classList.add('highlight-flash')
+  setTimeout(function() { header.classList.remove('highlight-flash') }, 1800)
+}
+
 function scrollToSection(id) {
   var el = document.getElementById(id)
   if (!el) return
@@ -36,7 +47,10 @@ function scrollToSection(id) {
     if (el.classList.contains('brain-section') && !el.classList.contains('open')) {
       el.classList.add('open')
     }
-    setTimeout(function() { el.scrollIntoView({ behavior: 'smooth', block: 'start' }) }, 280)
+    setTimeout(function() {
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      flashSectionHeader(el)
+    }, 280)
     return
   }
   // For projects-container or other main content
@@ -44,6 +58,25 @@ function scrollToSection(id) {
     el.classList.add('open')
   }
   el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  flashSectionHeader(el)
+}
+
+function collapseAllAdminSections() {
+  var drawer = document.getElementById('admin-drawer')
+  if (!drawer) return
+  var sections = drawer.querySelectorAll('.brain-section.open')
+  sections.forEach(function(s) { s.classList.remove('open') })
+}
+
+function toggleInfoPanel(id) {
+  var panel = document.getElementById(id)
+  if (!panel) return
+  panel.hidden = !panel.hidden
+  // If we just revealed it, make sure its section is open so the user can see it
+  if (!panel.hidden) {
+    var section = panel.closest('.brain-section')
+    if (section) section.classList.add('open')
+  }
 }
 
 function openAdminDrawer() {
@@ -73,11 +106,31 @@ const agents = {}       // compatibility alias — same objects
 const brainLog = document.getElementById('brain-log')
 const brainBadge = document.getElementById('brain-badge')
 const container = document.getElementById('projects-container')
-const statusBar = document.getElementById('status-bar')
 let cursor = 0
+// Server-stamped timestamps of events already applied. Used to dedupe between
+// the live SSE stream and replayed persistent chat history.
+const seenEventTs = new Set()
+const SEEN_TS_MAX = 5000 // cap memory; oldest evicted via Set insertion order
+
+function markSeen(t) {
+  if (typeof t !== 'number') return false
+  if (seenEventTs.has(t)) return true
+  seenEventTs.add(t)
+  if (seenEventTs.size > SEEN_TS_MAX) {
+    // Evict oldest (Set preserves insertion order)
+    const first = seenEventTs.values().next().value
+    if (first !== undefined) seenEventTs.delete(first)
+  }
+  return false
+}
 
 function ts() {
   return new Date().toLocaleTimeString()
+}
+
+function tsFromEpoch(epochMs) {
+  if (!epochMs) return ts()
+  return new Date(epochMs).toLocaleTimeString()
 }
 
 function escapeHtml(text) {
@@ -99,19 +152,94 @@ function projectLabel(agentName) {
   return agentName.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
 }
 
-// Toggle project row open/closed and scroll logs to bottom if needed
-function toggleProjectRow(rowEl) {
-  rowEl.classList.toggle('open')
-  if (rowEl.classList.contains('open')) {
-    // Scroll any logs that received content while collapsed
-    requestAnimationFrame(function() {
-      rowEl.querySelectorAll('.panel-log').forEach(function(log) {
-        if (log._needsScrollOnReveal) {
-          log.scrollTop = log.scrollHeight
-          log._needsScrollOnReveal = false
-        }
-      })
+// Scroll any panel logs that received content while collapsed, once the row
+// is revealed again. Called by both setChatsOpen and the master toggle.
+function flushPendingScrolls(rowEl) {
+  requestAnimationFrame(function() {
+    rowEl.querySelectorAll('.panel-log').forEach(function(log) {
+      if (log._needsScrollOnReveal) {
+        log.scrollTop = log.scrollHeight
+        log._needsScrollOnReveal = false
+      }
     })
+  })
+}
+
+// Open/close the chats panel (worker + supervisor logs). The chats state is
+// carried on the row element via the `open` class — same as before — so
+// existing CSS (`.project-row.open .project-row-body { display: flex }`)
+// keeps working.
+function setChatsOpen(rowEl, open) {
+  rowEl.classList.toggle('open', open)
+  const btn = rowEl.querySelector('[data-action="toggle-chats"]')
+  if (btn) {
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false')
+    const arrow = btn.querySelector('.row-toggle-arrow')
+    if (arrow) arrow.innerHTML = open ? '&#9660;' : '&#9654;'
+  }
+  if (open) flushPendingScrolls(rowEl)
+}
+
+function setSettingsOpen(rowEl, open) {
+  const content = rowEl.querySelector('.directive-content')
+  if (content) content.classList.toggle('open', open)
+  const btn = rowEl.querySelector('[data-action="toggle-settings"]')
+  if (btn) {
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false')
+    const arrow = btn.querySelector('.row-toggle-arrow')
+    if (arrow) arrow.innerHTML = open ? '&#9660;' : '&#9654;'
+  }
+}
+
+function setHistoryOpen(rowEl, open) {
+  const content = rowEl.querySelector('.history-content')
+  if (content) content.classList.toggle('open', open)
+  const btn = rowEl.querySelector('[data-action="toggle-history"]')
+  if (btn) {
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false')
+    const arrow = btn.querySelector('.row-toggle-arrow')
+    if (arrow) arrow.innerHTML = open ? '&#9660;' : '&#9654;'
+  }
+  if (open) loadHistory(rowEl.dataset.agent)
+}
+
+function setNotesOpen(rowEl, open) {
+  const content = rowEl.querySelector('.notes-content')
+  if (content) content.classList.toggle('open', open)
+  const btn = rowEl.querySelector('[data-action="toggle-notes"]')
+  if (btn) {
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false')
+    const arrow = btn.querySelector('.row-toggle-arrow')
+    if (arrow) arrow.innerHTML = open ? '&#9660;' : '&#9654;'
+  }
+  if (open) loadNotes(rowEl.dataset.agent)
+}
+
+// Master toggle: clicking the project header collapses every open view and
+// remembers which were open, so a second click restores the prior layout.
+function masterToggleRow(rowEl) {
+  const chatsOpen = rowEl.classList.contains('open')
+  const settingsOpen = !!rowEl.querySelector('.directive-content.open')
+  const historyOpen = !!rowEl.querySelector('.history-content.open')
+  const notesOpen = !!rowEl.querySelector('.notes-content.open')
+  const anyOpen = chatsOpen || settingsOpen || historyOpen || notesOpen
+  if (anyOpen) {
+    rowEl.dataset.prevOpen = [
+      chatsOpen ? 'chats' : '',
+      settingsOpen ? 'settings' : '',
+      historyOpen ? 'history' : '',
+      notesOpen ? 'notes' : '',
+    ].filter(Boolean).join(',')
+    if (chatsOpen) setChatsOpen(rowEl, false)
+    if (settingsOpen) setSettingsOpen(rowEl, false)
+    if (historyOpen) setHistoryOpen(rowEl, false)
+    if (notesOpen) setNotesOpen(rowEl, false)
+  } else {
+    const prev = (rowEl.dataset.prevOpen || 'chats').split(',')
+    if (prev.includes('chats')) setChatsOpen(rowEl, true)
+    if (prev.includes('settings')) setSettingsOpen(rowEl, true)
+    if (prev.includes('history')) setHistoryOpen(rowEl, true)
+    if (prev.includes('notes')) setNotesOpen(rowEl, true)
   }
 }
 
@@ -130,32 +258,39 @@ function ensureAgent(name) {
 
   row.innerHTML = `
     <div class="project-row-header" role="button" tabindex="0" aria-expanded="true">
-      <span class="project-row-arrow" aria-hidden="true">&#9654;</span>
+      <span class="project-row-dots" aria-hidden="true">
+        <span class="status-dot dot-idle" id="wdot-${sid}" title="Worker"></span>
+        <span class="status-dot dot-idle" id="sdot-${sid}" title="Supervisor"></span>
+      </span>
       <span class="project-row-name">${escapeHtml(projectLabel(name))}</span>
-      <span class="project-row-dir" id="dir-${sid}"></span>
-      <span class="project-row-port" id="port-${sid}" style="font-size:9px;color:#666;margin-left:4px;font-family:monospace;"></span>
+      <span class="project-row-dir" id="dir-${sid}" data-action="show-project-info" role="button" tabindex="0" title="Click to show tracking IDs"></span>
+      <span class="project-row-port" id="port-${sid}"></span>
       <div class="project-row-badges">
-        <span class="agent-badge badge-starting" id="projstatus-${sid}" style="margin-right:8px;">STARTING</span>
-        <span style="font-size:10px;color:#666;">Worker:</span>
-        <span class="agent-badge badge-idle" id="wbadge-${sid}">IDLE</span>
-        <span style="font-size:10px;color:#666;margin-left:4px;">Supervisor:</span>
-        <span class="agent-badge badge-idle" id="sbadge-${sid}">IDLE</span>
-        <span class="agent-badge" id="pausebadge-${sid}" style="display:none;margin-right:4px;"></span>
-        <button class="project-row-remove" data-action="pause" title="Pause supervisor after current cycle completes (click again to resume)" style="color:#f59e0b;border-color:#f59e0b;">Pause</button>
+        <button class="project-row-iconbtn iconbtn-pause" data-action="pause" aria-label="Pause supervisor" title="Pause supervisor after current cycle completes (click again to resume)">&#9208;</button>
         <span class="agent-badge" id="branchbadge-${sid}" style="display:none;background:#1e293b;color:#10b981;font-size:9px;margin-right:4px;"></span>
-        <button class="project-row-remove" data-action="merge" title="Merge the agent's isolated git branch back into the main branch" style="color:#10b981;border-color:#10b981;">Merge</button>
-        <button class="project-row-remove" data-action="validate" title="Set a shell command to run after each cycle (e.g. test suite) — fails trigger re-work" style="color:#22d3ee;border-color:#22d3ee;">Validate</button>
-        <button class="project-row-remove" data-action="ab" title="Run two models side-by-side on the same task and compare results" style="color:#c084fc;border-color:#c084fc;">A/B</button>
-        <button class="project-row-remove" data-action="remove" title="Stop supervisor, kill agent process, and remove this project">Remove</button>
+        <button class="project-row-iconbtn iconbtn-merge" data-action="merge" aria-label="Merge branch into main" title="Merge the agent's isolated git branch back into the main branch">&#8631;</button>
+        <button class="project-row-iconbtn iconbtn-remove" data-action="remove" aria-label="Remove project" title="Stop supervisor, kill agent process, and remove this project">&#10005;</button>
       </div>
     </div>
     <div class="directive-section">
-      <div class="directive-toggle" data-action="toggle-settings">&#9660; Settings</div>
+      <div class="row-toggles">
+        <button class="row-toggle" data-action="toggle-settings" aria-expanded="false" title="Show/hide settings, directive, and roles">
+          <span class="row-toggle-arrow">&#9654;</span>Settings
+        </button>
+        <button class="row-toggle" data-action="toggle-chats" aria-expanded="true" title="Show/hide worker and supervisor chat panels">
+          <span class="row-toggle-arrow">&#9660;</span>Chats
+        </button>
+        <button class="row-toggle" data-action="toggle-history" aria-expanded="false" title="Show/hide directive revision history">
+          <span class="row-toggle-arrow">&#9654;</span>History
+        </button>
+        <button class="row-toggle" data-action="toggle-notes" aria-expanded="false" title="Show/hide behavioral notes, project notes, and session memory">
+          <span class="row-toggle-arrow">&#9654;</span>Notes
+        </button>
+      </div>
       <div class="directive-content" id="dcontent-${sid}">
         <div class="drawer-tabs">
           <button class="drawer-tab active" data-action="drawer-tab" data-tab="settings">Settings</button>
-          <button class="drawer-tab" data-action="drawer-tab" data-tab="history">History</button>
-          <button class="drawer-tab" data-action="drawer-tab" data-tab="memory">Memory</button>
+          <button class="drawer-tab" data-action="drawer-tab" data-tab="roles">Roles</button>
         </div>
         <div class="drawer-panel active" id="dtab-settings-${sid}">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
@@ -168,19 +303,20 @@ function ensureAgent(name) {
           <div style="margin-bottom:4px;font-size:10px;color:#888;">Directive:</div>
           <textarea class="directive-text" id="dtxt-${sid}" rows="3"></textarea>
           <div class="directive-actions">
-            <button class="directive-save" data-action="save-directive">Save Directive &amp; Restart Supervisor</button>
-          </div>
-          <div style="margin-top:8px;display:flex;gap:6px;align-items:center;">
-            <input type="text" class="directive-text" id="dcmt-${sid}" placeholder="Leave feedback for supervisor..." style="min-height:auto;height:26px;padding:2px 8px;flex:1;">
-            <button class="directive-save" data-action="send-comment" style="white-space:nowrap;">Send Comment</button>
+            <button class="directive-save" data-action="save-directive" title="Hot-swap directive. Supervisor picks it up at the next cycle boundary — cycle count and session memory are preserved.">Save Directive</button>
+            <button class="directive-save directive-save-secondary" data-action="save-directive-restart" title="Save directive and restart the supervisor. Cycle count resets to 1 and session memory is wiped. Use for major pivots.">Save &amp; Restart</button>
+            <span class="directive-save-hint" data-hint-for="${sid}" style="display:none;"></span>
           </div>
         </div>
-        <div class="drawer-panel" id="dtab-history-${sid}">
-          <div id="dhist-${sid}" style="max-height:280px;overflow-y:auto;"></div>
+        <div class="drawer-panel" id="dtab-roles-${sid}">
+          <div id="droles-${sid}" style="max-height:360px;overflow-y:auto;"><em style="color:#555;">Click to load roles...</em></div>
         </div>
-        <div class="drawer-panel" id="dtab-memory-${sid}">
-          <div id="dmem-${sid}" style="max-height:280px;overflow-y:auto;"><em style="color:#555;">Click to load memory...</em></div>
-        </div>
+      </div>
+      <div class="history-content" id="dhistc-${sid}">
+        <div id="dhist-${sid}" style="max-height:280px;overflow-y:auto;"></div>
+      </div>
+      <div class="notes-content" id="dnotesc-${sid}">
+        <div id="dnotes-${sid}" style="max-height:280px;overflow-y:auto;"><em style="color:#555;">Loading notes...</em></div>
       </div>
     </div>
     <div class="project-row-body">
@@ -205,32 +341,44 @@ function ensureAgent(name) {
             <span class="supervisor-icon">&#9670;</span>
             <span class="label">Supervisor</span>
           </div>
+          <span class="agent-badge badge-idle" id="sbadge-${sid}">IDLE</span>
         </div>
         <div class="panel-log" id="slog-${sid}"></div>
+        <div class="agent-chatbox">
+          <input type="text" id="dcmt-${sid}" placeholder="Leave feedback for supervisor...">
+          <button data-action="send-comment">Send</button>
+        </div>
       </div>
     </div>
   `
 
-  // Attach direct event listeners for header toggle (no inline onclick)
+  // Master toggle on header click: collapses all open views, second click restores.
+  // Ignore events that originated inside a [data-action] button (pause/merge/ab/remove),
+  // since those live inside the header and would otherwise trigger the collapse as a
+  // side-effect of bubbling before the row-level delegation's stopPropagation runs.
   const header = row.querySelector('.project-row-header')
-  header.addEventListener('click', function() { toggleProjectRow(row) })
-  header.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleProjectRow(row) }
+  header.addEventListener('click', function(e) {
+    if (e.target.closest('[data-action]')) return
+    masterToggleRow(row)
   })
-
-  // Directive toggle (no inline onclick)
-  const dirToggle = row.querySelector('.directive-toggle')
-  if (dirToggle) dirToggle.addEventListener('click', function() { this.nextElementSibling.classList.toggle('open') })
+  header.addEventListener('keydown', function(e) {
+    if (e.key !== 'Enter' && e.key !== ' ') return
+    if (e.target.closest('[data-action]')) return
+    e.preventDefault()
+    masterToggleRow(row)
+  })
 
   // Chatbox Enter key (no inline onkeydown)
   const chatInput = row.querySelector('#chat-' + sid)
   if (chatInput) chatInput.addEventListener('keydown', function(e) { if (e.key === 'Enter') sendPrompt(name) })
+  const commentInput = row.querySelector('#dcmt-' + sid)
+  if (commentInput) commentInput.addEventListener('keydown', function(e) { if (e.key === 'Enter') sendComment(name) })
 
-  // Stop propagation on directive section and chatbox clicks
-  const dirSection = row.querySelector('.directive-section')
-  if (dirSection) dirSection.addEventListener('click', function(e) { e.stopPropagation() })
-
-  // Event delegation for all data-action buttons (no inline onclick)
+  // Event delegation for all data-action buttons (no inline onclick).
+  // Buttons inside .directive-section (row-toggles, drawer-tabs, save-directive,
+  // save-model) bubble up here. masterToggleRow is attached to
+  // .project-row-header (a sibling of .directive-section), so directive clicks
+  // never reach it via bubbling — no need to stopPropagation on dirSection.
   row.addEventListener('click', function(e) {
     const btn = e.target.closest('[data-action]')
     if (!btn) return
@@ -238,18 +386,22 @@ function ensureAgent(name) {
     const action = btn.dataset.action
     try {
       switch (action) {
+        case 'toggle-settings': setSettingsOpen(row, !row.querySelector('.directive-content.open')); break
+        case 'toggle-chats': setChatsOpen(row, !row.classList.contains('open')); break
+        case 'toggle-history': setHistoryOpen(row, !row.querySelector('.history-content.open')); break
+        case 'toggle-notes': setNotesOpen(row, !row.querySelector('.notes-content.open')); break
         case 'pause': togglePause(name); break
         case 'merge': mergeBranch(projectRows[name]?.projectId); break
-        case 'validate': setValidation(projectRows[name]?.projectId); break
-        case 'ab': openABTestModal(name); break
         case 'remove': removeProject(name); break
         case 'drawer-tab': switchDrawerTab(name, btn.dataset.tab, btn); break
         case 'save-model': saveModel(name); break
-        case 'save-directive': saveDirective(name); break
+        case 'save-directive': saveDirective(name, false); break
+        case 'save-directive-restart': saveDirective(name, true); break
         case 'send-comment': sendComment(name); break
         case 'send-prompt': sendPrompt(name); break
         case 'perm-approve': replyPermission(btn.dataset.agent, btn.dataset.reqid, 'approve', btn.dataset.id); break
         case 'perm-deny': replyPermission(btn.dataset.agent, btn.dataset.reqid, 'deny', btn.dataset.id); break
+        case 'show-project-info': showProjectInfo(name, btn); break
       }
     } catch (err) {
       console.error('[orchestrator-dashboard] Action handler error for', action, err)
@@ -265,9 +417,14 @@ function ensureAgent(name) {
     supervisorLog: row.querySelector('#slog-' + sid),
     workerBadge: row.querySelector('#badge-' + sid),
     supervisorBadge: row.querySelector('#sbadge-' + sid),
-    rowWorkerBadge: row.querySelector('#wbadge-' + sid),
-    rowSupervisorBadge: row.querySelector('#sbadge-' + sid),
-    projStatusBadge: row.querySelector('#projstatus-' + sid),
+    // Row-header chips have been replaced by status dots; keep these
+    // fields as the row dots so existing setBadge/setProjectStatus calls
+    // route through dot updates instead of chip text writes.
+    rowWorkerDot: row.querySelector('#wdot-' + sid),
+    rowSupervisorDot: row.querySelector('#sdot-' + sid),
+    rowWorkerBadge: null,
+    rowSupervisorBadge: null,
+    projStatusBadge: null,
     branchBadge: row.querySelector('#branchbadge-' + sid),
     directiveText: row.querySelector('#dtxt-' + sid),
     modelSelect: row.querySelector('#msel-' + sid),
@@ -490,6 +647,170 @@ function loadOlder(logEl) {
 
   // Maintain scroll position so it doesn't jump
   logEl.scrollTop += logEl.scrollHeight - prevHeight
+
+  // If the local backing buffer is exhausted and the server may have older
+  // persisted events, fetch another page from the chat-log API and prepend.
+  if (store.renderedStart <= 0) {
+    const agent = agentForLog(logEl)
+    if (agent && agent.hasMoreHistory && !agent.loadingHistory) {
+      loadOlderFromServer(agent)
+    }
+  }
+}
+
+/** Locate the agent record whose workerLog matches the given DOM element. */
+function agentForLog(logEl) {
+  for (const name in projectRows) {
+    const a = projectRows[name]
+    if (a && a.workerLog === logEl) return a
+  }
+  return null
+}
+
+/** On first project load, fetch the persisted chat log and prepend it to the
+ *  worker log so older events appear above live ones. The dedupe set
+ *  (seenEventTs) prevents double-rendering of events that also arrived via
+ *  the live SSE stream. */
+function replayInitialChatHistory(agent) {
+  if (!agent || !agent.projectId) return
+  agent.loadingHistory = true
+  const logEl = agent.workerLog
+  const prevHeight = logEl ? logEl.scrollHeight : 0
+  fetch('/api/projects/' + encodeURIComponent(agent.projectId) + '/chat?limit=200')
+    .then(function(r) { if (!r.ok) throw new Error('chat ' + r.status); return r.json() })
+    .then(function(data) {
+      const records = Array.isArray(data.events) ? data.events : []
+      if (records.length === 0) {
+        agent.hasMoreHistory = false
+        return
+      }
+      agent.oldestHistoryTs = records[0].t
+      agent.hasMoreHistory = records.length >= 200
+      if (!logEl) return
+
+      const store = getStore(logEl)
+      const frag = document.createDocumentFragment()
+      const newEntries = []
+      for (const rec of records) {
+        if (!rec || !rec.e) continue
+        if (rec.e.t == null) rec.e.t = rec.t
+        if (markSeen(rec.t)) continue
+        const entry = eventToEntry(rec.e, rec.t)
+        if (!entry) continue
+        newEntries.push(entry)
+        frag.appendChild(renderEntry(entry))
+      }
+      if (newEntries.length) {
+        store.entries.splice(0, 0, ...newEntries)
+        store.renderedStart += newEntries.length
+        logEl.insertBefore(frag, logEl.firstChild)
+        // Keep the user pinned to the bottom if that's where they were
+        if (store.pinned) {
+          logEl.scrollTop = logEl.scrollHeight
+        } else {
+          logEl.scrollTop += logEl.scrollHeight - prevHeight
+        }
+      }
+    })
+    .catch(function(err) {
+      console.error('[chat-history] initial replay failed:', err)
+      agent.hasMoreHistory = false
+    })
+    .finally(function() { agent.loadingHistory = false })
+}
+
+/** Fetch the next older page and prepend to the worker log, preserving scroll. */
+function loadOlderFromServer(agent) {
+  if (!agent || !agent.projectId || agent.loadingHistory || !agent.hasMoreHistory) return
+  agent.loadingHistory = true
+  const before = agent.oldestHistoryTs || Date.now()
+  const logEl = agent.workerLog
+  const prevHeight = logEl ? logEl.scrollHeight : 0
+  fetch('/api/projects/' + encodeURIComponent(agent.projectId) + '/chat?before=' + before + '&limit=200')
+    .then(function(r) { if (!r.ok) throw new Error('chat ' + r.status); return r.json() })
+    .then(function(data) {
+      const records = Array.isArray(data.events) ? data.events : []
+      if (records.length === 0) {
+        agent.hasMoreHistory = false
+        return
+      }
+      agent.oldestHistoryTs = records[0].t
+      agent.hasMoreHistory = records.length >= 200
+
+      // Prepend to the store's backing array so scroll-up renders them. We
+      // replay through renderEntry-compatible flow by inserting nodes directly
+      // above the current top via a temporary fragment, then shift entries
+      // into the store so later loadOlder() calls can find them.
+      const store = getStore(logEl)
+      const frag = document.createDocumentFragment()
+      const newEntries = []
+      for (const rec of records) {
+        if (!rec || !rec.e) continue
+        if (rec.e.t == null) rec.e.t = rec.t
+        if (markSeen(rec.t)) continue
+        const entry = eventToEntry(rec.e, rec.t)
+        if (!entry) continue
+        newEntries.push(entry)
+        frag.appendChild(renderEntry(entry))
+      }
+      if (newEntries.length) {
+        store.entries.splice(0, 0, ...newEntries)
+        store.renderedStart += newEntries.length
+        logEl.insertBefore(frag, logEl.firstChild)
+        if (logEl) logEl.scrollTop += logEl.scrollHeight - prevHeight
+      }
+    })
+    .catch(function(err) { console.error('[chat-history] paginate failed:', err) })
+    .finally(function() { agent.loadingHistory = false })
+}
+
+/** Convert a DashboardEvent from the persisted log into a render entry.
+ *  Mirrors handleEvent's formatting but returns a plain data object so we
+ *  can prepend it above the live entries without re-dedicating logic. */
+function eventToEntry(event, epochMs) {
+  const stamp = tsFromEpoch(epochMs)
+  if (event.type === 'agent-prompt') {
+    return {
+      type: ENTRY_COLLAPSIBLE,
+      collapsibleType: 'prompt',
+      header: 'PROMPT: ' + makeHeader(event.text, 80),
+      body: event.text,
+      startOpen: false,
+      timestamp: stamp,
+    }
+  }
+  if (event.type === 'agent-response') {
+    return {
+      type: ENTRY_COLLAPSIBLE,
+      collapsibleType: 'response',
+      header: 'RESPONSE: ' + makeHeader(event.text, 80),
+      body: event.text,
+      startOpen: false,
+      timestamp: stamp,
+    }
+  }
+  if (event.type === 'cycle-summary') {
+    return { type: ENTRY_CYCLE_SUMMARY, cycle: event.cycle, summary: event.summary }
+  }
+  if (event.type === 'agent-status') {
+    const detail = event.detail ? ' (' + event.detail + ')' : ''
+    if (event.status === 'busy') {
+      return { type: ENTRY_LOG, className: 'status', html: '&#9654; Started working', timestamp: stamp }
+    }
+    if (event.status === 'completed') {
+      return { type: ENTRY_LOG, className: 'status', html: '&#10003; Finished' + escapeHtml(detail), timestamp: stamp }
+    }
+    if (event.status === 'idle') return null
+    return { type: ENTRY_LOG, className: 'status', html: escapeHtml(event.status + detail), timestamp: stamp }
+  }
+  if (event.type === 'agent-event') {
+    const t = event.event && event.event.type || ''
+    if (['session.error', 'permission.request'].includes(t)) {
+      return { type: ENTRY_LOG, className: 'status', html: escapeHtml(t), timestamp: stamp }
+    }
+    return null
+  }
+  return null
 }
 
 // -- Convenience wrappers that create entry data and route through pushEntry --
@@ -522,6 +843,7 @@ function addCycleSummary(logEl, cycle, summary) {
 }
 
 function setBadge(badge, status) {
+  if (!badge) return
   const map = {
     idle: ['IDLE', 'badge-idle'],
     busy: ['BUSY', 'badge-busy'],
@@ -539,6 +861,31 @@ function setBadge(badge, status) {
   const [text, cls] = map[status] || [String(status ?? 'UNKNOWN').toUpperCase(), 'badge-idle']
   badge.textContent = text
   badge.className = 'agent-badge ' + cls
+}
+
+/** Map any worker/supervisor/project status to one of the 7 dot color classes.
+ *  Supervisor-specific states (supervising, reviewing) fold into busy. */
+function dotClassFor(status) {
+  switch (status) {
+    case 'busy':
+    case 'supervising':
+    case 'reviewing':
+    case 'running':
+    case 'starting': return 'dot-busy'
+    case 'disconnected': return 'dot-disconnected'
+    case 'error': return 'dot-error'
+    case 'completed':
+    case 'done': return 'dot-done'
+    case 'paused': return 'dot-paused'
+    case 'stuck': return 'dot-stuck'
+    default: return 'dot-idle'
+  }
+}
+
+function setDot(dotEl, status, titleLabel) {
+  if (!dotEl) return
+  dotEl.className = 'status-dot ' + dotClassFor(status)
+  if (titleLabel) dotEl.title = titleLabel + ': ' + (status || 'idle')
 }
 
 function statusToDot(status) {
@@ -561,39 +908,41 @@ function statusToLabel(status) {
 function effectiveStatus(a) {
   // Combined project status: supervisor state takes priority over momentary worker idle
   if (a.supervisorStatus === 'paused') return 'paused'
+  // If the backend says a supervisor is active right now, any stale local
+  // 'completed' is wrong — the old supervisor's terminal 'done' event hasn't
+  // been cleared yet by a follow-up 'running'. Show 'busy' instead of a
+  // misleading sticky blue/done chip.
+  if (a.projectStatus === 'supervising' && a.supervisorStatus === 'completed') return 'busy'
   if (a.supervisorStatus === 'completed') return 'completed'
   if (a.status === 'error' || a.status === 'disconnected' || a.status === 'stuck') return a.status
   if (a.supervisorStatus === 'busy') return 'busy'
   return a.status
 }
 
-function updateStatusBar() {
-  if (updateStatusBar._raf) return // already scheduled
-  updateStatusBar._raf = requestAnimationFrame(() => {
-    updateStatusBar._raf = null
-    const items = Object.entries(projectRows).map(([name, a]) => {
-      const combined = effectiveStatus(a)
-      const dotClass = statusToDot(combined)
-      const label = statusToLabel(combined)
-    const labelColor = dotClass === 'dot-busy' ? '#facc15' : dotClass === 'dot-disconnected' || dotClass === 'dot-error' ? '#ef4444' : dotClass === 'dot-done' ? '#60a5fa' : dotClass === 'dot-paused' ? '#f59e0b' : dotClass === 'dot-stuck' ? '#fb923c' : '#4ade80'
-      return '<a href="javascript:void(0)" onclick="document.getElementById(\'row-' + sanitizeId(name) + '\')?.scrollIntoView({behavior:\'smooth\',block:\'center\'})" style="text-decoration:none;color:inherit;cursor:pointer"><span class="status-dot ' + dotClass + '" aria-hidden="true"></span>' + escapeHtml(name) + '<span class="status-dot-label" style="color:' + labelColor + ';margin-left:4px;">' + label + '</span></a>'
-    })
-    statusBar.innerHTML = items.join('')
-  })
-}
-
 function handleEvent(event) {
   if (event.type === 'heartbeat') return
+  // Dedupe between live SSE and replayed persistent chat history.
+  // Each server-pushed event carries a unique `t` (epoch ms).
+  if (event.t != null && markSeen(event.t)) return
 
   if (event.type === 'agent-status') {
     const agent = ensureAgent(event.agent)
     if (!agent) return
     agent.status = event.status
     setBadge(agent.workerBadge, event.status)
-    setBadge(agent.rowWorkerBadge, event.status)
+    setDot(agent.rowWorkerDot, event.status, 'Worker')
     const detail = event.detail ? ' (' + event.detail + ')' : ''
-    addLogEntry(agent.workerLog, 'status', escapeHtml(event.status + detail))
-    updateStatusBar()
+    // Render human-friendly status lines; raw 'idle' is redundant (completion line already implies it)
+    if (event.status === 'busy') {
+      const preview = agent.lastPromptPreview ? ' on: ' + escapeHtml(agent.lastPromptPreview) : ''
+      addLogEntry(agent.workerLog, 'status', '&#9654; Started working' + preview)
+    } else if (event.status === 'completed') {
+      addLogEntry(agent.workerLog, 'status', '&#10003; Finished' + escapeHtml(detail))
+    } else if (event.status === 'idle') {
+      // Intentionally skip — idle is implied by the preceding completion line
+    } else {
+      addLogEntry(agent.workerLog, 'status', escapeHtml(event.status + detail))
+    }
     if (event.status === 'completed') {
       notify(event.agent + ' completed', detail || 'Task finished')
       showNotification(event.agent + ' completed', 'success')
@@ -608,6 +957,7 @@ function handleEvent(event) {
   if (event.type === 'agent-prompt') {
     const agent = ensureAgent(event.agent)
     if (!agent) return
+    agent.lastPromptPreview = makeHeader(event.text, 60)
     const header = 'PROMPT: ' + makeHeader(event.text, 80)
     addCollapsible(agent.workerLog, 'prompt', header, event.text, false)
   }
@@ -627,7 +977,8 @@ function handleEvent(event) {
 
   if (event.type === 'agent-event') {
     const t = event.event?.type || ''
-    if (['session.idle', 'session.error', 'permission.request'].includes(t)) {
+    // session.idle is suppressed — the 'Finished (Xs)' status line already conveys idleness.
+    if (['session.error', 'permission.request'].includes(t)) {
       const agent = ensureAgent(event.agent)
       if (!agent) return
       addLogEntry(agent.workerLog, 'status', escapeHtml(t))
@@ -747,26 +1098,25 @@ function handleEvent(event) {
     // conflicting writes between real-time events and polling.
     if (event.status === 'running') {
       setBadge(agent.supervisorBadge, 'supervising')
-      setBadge(agent.rowSupervisorBadge, 'supervising')
+      setDot(agent.rowSupervisorDot, 'supervising', 'Supervisor')
       agent.supervisorStatus = 'busy'
     } else if (event.status === 'reviewing') {
       setBadge(agent.supervisorBadge, 'reviewing')
-      setBadge(agent.rowSupervisorBadge, 'reviewing')
+      setDot(agent.rowSupervisorDot, 'reviewing', 'Supervisor')
       agent.supervisorStatus = 'busy'
     } else if (event.status === 'paused') {
       setBadge(agent.supervisorBadge, 'paused')
-      setBadge(agent.rowSupervisorBadge, 'paused')
+      setDot(agent.rowSupervisorDot, 'paused', 'Supervisor')
       agent.supervisorStatus = 'paused'
     } else if (event.status === 'done') {
       setBadge(agent.supervisorBadge, 'completed')
-      setBadge(agent.rowSupervisorBadge, 'completed')
+      setDot(agent.rowSupervisorDot, 'completed', 'Supervisor')
       agent.supervisorStatus = 'completed'
     } else {
       setBadge(agent.supervisorBadge, 'idle')
-      setBadge(agent.rowSupervisorBadge, 'idle')
+      setDot(agent.rowSupervisorDot, 'idle', 'Supervisor')
       agent.supervisorStatus = 'idle'
     }
-    updateStatusBar()
   }
 
   if (event.type === 'brain-thinking') {
@@ -805,9 +1155,8 @@ function applyStatusData(data) {
     if (agent.link) agent.link.href = info.url || '#'
     agent.status = info.status
     setBadge(agent.workerBadge, info.status)
-    setBadge(agent.rowWorkerBadge, info.status)
+    setDot(agent.rowWorkerDot, info.status, 'Worker')
   }
-  updateStatusBar()
 }
 
 // Fetch and apply project data (directives, projectIds, project status)
@@ -816,7 +1165,12 @@ function applyProjectData(projects) {
   for (const proj of projects) {
     const agent = projectRows[proj.agentName]
     if (!agent) continue
+    const firstIdAssignment = !agent.projectId && proj.id
     agent.projectId = proj.id
+    if (firstIdAssignment && !agent.historyReplayed) {
+      agent.historyReplayed = true
+      replayInitialChatHistory(agent)
+    }
     agent.directive = proj.directive
     if (agent.portLabel && proj.workerPort) {
       agent.portLabel.textContent = ':' + proj.workerPort
@@ -832,6 +1186,20 @@ function applyProjectData(projects) {
     if (agent.projStatusBadge && proj.status) {
       setProjectStatus(agent.projStatusBadge, proj.status)
     }
+    if (proj.status) agent.projectStatus = proj.status
+    // Reconcile stale supervisor chip against backend ground truth. The local
+    // supervisorStatus is driven by SSE 'supervisor-status' events and can
+    // get stranded on 'completed' if the follow-up 'running' event is missed,
+    // or if a supervisor was restarted off-screen. When the backend reports
+    // project.status === 'supervising' we know a supervisor is active, so any
+    // stale 'completed' / 'idle' / undefined local state is wrong — flip it
+    // back to 'busy' and repaint the supervisor badges.
+    if (proj.status === 'supervising'
+        && (agent.supervisorStatus === 'completed' || agent.supervisorStatus === 'idle' || !agent.supervisorStatus)) {
+      agent.supervisorStatus = 'busy'
+      setBadge(agent.supervisorBadge, 'supervising')
+      setDot(agent.rowSupervisorDot, 'supervising', 'Supervisor')
+    }
     // Update pause UI
     updatePauseUI(proj.agentName, proj.pauseStatus || 'none', proj.pauseRequestedAt)
     // Update branch badge
@@ -843,10 +1211,11 @@ function applyProjectData(projects) {
 }
 
 function setProjectStatus(badge, status) {
+  if (!badge) return // project-status chip removed in favor of row status dots
   const map = {
     starting: ['STARTING', 'badge-starting'],
     running: ['RUNNING', 'badge-running'],
-    supervising: [null, null], // hidden — Worker/Supervisor badges already show this
+    supervising: [null, null],
     stopped: ['FINISHED', 'badge-stopped'],
     error: ['ERROR', 'badge-error'],
   }
@@ -909,6 +1278,116 @@ function showNotification(message, type, duration) {
   while (toastContainer.children.length > 5) toastContainer.removeChild(toastContainer.firstChild)
   setTimeout(() => { if (toast.parentNode) toast.remove() }, duration)
 }
+
+// --- Project info popup: reveals tracking IDs on path click ---
+const projectInfoPopup = document.createElement('div')
+projectInfoPopup.className = 'project-info-popup'
+projectInfoPopup.style.display = 'none'
+document.body.appendChild(projectInfoPopup)
+
+function closeProjectInfoPopup() {
+  projectInfoPopup.style.display = 'none'
+  projectInfoPopup.dataset.forAgent = ''
+}
+
+function renderProjectInfoRow(label, value, copyable) {
+  const safe = escapeHtml(value ?? '—')
+  const copy = copyable && value
+    ? `<button class="pinfo-copy" data-copy="${escapeHtml(value)}" title="Copy to clipboard" aria-label="Copy ${escapeHtml(label)}">&#128203;</button>`
+    : ''
+  return `<div class="pinfo-row"><span class="pinfo-label">${escapeHtml(label)}</span><span class="pinfo-value">${safe}</span>${copy}</div>`
+}
+
+async function showProjectInfo(agentName, anchorEl) {
+  const agent = projectRows[agentName]
+  if (!agent) return
+
+  // Toggle off if clicking the same anchor while popup is open
+  if (projectInfoPopup.style.display === 'block' && projectInfoPopup.dataset.forAgent === agentName) {
+    closeProjectInfoPopup()
+    return
+  }
+
+  const directory = agent.dirLabel?.textContent || ''
+  const projectId = agent.projectId || '(not yet assigned)'
+
+  // Fetch live project details + latest analytics session in parallel.
+  const [projectsRes, sessionsRes] = await Promise.allSettled([
+    apiFetch('/api/projects'),
+    apiFetch('/api/analytics/sessions?agent=' + encodeURIComponent(agentName)),
+  ])
+
+  let project = null
+  try {
+    if (projectsRes.status === 'fulfilled') {
+      const list = await projectsRes.value.json()
+      project = Array.isArray(list) ? list.find(p => p.id === projectId || p.agentName === agentName) : null
+    }
+  } catch {}
+
+  let latestSession = null
+  try {
+    if (sessionsRes.status === 'fulfilled') {
+      const sessions = await sessionsRes.value.json()
+      if (Array.isArray(sessions) && sessions.length > 0) latestSession = sessions[0]
+    }
+  } catch {}
+
+  const rows = [
+    renderProjectInfoRow('Agent', agentName, true),
+    renderProjectInfoRow('Project ID', projectId, !!agent.projectId),
+    renderProjectInfoRow('Directory', directory, !!directory),
+    renderProjectInfoRow('Worker port', project?.workerPort ? String(project.workerPort) : '', !!project?.workerPort),
+    renderProjectInfoRow('Agent branch', project?.agentBranch || '', !!project?.agentBranch),
+    renderProjectInfoRow('Base branch', project?.baseBranch || '', !!project?.baseBranch),
+    renderProjectInfoRow('Latest session', latestSession?.id || '(none yet)', !!latestSession?.id),
+    renderProjectInfoRow('Model', project?.model || latestSession?.model || '', !!(project?.model || latestSession?.model)),
+  ].join('')
+
+  projectInfoPopup.innerHTML = `
+    <div class="pinfo-header">
+      <span>Tracking IDs</span>
+      <button class="pinfo-close" aria-label="Close" title="Close">&times;</button>
+    </div>
+    <div class="pinfo-body">${rows}</div>
+  `
+  projectInfoPopup.dataset.forAgent = agentName
+  projectInfoPopup.style.display = 'block'
+
+  // Position below the anchor, clamped to viewport.
+  const rect = anchorEl.getBoundingClientRect()
+  const popupW = 360
+  const left = Math.min(Math.max(8, rect.left), window.innerWidth - popupW - 8)
+  projectInfoPopup.style.left = left + 'px'
+  projectInfoPopup.style.top = (rect.bottom + 6) + 'px'
+}
+
+// Popup-level click: copy buttons + close
+projectInfoPopup.addEventListener('click', function(e) {
+  const closeBtn = e.target.closest('.pinfo-close')
+  if (closeBtn) { closeProjectInfoPopup(); return }
+  const copyBtn = e.target.closest('.pinfo-copy')
+  if (copyBtn) {
+    const value = copyBtn.dataset.copy || ''
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(value).then(
+        () => showNotification('Copied: ' + (value.length > 40 ? value.slice(0, 40) + '…' : value), 'success', 2000),
+        () => showNotification('Copy failed', 'error', 2000),
+      )
+    }
+  }
+})
+
+// Close on outside click or Esc
+document.addEventListener('click', function(e) {
+  if (projectInfoPopup.style.display !== 'block') return
+  if (projectInfoPopup.contains(e.target)) return
+  if (e.target.closest('[data-action="show-project-info"]')) return // let the toggle logic handle it
+  closeProjectInfoPopup()
+})
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape' && projectInfoPopup.style.display === 'block') closeProjectInfoPopup()
+})
 
 let annotationContext = null
 
@@ -1472,93 +1951,20 @@ if (localStorage.getItem('orch-theme') === 'light') {
   document.getElementById('theme-btn').textContent = 'Dark'
 }
 
-// Search/filter — global across all panels, projects, events, and logs
-let filterDebounceTimer = null
-function filterLogs(query) {
-  clearTimeout(filterDebounceTimer)
-  filterDebounceTimer = setTimeout(() => _filterLogs(query), 120)
+function toggleStatusVisibility() {
+  document.body.classList.toggle('hide-status')
+  const hidden = document.body.classList.contains('hide-status')
+  const btn = document.getElementById('hide-status-btn')
+  if (btn) {
+    btn.textContent = hidden ? 'Show Status' : 'Hide Status'
+    btn.classList.toggle('toolbar-btn-active', hidden)
+  }
+  localStorage.setItem('orch-hide-status', hidden ? '1' : '0')
 }
-
-function _filterLogs(query) {
-  const q = query.toLowerCase()
-
-  // Filter log entries in worker/supervisor panels using backing arrays
-  for (const [name, agent] of Object.entries(projectRows)) {
-    const rowEl = document.getElementById('row-' + sanitizeId(name))
-    if (!rowEl) continue
-
-    const nameMatch = !q || name.toLowerCase().includes(q)
-    const dirMatch = !q || (agent.dirLabel && agent.dirLabel.textContent.toLowerCase().includes(q))
-
-    // Search backing arrays for match
-    let logMatch = false
-    if (q) {
-      for (const logEl of [agent.workerLog, agent.supervisorLog]) {
-        const store = logStores.get(logEl)
-        if (!store) continue
-        for (const entry of store.entries) {
-          if (entryToText(entry).toLowerCase().includes(q)) { logMatch = true; break }
-        }
-        if (logMatch) break
-      }
-    }
-
-    // Show/hide project row
-    rowEl.style.display = !q || nameMatch || dirMatch || logMatch ? '' : 'none'
-
-    // Show/hide individual DOM entries based on backing store match
-    for (const logEl of [agent.workerLog, agent.supervisorLog]) {
-      const store = logStores.get(logEl)
-      if (!store) continue
-      // Only filter rendered entries (in the DOM)
-      for (let i = 0; i < logEl.children.length; i++) {
-        const child = logEl.children[i]
-        if (!q) { child.style.display = ''; continue }
-        // Find the corresponding entry in the backing store
-        const renderedIndex = store.renderedStart + i
-        const entry = store.entries[renderedIndex]
-        if (entry) {
-          child.style.display = entryToText(entry).toLowerCase().includes(q) ? '' : 'none'
-        } else {
-          child.style.display = child.textContent.toLowerCase().includes(q) ? '' : 'none'
-        }
-      }
-    }
-  }
-
-  // Filter brain log using backing array
-  if (q) {
-    const bStore = logStores.get(brainLog)
-    let brainMatch = false
-    if (bStore) {
-      for (const entry of bStore.entries) {
-        if (entryToText(entry).toLowerCase().includes(q)) { brainMatch = true; break }
-      }
-    }
-    // Filter rendered entries
-    for (let i = 0; i < brainLog.children.length; i++) {
-      const child = brainLog.children[i]
-      if (bStore) {
-        const renderedIndex = bStore.renderedStart + i
-        const entry = bStore.entries[renderedIndex]
-        child.style.display = (entry && entryToText(entry).toLowerCase().includes(q)) ? '' : 'none'
-      } else {
-        child.style.display = child.textContent.toLowerCase().includes(q) ? '' : 'none'
-      }
-    }
-  } else {
-    brainLog.querySelectorAll('div').forEach(el => { el.style.display = '' })
-  }
-
-  // Filter live event stream entries (no backing store, DOM-only)
-  document.querySelectorAll('#live-event-log > div').forEach(el => {
-    el.style.display = !q || el.textContent.toLowerCase().includes(q) ? '' : 'none'
-  })
-
-  // Filter bus events (no backing store, DOM-only)
-  document.querySelectorAll('#bus-events > div').forEach(el => {
-    el.style.display = !q || el.textContent.toLowerCase().includes(q) ? '' : 'none'
-  })
+if (localStorage.getItem('orch-hide-status') === '1') {
+  document.body.classList.add('hide-status')
+  var _hsBtn = document.getElementById('hide-status-btn')
+  if (_hsBtn) { _hsBtn.textContent = 'Show Status'; _hsBtn.classList.add('toolbar-btn-active') }
 }
 
 // Export logs — iterates backing arrays for complete history
@@ -1578,7 +1984,7 @@ function entryToText(entry) {
 
 function exportLogs() {
   const lines = []
-  lines.push('=== OpenCode Orchestrator Log Export ===')
+  lines.push('=== Multi-Agent Orchestrator Log Export ===')
   lines.push('Exported: ' + new Date().toISOString())
   lines.push('')
   for (const [name, a] of Object.entries(projectRows)) {
@@ -1617,30 +2023,51 @@ function exportLogs() {
 // Directive / Settings panel functions
 // -----------------------------------------------------------------------
 
-async function saveDirective(agentName) {
+async function saveDirective(agentName, restart) {
   const agent = projectRows[agentName]
   if (!agent || !agent.projectId) { alert('Project not found for ' + agentName); return }
-  const btn = agent.directiveText?.closest('.directive-section')?.querySelector('.directive-save')
+  const actionsEl = agent.directiveText?.closest('.directive-section')?.querySelector('.directive-actions')
+  const primaryBtn = actionsEl?.querySelector('[data-action="save-directive"]')
+  const restartBtn = actionsEl?.querySelector('[data-action="save-directive-restart"]')
+  const hintEl = actionsEl?.querySelector('.directive-save-hint')
   const text = (agent.directiveText?.value || '').trim()
   if (!text) { alert('Directive cannot be empty'); return }
-  if (btn) { btn.disabled = true; btn.textContent = 'Saving...' }
+  if (restart) {
+    if (!confirm('Restart the supervisor?\n\nThis wipes session memory and resets cycle count to 1. Only use this for major pivots — for normal edits, use "Save Directive" (takes effect next cycle).')) return
+  }
+  const activeBtn = restart ? restartBtn : primaryBtn
+  const originalLabel = activeBtn?.textContent
+  if (primaryBtn) primaryBtn.disabled = true
+  if (restartBtn) restartBtn.disabled = true
+  if (activeBtn) activeBtn.textContent = 'Saving...'
   try {
     const res = await apiFetch('/api/projects/' + agent.projectId + '/directive', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ directive: text }),
+      body: JSON.stringify({ directive: text, restart: !!restart }),
     })
     const data = await res.json()
     if (data.ok) {
       agent.directiveText._userEdited = false
-      addLogEntry(agent.supervisorLog, 'status', 'Directive updated. Supervisor restarting...')
+      if (restart) {
+        addLogEntry(agent.supervisorLog, 'status', 'Directive updated. Supervisor restarting...')
+      } else {
+        addLogEntry(agent.supervisorLog, 'status', 'Directive updated. Takes effect at next cycle boundary.')
+        if (hintEl) {
+          hintEl.textContent = 'Saved — applies next cycle'
+          hintEl.style.display = 'inline'
+          setTimeout(() => { if (hintEl) hintEl.style.display = 'none' }, 4000)
+        }
+      }
     } else {
       alert('Failed to save directive: ' + (data.error || 'Unknown error'))
     }
   } catch (err) {
     alert('Error saving directive: ' + err)
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Save Directive & Restart Supervisor' }
+    if (primaryBtn) primaryBtn.disabled = false
+    if (restartBtn) restartBtn.disabled = false
+    if (activeBtn && originalLabel) activeBtn.textContent = originalLabel
   }
 }
 
@@ -1680,6 +2107,7 @@ async function sendComment(agentName) {
   const btn = input?.nextElementSibling
   const comment = input.value.trim()
   if (!comment) { alert('Please enter a comment.'); return }
+  const originalBtnText = btn ? btn.textContent : 'Send'
   if (btn) { btn.disabled = true; btn.textContent = 'Sending...' }
   try {
     const res = await apiFetch('/api/projects/' + agent.projectId + '/directive-comment', {
@@ -1691,15 +2119,15 @@ async function sendComment(agentName) {
     if (data.ok) {
       input.value = ''
       addLogEntry(agent.supervisorLog, 'status', 'Comment sent to supervisor: "' + comment.slice(0, 80) + '"')
-      const histEl = document.getElementById('dhist-' + sanitizeId(agentName))
-      if (histEl && histEl.style.display !== 'none') loadHistory(agentName)
+      const histContent = document.getElementById('dhistc-' + sanitizeId(agentName))
+      if (histContent && histContent.classList.contains('open')) loadHistory(agentName)
     } else {
       alert('Failed: ' + (data.error || 'Unknown error'))
     }
   } catch (err) {
     alert('Error: ' + err)
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Send Comment' }
+    if (btn) { btn.disabled = false; btn.textContent = originalBtnText }
   }
 }
 
@@ -1715,21 +2143,133 @@ function switchDrawerTab(agentName, tabName, btn) {
   var panel = document.getElementById('dtab-' + tabName + '-' + sid)
   if (panel) panel.classList.add('active')
   // Auto-load data when switching to tabs
-  if (tabName === 'history') loadHistory(agentName)
-  if (tabName === 'memory') loadMemory(agentName)
+  if (tabName === 'roles') loadRoles(agentName)
 }
 
-async function loadMemory(agentName) {
-  var el = document.getElementById('dmem-' + sanitizeId(agentName))
+async function loadRoles(agentName) {
+  const sid = sanitizeId(agentName)
+  const el = document.getElementById('droles-' + sid)
   if (!el) return
-  el.innerHTML = '<em style="color:#555;">Loading memory...</em>'
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) { el.innerHTML = '<em style="color:#555;">Waiting for project to start...</em>'; return }
+  el.innerHTML = '<em style="color:#555;">Loading roles...</em>'
+  try {
+    const res = await apiFetch('/api/projects/' + agent.projectId + '/responsibilities')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    const list = await res.json()
+    renderRoles(agentName, list)
+  } catch (err) {
+    el.innerHTML = '<em style="color:#ef4444;">Failed to load: ' + escapeHtml(String(err)) + '</em>'
+  }
+}
+
+function renderRoles(agentName, list) {
+  const sid = sanitizeId(agentName)
+  const el = document.getElementById('droles-' + sid)
+  if (!el) return
+  if (!Array.isArray(list) || list.length === 0) {
+    el.innerHTML = '<em style="color:#555;">No responsibilities configured.</em>'
+    return
+  }
+  const byOwner = { supervisor: [], worker: [] }
+  for (const r of list) (byOwner[r.owner] || (byOwner[r.owner] = [])).push(r)
+  const sections = []
+  for (const owner of ['supervisor', 'worker']) {
+    const items = byOwner[owner]
+    if (!items || items.length === 0) continue
+    sections.push(
+      '<div class="roles-section">' +
+      '<div class="roles-section-title">' + (owner === 'supervisor' ? '&#9670; Supervisor' : '&#9881; Worker') + '</div>' +
+      items.map(r => roleItemHtml(agentName, r)).join('') +
+      '</div>'
+    )
+  }
+  el.innerHTML = sections.join('')
+  // Wire up checkboxes
+  el.querySelectorAll('[data-role-toggle]').forEach(cb => {
+    cb.addEventListener('change', () => patchResponsibility(agentName, cb.dataset.roleToggle, { enabled: cb.checked }))
+  })
+  // Wire up validation-command inline editor
+  el.querySelectorAll('[data-role-edit-validation]').forEach(btn => {
+    btn.addEventListener('click', () => editValidationConfig(agentName, btn.dataset.roleEditValidation))
+  })
+}
+
+function statusMark(status) {
+  if (status === 'success') return '<span title="Last run passed" style="color:#22c55e;font-weight:bold;">&#10003;</span>'
+  if (status === 'failure') return '<span title="Last run failed" style="color:#ef4444;font-weight:bold;">&#10007;</span>'
+  if (status === 'skipped') return '<span title="Skipped" style="color:#888;">&#8211;</span>'
+  return ''
+}
+
+function roleItemHtml(agentName, r) {
+  const sid = sanitizeId(agentName)
+  const checkboxId = 'role-' + sid + '-' + sanitizeId(r.id)
+  const cmd = r.config && (r.config.command || r.config.preset)
+  const lastSeen = r.lastRunAt ? ' &middot; last ' + new Date(r.lastRunAt).toLocaleTimeString() : ''
+  const mark = statusMark(r.lastStatus)
+  const editBtn = r.id === 'supervisor.run-validation'
+    ? '<button class="role-edit" data-role-edit-validation="' + escapeHtml(r.id) + '" title="Edit validation command">' + (cmd ? escapeHtml(String(cmd)) : 'Set command') + '</button>'
+    : ''
+  return (
+    '<label class="role-item" for="' + checkboxId + '">' +
+      '<input type="checkbox" id="' + checkboxId + '" data-role-toggle="' + escapeHtml(r.id) + '"' + (r.enabled ? ' checked' : '') + '>' +
+      '<span class="role-body">' +
+        '<span class="role-label">' + escapeHtml(r.label) + ' ' + mark + '</span>' +
+        '<span class="role-desc">' + escapeHtml(r.description) + lastSeen + '</span>' +
+      '</span>' +
+      editBtn +
+    '</label>'
+  )
+}
+
+async function patchResponsibility(agentName, responsibilityId, body) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) return
+  try {
+    const res = await apiFetch('/api/projects/' + agent.projectId + '/responsibilities/' + encodeURIComponent(responsibilityId), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) {
+      const e = await res.json().catch(() => ({}))
+      showNotification('Failed to update role: ' + (e.error || res.status), 'error')
+      loadRoles(agentName) // revert UI from server state
+      return
+    }
+    // Refresh to show new state (+ reset stale lastStatus when command changes)
+    loadRoles(agentName)
+  } catch (err) {
+    showNotification('Error: ' + err, 'error')
+    loadRoles(agentName)
+  }
+}
+
+async function editValidationConfig(agentName, responsibilityId) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) return
+  const choice = prompt('Validation preset or command.\nPresets: test, typecheck, lint, build, test+typecheck\nOr enter a custom command (e.g., "bun test"):')
+  if (!choice) return
+  const presets = ['test', 'typecheck', 'lint', 'build', 'test+typecheck']
+  const config = presets.includes(choice.trim().toLowerCase())
+    ? { preset: choice.trim().toLowerCase(), failAction: 'inject' }
+    : { command: choice, failAction: 'inject' }
+  await patchResponsibility(agentName, responsibilityId, { config, enabled: true })
+}
+
+async function loadNotes(agentName) {
+  var el = document.getElementById('dnotes-' + sanitizeId(agentName))
+  if (!el) return
+  el.innerHTML = '<em style="color:#555;">Loading notes...</em>'
   try {
     var res = await apiFetch('/api/memory/' + agentName)
     if (!res.ok) throw new Error('HTTP ' + res.status)
     var data = await res.json()
     var html = ''
 
-    // Behavioral notes
+    // Behavioral notes — supervisor writes these about worker interaction,
+    // for the orchestrator agent to review and improve project execution.
     if (data.behavioralNotes && data.behavioralNotes.length > 0) {
       html += '<div class="mem-section">'
       html += '<div class="mem-section-title">Behavioral Notes</div>'
@@ -1781,18 +2321,13 @@ async function loadMemory(agentName) {
     }
 
     if (!html) {
-      html = '<em style="color:#555;font-size:11px;">No memory records yet. Memory accumulates as the supervisor runs cycles.</em>'
+      html = '<em style="color:#555;font-size:11px;">No notes yet. Behavioral notes, project notes, and session summaries accumulate as the supervisor runs cycles.</em>'
     }
 
     el.innerHTML = html
   } catch (err) {
-    el.innerHTML = '<em style="color:#ef4444;font-size:11px;">Error loading memory: ' + err + '</em>'
+    el.innerHTML = '<em style="color:#ef4444;font-size:11px;">Error loading notes: ' + err + '</em>'
   }
-}
-
-// toggleHistory kept for backward compat but now called from switchDrawerTab
-function toggleHistory(agentName) {
-  loadHistory(agentName)
 }
 
 async function loadHistory(agentName) {
@@ -1824,6 +2359,7 @@ async function loadHistory(agentName) {
       html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px;">'
       html += '<span style="color:' + sourceColor + ';font-weight:600;font-size:9px;text-transform:uppercase;">' + sourceLabel + '</span>'
       html += '<span style="color:#555;">' + timeStr + '</span>'
+      if (typeof entry.cycleNumber === 'number') html += '<span style="color:#666;font-size:9px;">after cycle ' + entry.cycleNumber + '</span>'
       if (isLatest) html += '<span style="color:#4ade80;font-size:9px;font-weight:600;">CURRENT</span>'
       html += '</div>'
       html += '<div style="color:#c0c0c0;line-height:1.4;white-space:pre-wrap;max-height:80px;overflow:hidden;">' + escapeHtml(entry.text.slice(0, 300)) + (entry.text.length > 300 ? '...' : '') + '</div>'
@@ -1866,10 +2402,10 @@ function revertDirective(agentName, historyIndex) {
   fetch('/api/projects/' + agent.projectId + '/directive-history').then(r => r.json()).then(history => {
     if (!history[historyIndex]) return
     const text = history[historyIndex].text
-    if (!confirm('Revert directive to:\n\n"' + text.slice(0, 200) + '"\n\nThis will restart the supervisor.')) return
+    if (!confirm('Revert directive to:\n\n"' + text.slice(0, 200) + '"\n\nApplies at the next cycle boundary (no restart).')) return
     agent.directiveText.value = text
     agent.directiveText._userEdited = true
-    saveDirective(agentName)
+    saveDirective(agentName, false)
   })
 }
 
@@ -1959,7 +2495,6 @@ async function removeProject(agentName) {
     if (row) row.remove()
     delete projectRows[agentName]
     delete agents[agentName]
-    updateStatusBar()
     checkEmptyState()
   } catch (err) {
     alert('Error removing project: ' + err)
@@ -1984,26 +2519,100 @@ async function togglePause(agentName) {
   const projectId = await getProjectId(agentName)
   if (!projectId) { alert('Cannot find project for ' + agentName); return }
   const agent = projectRows[agentName]
-  const isPaused = agent?.supervisorStatus === 'paused'
-  const endpoint = isPaused ? 'resume' : 'pause'
+  const btn = agent?.row?.querySelector('[data-action="pause"]')
+  // Treat both 'requested' and 'paused' as "not idle" → resume cancels either
+  const isActive = agent?.pauseStatus === 'paused' || agent?.pauseStatus === 'requested'
+  const endpoint = isActive ? 'resume' : 'pause'
+  if (btn) btn.disabled = true
   try {
     const res = await apiFetch('/api/projects/' + projectId + '/' + endpoint, { method: 'POST' })
     if (!res.ok) { const e = await res.json().catch(() => ({})); alert(e.error || 'Failed'); return }
-  } catch (err) { alert('Error: ' + err) }
+    // Optimistic update — avoids 10s lag until next /api/projects poll
+    updatePauseUI(agentName, isActive ? 'none' : 'requested', Date.now())
+  } catch (err) {
+    alert('Error: ' + err)
+  } finally {
+    if (btn) btn.disabled = false
+  }
 }
 
-async function pauseAll() {
-  try {
-    const res = await apiFetch('/api/pause-all', { method: 'POST' })
-    if (!res.ok) { const err = await res.json().catch(() => ({})); showNotification('Pause all failed: ' + (err.error || res.status), 'error') }
-  } catch (err) { showNotification('Pause all error: ' + err, 'error') }
+function countPauseStates() {
+  let pausing = 0, paused = 0, pausable = 0
+  for (const name in projectRows) {
+    const a = projectRows[name]
+    const s = a.pauseStatus
+    const ps = a.projectStatus
+    if (s === 'requested') pausing++
+    else if (s === 'paused') paused++
+    else if (ps === 'supervising' || ps === 'running') pausable++
+  }
+  return { pausing, paused, pausable, total: pausing + paused }
 }
 
-async function resumeAll() {
+function updateToolbarPauseButton() {
+  const btn = document.getElementById('pause-all-btn')
+  if (!btn) return
+  const { pausing, paused, total } = countPauseStates()
+  if (total === 0) {
+    btn.textContent = 'Pause All'
+    btn.style.color = '#f59e0b'
+    btn.style.borderColor = '#f59e0b'
+    btn.setAttribute('aria-label', 'Pause all projects')
+    btn.setAttribute('title', 'Pause all supervisors after their current cycles complete')
+  } else {
+    const parts = []
+    if (pausing) parts.push(pausing + ' pausing')
+    if (paused) parts.push(paused + ' paused')
+    btn.textContent = 'Resume All (' + parts.join(' · ') + ')'
+    btn.style.color = '#22d3ee'
+    btn.style.borderColor = '#22d3ee'
+    btn.setAttribute('aria-label', 'Resume all paused projects')
+    btn.setAttribute('title', 'Resume all paused or pausing supervisors')
+  }
+}
+
+async function togglePauseAll() {
+  const btn = document.getElementById('pause-all-btn')
+  const { total, pausable } = countPauseStates()
+  const isResume = total > 0
+  if (!isResume && pausable === 0) {
+    showNotification('No running projects to pause', 'info')
+    return
+  }
+  const endpoint = isResume ? '/api/resume-all' : '/api/pause-all'
+  const label = isResume ? 'Resume' : 'Pause'
+  if (btn) btn.disabled = true
   try {
-    const res = await apiFetch('/api/resume-all', { method: 'POST' })
-    if (!res.ok) { const err = await res.json().catch(() => ({})); showNotification('Resume all failed: ' + (err.error || res.status), 'error') }
-  } catch (err) { showNotification('Resume all error: ' + err, 'error') }
+    const res = await apiFetch(endpoint, { method: 'POST' })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      showNotification(label + ' all failed: ' + (err.error || res.status), 'error')
+      return
+    }
+    if (isResume) {
+      showNotification('Resumed ' + total + ' project' + (total === 1 ? '' : 's'), 'success')
+      for (const name in projectRows) {
+        if (projectRows[name].pauseStatus && projectRows[name].pauseStatus !== 'none') {
+          updatePauseUI(name, 'none', undefined)
+        }
+      }
+    } else {
+      let affected = 0
+      for (const name in projectRows) {
+        const a = projectRows[name]
+        const pausable = a.projectStatus === 'supervising' || a.projectStatus === 'running'
+        if (pausable && (!a.pauseStatus || a.pauseStatus === 'none')) {
+          updatePauseUI(name, 'requested', Date.now())
+          affected++
+        }
+      }
+      showNotification('Pausing ' + affected + ' project' + (affected === 1 ? '' : 's') + ' — finishing current cycles...', 'success')
+    }
+  } catch (err) {
+    showNotification(label + ' all error: ' + err, 'error')
+  } finally {
+    if (btn) btn.disabled = false
+  }
 }
 
 // Update pause button text based on status
@@ -2011,49 +2620,35 @@ function updatePauseUI(agentName, pauseStatus, pauseRequestedAt) {
   const sid = sanitizeId(agentName)
   const row = document.getElementById('row-' + sid)
   const btn = row ? row.querySelector('[data-action="pause"]') : null
-  const badge = document.getElementById('pausebadge-' + sid)
+  const agent = projectRows[agentName]
+  if (agent) agent.pauseStatus = pauseStatus
+  updateToolbarPauseButton()
   if (!btn) return
   if (pauseStatus === 'requested') {
-    btn.textContent = 'Resume'
-    btn.style.color = '#22d3ee'
-    btn.style.borderColor = '#22d3ee'
-    if (badge) {
-      badge.style.display = 'inline'
-      badge.className = 'agent-badge'
-      badge.style.background = '#f59e0b'
-      badge.style.color = '#000'
-      badge.style.fontSize = '9px'
-      const ago = pauseRequestedAt ? Math.round((Date.now() - pauseRequestedAt) / 1000) : 0
-      badge.textContent = 'PAUSING...'
-      badge.title = 'Requested ' + ago + 's ago'
-    }
-    // Hide supervisor badge — pause badge shows the state
-    const sBadge = document.getElementById('sbadge-' + sid)
-    if (sBadge) sBadge.style.display = 'none'
+    btn.innerHTML = '&#9654;'
+    btn.setAttribute('aria-label', 'Cancel pending pause')
+    btn.classList.add('iconbtn-resume')
+    btn.classList.remove('iconbtn-pause')
+    const ago = pauseRequestedAt ? Math.round((Date.now() - pauseRequestedAt) / 1000) : 0
+    btn.title = 'Pausing (requested ' + ago + 's ago) — click to cancel'
+    if (agent) setDot(agent.rowSupervisorDot, 'paused', 'Supervisor (pausing)')
   } else if (pauseStatus === 'paused') {
-    btn.textContent = 'Resume'
-    btn.style.color = '#22d3ee'
-    btn.style.borderColor = '#22d3ee'
-    if (badge) {
-      badge.style.display = 'inline'
-      badge.className = 'agent-badge badge-paused'
-      badge.textContent = 'PAUSED'
-      badge.style.fontSize = '9px'
-    }
-    // Hide supervisor badge — pause badge already shows the state
-    const sBadge = document.getElementById('sbadge-' + sid)
-    if (sBadge) sBadge.style.display = 'none'
-    // Add amber left border to project row
+    btn.innerHTML = '&#9654;'
+    btn.setAttribute('aria-label', 'Resume supervisor')
+    btn.classList.add('iconbtn-resume')
+    btn.classList.remove('iconbtn-pause')
+    btn.title = 'Paused — click to resume'
+    if (agent) setDot(agent.rowSupervisorDot, 'paused', 'Supervisor (paused)')
     if (row) row.style.borderLeft = '3px solid #f59e0b'
   } else {
-    btn.textContent = 'Pause'
-    btn.style.color = '#f59e0b'
-    btn.style.borderColor = '#f59e0b'
-    if (badge) badge.style.display = 'none'
-    // Restore supervisor badge visibility
-    const sBadge = document.getElementById('sbadge-' + sid)
-    if (sBadge) sBadge.style.display = ''
+    btn.innerHTML = '&#9208;'
+    btn.setAttribute('aria-label', 'Pause supervisor')
+    btn.classList.add('iconbtn-pause')
+    btn.classList.remove('iconbtn-resume')
+    btn.title = 'Pause supervisor after current cycle completes (click again to resume)'
     if (row) row.style.borderLeft = ''
+    // Reconcile the supervisor dot back to its live status
+    if (agent) setDot(agent.rowSupervisorDot, agent.supervisorStatus || 'idle', 'Supervisor')
   }
 }
 
@@ -2111,84 +2706,6 @@ async function loadLedgerPage() {
 window.ledgerPage = function(dir) {
   ledgerOffset = Math.max(0, ledgerOffset + dir * LEDGER_PAGE_SIZE)
   loadLedgerPage()
-}
-
-// ---- A/B Test Modal ----
-
-let abTestProjectName = ''
-
-async function openABTestModal(agentName) {
-  abTestProjectName = agentName
-  const projectId = await getProjectId(agentName)
-  document.getElementById('ab-project-id').value = projectId || ''
-  // Load current directive into both textareas
-  const agent = projectRows[agentName]
-  const directive = agent?.directive || ''
-  document.getElementById('ab-directive-a').value = directive
-  document.getElementById('ab-directive-b').value = directive
-  // Load models from all enabled providers
-  try {
-    const res = await apiFetch('/api/models')
-    if (res.ok) {
-      const data = await res.json()
-      const selA = document.getElementById('ab-model-a')
-      const selB = document.getElementById('ab-model-b')
-      selA.innerHTML = ''
-      selB.innerHTML = ''
-      var lastProvider = ''
-      for (const m of data.models || []) {
-        var value = m.provider === 'ollama' ? m.model : m.provider + ':' + m.model
-        var label = m.providerName + ' / ' + m.model
-        if (m.provider !== lastProvider) {
-          selA.innerHTML += '<option disabled>── ' + m.providerName + ' ──</option>'
-          selB.innerHTML += '<option disabled>── ' + m.providerName + ' ──</option>'
-          lastProvider = m.provider
-        }
-        selA.innerHTML += '<option value="' + value + '">' + label + '</option>'
-        selB.innerHTML += '<option value="' + value + '">' + label + '</option>'
-      }
-    }
-  } catch {}
-  document.getElementById('ab-test-modal').style.display = 'flex'
-}
-
-function closeABTestModal() {
-  document.getElementById('ab-test-modal').style.display = 'none'
-}
-
-async function startABTest() {
-  const projectId = document.getElementById('ab-project-id').value
-  if (!projectId) { alert('No project ID'); return }
-  const body = {
-    variants: [
-      {
-        model: document.getElementById('ab-model-a').value,
-        directive: document.getElementById('ab-directive-a').value,
-        maxCycles: parseInt(document.getElementById('ab-cycles-a').value) || 3,
-      },
-      {
-        model: document.getElementById('ab-model-b').value,
-        directive: document.getElementById('ab-directive-b').value,
-        maxCycles: parseInt(document.getElementById('ab-cycles-b').value) || 3,
-      },
-    ],
-  }
-  try {
-    const res = await apiFetch('/api/projects/' + projectId + '/ab-test', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    })
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      alert('Failed to start A/B test: ' + (err.error || res.status))
-      return
-    }
-    closeABTestModal()
-    alert('A/B test started! Check the brain log for progress updates.')
-  } catch (err) {
-    alert('Error: ' + err)
-  }
 }
 
 // Permission reply handler
@@ -2947,6 +3464,12 @@ function connectSSE() {
           }
         }
       }
+      if (evt.type === 'validation-result' && evt.agentName) {
+        // If the Roles tab is open for this agent, refresh it so lastStatus updates live.
+        const sid = sanitizeId(evt.agentName)
+        const panel = document.getElementById('dtab-roles-' + sid)
+        if (panel && panel.classList.contains('active')) loadRoles(evt.agentName)
+      }
     } catch {} // Intentionally silent: best-effort SSE event parsing
   }
   sseSource.onerror = function() {
@@ -3133,24 +3656,37 @@ async function mergeBranch(projectId) {
   finally { if (mergeBtn) { mergeBtn.disabled = false; mergeBtn.textContent = 'Merge' } }
 }
 
-async function setValidation(projectId) {
-  var choice = prompt('Validation preset or command.\nPresets: test, typecheck, lint, build, test+typecheck\nOr enter a custom command (e.g., "bun test"):\n\nEnter preset name or command:')
-  if (!choice) return
-  var presets = ['test', 'typecheck', 'lint', 'build', 'test+typecheck']
-  var body = presets.includes(choice.trim().toLowerCase())
-    ? { preset: choice.trim().toLowerCase(), failAction: 'inject' }
-    : { command: choice, failAction: 'inject' }
-  try {
-    const res = await apiFetch('/api/projects/' + projectId + '/validation', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    })
-    if (res.ok) {
-      showNotification('Validation set: ' + (body.preset || body.command), 'success')
-    } else {
-      const err = await res.json().catch(() => ({}))
-      showNotification('Failed to set validation: ' + (err.error || res.status), 'error')
-    }
-  } catch (err) { showNotification('Error: ' + err, 'error') }
-}
+// -----------------------------------------------------------------------
+// Expose handlers for inline onclick= attributes
+// -----------------------------------------------------------------------
+// The <script> tag is loaded as type="module", which scopes top-level
+// declarations to the module (not to window). Inline `onclick="foo()"`
+// attributes in dashboard.html and in JS-generated HTML templates need
+// these names on window, so we re-attach them here.
+// Functions already assigned with `window.name = ...` inline (e.g.
+// refreshAnalytics, refreshLedger, ledgerPage, evaluateSession,
+// refreshPerformance) are intentionally omitted.
+Object.assign(window, {
+  // Navigation / layout
+  scrollToSection, toggleInfoPanel, collapseAllAdminSections,
+  openAdminDrawer, closeAdminDrawer,
+  // Toolbar + theme
+  exportLogs, toggleStatusVisibility, toggleTheme,
+  softStop, togglePauseAll,
+  // Add-project / browse
+  openAddProject, closeAddProject, submitProject, toggleBrowse,
+  // Analytics compare modal
+  closeCompareModal, toggleAnalyticsCard, updateCompareSelection, runComparison,
+  // Providers admin drawer
+  refreshProviders, addCustomProvider, addOllamaModel,
+  promptAddModel, promptApiKey, toggleProvider,
+  // Admin drawer sections
+  refreshBusEvents, refreshResources, refreshIntents, refreshTeam,
+  // SSE live-events panel
+  toggleSSE, clearEventLog, reconnectSSE,
+  // Command palette
+  cmdFill,
+  // Annotation popup
+  closeAnnotation, submitAnnotation,
+})
+

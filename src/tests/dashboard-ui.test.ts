@@ -32,11 +32,9 @@ function createDashboardDOM() {
 
     <header role="banner">
       <div style="display:flex;align-items:center;gap:16px;">
-        <h1>OpenCode Orchestrator</h1>
-        <div class="status-bar" id="status-bar" role="status" aria-live="polite"></div>
+        <h1>Multi-Agent Orchestrator</h1>
       </div>
       <nav class="toolbar" role="toolbar" aria-label="Dashboard controls">
-        <input type="text" class="search-input" id="search-input" placeholder="Filter logs..." aria-label="Filter log entries">
         <button class="toolbar-btn" id="theme-btn">Light</button>
       </nav>
     </header>
@@ -175,11 +173,10 @@ function injectFunctions(document: any) {
     while (toastContainer.children.length > 5) toastContainer.removeChild(toastContainer.firstChild)
   }
 
-  // -- Shared state for ensureAgent / updateStatusBar / filterLogs --
+  // -- Shared state for ensureAgent --
   const projectRows: Record<string, any> = {}
   const removedAgents = new Set<string>()
   const container = document.getElementById("projects-container")!
-  const statusBar = document.getElementById("status-bar")!
   const brainLog = document.getElementById("brain-log")!
 
   // -- ensureAgent --
@@ -238,65 +235,6 @@ function injectFunctions(document: any) {
     return data
   }
 
-  // -- updateStatusBar --
-  function updateStatusBar(): void {
-    const items = Object.entries(projectRows).map(([name, a]: [string, any]) => {
-      const dotClass = statusToDot(a.status)
-      const label = statusToLabel(a.status)
-      const labelColor = dotClass === "dot-busy" ? "#facc15"
-        : dotClass === "dot-disconnected" || dotClass === "dot-error" ? "#ef4444"
-        : dotClass === "dot-done" ? "#60a5fa" : "#4ade80"
-      return '<span><span class="status-dot ' + dotClass + '" aria-hidden="true"></span>' +
-        name + '<span class="status-dot-label" style="color:' + labelColor + ';margin-left:4px;">' +
-        label + "</span></span>"
-    })
-    statusBar.innerHTML = items.join("")
-  }
-
-  // -- filterLogs --
-  // Use individual class queries instead of comma-separated selectors (happy-dom compat)
-  function filterLogElements(q: string): void {
-    const classes = ["log-entry", "collapsible", "cycle-summary", "supervisor-entry"]
-    for (const cls of classes) {
-      document.querySelectorAll("." + cls).forEach((el: any) => {
-        el.style.display = !q || el.textContent.toLowerCase().includes(q) ? "" : "none"
-      })
-    }
-  }
-
-  function filterLogs(query: string): void {
-    const q = query.toLowerCase()
-
-    filterLogElements(q)
-
-    brainLog.querySelectorAll("div").forEach((el: any) => {
-      el.style.display = !q || el.textContent.toLowerCase().includes(q) ? "" : "none"
-    })
-
-    document.querySelectorAll(".project-row").forEach((row: any) => {
-      if (!q) { row.style.display = ""; return }
-      const nameEl = row.querySelector(".project-row-name")
-      const dirEl = row.querySelector(".project-row-dir")
-      const name = nameEl?.textContent?.toLowerCase() || ""
-      const dir = dirEl?.textContent?.toLowerCase() || ""
-      row.style.display = name.includes(q) || dir.includes(q) ? "" : "none"
-    })
-
-    const liveLog = document.getElementById("live-event-log")
-    if (liveLog) {
-      liveLog.querySelectorAll("div").forEach((el: any) => {
-        el.style.display = !q || el.textContent.toLowerCase().includes(q) ? "" : "none"
-      })
-    }
-
-    const busEvents = document.getElementById("bus-events")
-    if (busEvents) {
-      busEvents.querySelectorAll("div").forEach((el: any) => {
-        el.style.display = !q || el.textContent.toLowerCase().includes(q) ? "" : "none"
-      })
-    }
-  }
-
   // -- toggleTheme --
   function toggleTheme(): void {
     document.body.classList.toggle("light")
@@ -324,15 +262,12 @@ function injectFunctions(document: any) {
     statusToLabel,
     showNotification,
     ensureAgent,
-    updateStatusBar,
-    filterLogs,
     toggleTheme,
     scrollToSection,
     // Expose internal state for assertions
     projectRows,
     removedAgents,
     toastContainer,
-    statusBar,
     brainLog,
     container,
   }
@@ -575,56 +510,6 @@ describe("Dashboard UI — ensureAgent", () => {
   })
 })
 
-describe("Dashboard UI — updateStatusBar", () => {
-  let fn: ReturnType<typeof injectFunctions>
-
-  beforeEach(() => {
-    const { document } = createDashboardDOM()
-    fn = injectFunctions(document)
-  })
-
-  test("renders empty when no agents", () => {
-    fn.updateStatusBar()
-    expect(fn.statusBar.innerHTML).toBe("")
-  })
-
-  test("renders one agent with status dot and label", () => {
-    fn.ensureAgent("alpha")
-    fn.updateStatusBar()
-    const html = fn.statusBar.innerHTML
-    expect(html).toContain("alpha")
-    expect(html).toContain("dot-idle")
-    expect(html).toContain("idle") // label text
-    expect(html).toContain("aria-hidden=\"true\"") // dot hidden from SR
-  })
-
-  test("renders busy agent with yellow label", () => {
-    const agent = fn.ensureAgent("worker-1")!
-    agent.status = "busy"
-    fn.updateStatusBar()
-    expect(fn.statusBar.innerHTML).toContain("dot-busy")
-    expect(fn.statusBar.innerHTML).toContain("#facc15") // yellow
-    expect(fn.statusBar.innerHTML).toContain("busy")
-  })
-
-  test("renders error agent with red label", () => {
-    const agent = fn.ensureAgent("broken")!
-    agent.status = "error"
-    fn.updateStatusBar()
-    expect(fn.statusBar.innerHTML).toContain("dot-error")
-    expect(fn.statusBar.innerHTML).toContain("#ef4444") // red
-    expect(fn.statusBar.innerHTML).toContain("err")
-  })
-
-  test("renders multiple agents", () => {
-    fn.ensureAgent("a")
-    fn.ensureAgent("b")
-    fn.updateStatusBar()
-    expect(fn.statusBar.innerHTML).toContain("a")
-    expect(fn.statusBar.innerHTML).toContain("b")
-  })
-})
-
 describe("Dashboard UI — showNotification (toast)", () => {
   let fn: ReturnType<typeof injectFunctions>
 
@@ -742,94 +627,6 @@ describe("Dashboard UI — scrollToSection", () => {
   })
 })
 
-describe("Dashboard UI — filterLogs", () => {
-  let fn: ReturnType<typeof injectFunctions>
-  let document: any
-
-  beforeEach(() => {
-    const dom = createDashboardDOM()
-    document = dom.document
-    fn = injectFunctions(document)
-  })
-
-  test("hides non-matching log entries", () => {
-    // Add log entries to brain log
-    const entry1 = document.createElement("div")
-    entry1.textContent = "Error connecting to server"
-    fn.brainLog.appendChild(entry1)
-
-    const entry2 = document.createElement("div")
-    entry2.textContent = "Cycle completed successfully"
-    fn.brainLog.appendChild(entry2)
-
-    fn.filterLogs("error")
-
-    expect(entry1.style.display).toBe("")  // visible (matches)
-    expect(entry2.style.display).toBe("none")  // hidden
-  })
-
-  test("shows all entries when query is empty", () => {
-    const entry = document.createElement("div")
-    entry.textContent = "Some log entry"
-    fn.brainLog.appendChild(entry)
-
-    fn.filterLogs("hidden")
-    expect(entry.style.display).toBe("none")
-
-    fn.filterLogs("")
-    expect(entry.style.display).toBe("")
-  })
-
-  test("filters project rows by name", () => {
-    fn.ensureAgent("backend-api")
-    fn.ensureAgent("frontend-ui")
-
-    fn.filterLogs("backend")
-
-    const backendRow = document.getElementById("row-backend-api")
-    const frontendRow = document.getElementById("row-frontend-ui")
-    expect(backendRow.style.display).toBe("")
-    expect(frontendRow.style.display).toBe("none")
-  })
-
-  test("case-insensitive filtering", () => {
-    const entry = document.createElement("div")
-    entry.textContent = "ERROR: Something failed"
-    fn.brainLog.appendChild(entry)
-
-    fn.filterLogs("error")
-    expect(entry.style.display).toBe("")
-  })
-
-  test("filters live event log entries", () => {
-    const liveLog = document.getElementById("live-event-log")
-    const e1 = document.createElement("div")
-    e1.textContent = "cycle-done event"
-    liveLog.appendChild(e1)
-
-    const e2 = document.createElement("div")
-    e2.textContent = "validation-result event"
-    liveLog.appendChild(e2)
-
-    fn.filterLogs("cycle")
-    expect(e1.style.display).toBe("")
-    expect(e2.style.display).toBe("none")
-  })
-
-  test("filters bus events", () => {
-    const busEvents = document.getElementById("bus-events")
-    const e1 = document.createElement("div")
-    e1.textContent = "agent-status from worker-1"
-    busEvents.appendChild(e1)
-
-    fn.filterLogs("worker-1")
-    expect(e1.style.display).toBe("")
-
-    fn.filterLogs("nonexistent")
-    expect(e1.style.display).toBe("none")
-  })
-})
-
 describe("Dashboard UI — ARIA structure", () => {
   let document: any
 
@@ -844,12 +641,6 @@ describe("Dashboard UI — ARIA structure", () => {
     expect(sidebar.getAttribute("aria-label")).toBe("Section navigation")
   })
 
-  test("status bar has status role and aria-live", () => {
-    const bar = document.getElementById("status-bar")
-    expect(bar.getAttribute("role")).toBe("status")
-    expect(bar.getAttribute("aria-live")).toBe("polite")
-  })
-
   test("projects container has main role", () => {
     const container = document.getElementById("projects-container")
     expect(container.getAttribute("role")).toBe("main")
@@ -860,11 +651,6 @@ describe("Dashboard UI — ARIA structure", () => {
     expect(toolbar).not.toBeNull()
     expect(toolbar.getAttribute("role")).toBe("toolbar")
     expect(toolbar.getAttribute("aria-label")).toBe("Dashboard controls")
-  })
-
-  test("search input has aria-label", () => {
-    const input = document.getElementById("search-input")
-    expect(input.getAttribute("aria-label")).toBe("Filter log entries")
   })
 
   test("brain section headers are buttons with aria-expanded", () => {

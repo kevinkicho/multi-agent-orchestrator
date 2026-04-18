@@ -4,14 +4,14 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3CradialGradient id='g' cx='32' cy='32' r='28'%3E%3Cstop offset='0%25' stop-color='%239b8bff'/%3E%3Cstop offset='100%25' stop-color='%235b4bdf'/%3E%3C/radialGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='%230a0a0f'/%3E%3Cline x1='32' y1='32' x2='16' y2='14' stroke='%234a4a6a' stroke-width='2'/%3E%3Cline x1='32' y1='32' x2='48' y2='14' stroke='%234a4a6a' stroke-width='2'/%3E%3Cline x1='32' y1='32' x2='16' y2='50' stroke='%234a4a6a' stroke-width='2'/%3E%3Cline x1='32' y1='32' x2='48' y2='50' stroke='%234a4a6a' stroke-width='2'/%3E%3Ccircle cx='16' cy='14' r='6' fill='%232a2a3a' stroke='%234ade80' stroke-width='2'/%3E%3Ccircle cx='48' cy='14' r='6' fill='%232a2a3a' stroke='%2360a5fa' stroke-width='2'/%3E%3Ccircle cx='16' cy='50' r='6' fill='%232a2a3a' stroke='%23facc15' stroke-width='2'/%3E%3Ccircle cx='48' cy='50' r='6' fill='%232a2a3a' stroke='%23c084fc' stroke-width='2'/%3E%3Ccircle cx='32' cy='32' r='9' fill='url(%23g)'/%3E%3Cpath d='M28 32 L31 35 L37 29' stroke='white' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
-  <title>OpenCode Orchestrator</title>
+  <title>Multi-Agent Orchestrator</title>
   <link rel="stylesheet" href="/dashboard-client.css">
 </head>
 <body>
   <nav class="sidebar" id="sidebar" role="navigation" aria-label="Section navigation">
     <button class="sidebar-toggle" onclick="document.getElementById('sidebar').classList.toggle('expanded')" aria-label="Toggle sidebar" title="Toggle sidebar">&#9776;</button>
     <button class="sidebar-link" onclick="scrollToSection('projects-container')" title="Projects"><span class="sb-icon">&#9881;</span><span class="sb-label">Projects</span></button>
-    <button class="sidebar-link" onclick="scrollToSection('brain-section')" title="Brain"><span class="sb-icon">&#9670;</span><span class="sb-label">Brain</span></button>
+    <button class="sidebar-link" onclick="scrollToSection('brain-section')" title="Brain — the LLM orchestrator agent that reasons about the project and commands workers. Click ⓘ in the header for details."><span class="sb-icon">&#9670;</span><span class="sb-label">Brain</span></button>
     <button class="sidebar-link" onclick="scrollToSection('perf-section')" title="Performance"><span class="sb-icon">&#9734;</span><span class="sb-label">Performance</span></button>
     <button class="sidebar-link" onclick="scrollToSection('analytics-section')" title="Analytics"><span class="sb-icon">&#9733;</span><span class="sb-label">Analytics</span></button>
     <button class="sidebar-link" onclick="scrollToSection('ledger-section')" title="Prompt Log"><span class="sb-icon">&#9998;</span><span class="sb-label">Prompt Log</span></button>
@@ -25,16 +25,14 @@
 
   <header role="banner">
     <div style="display:flex;align-items:center;gap:16px;">
-      <h1>OpenCode Orchestrator</h1>
+      <h1>Multi-Agent Orchestrator</h1>
       <button class="add-project-btn" onclick="openAddProject()" aria-label="Add new project">+ Add Project</button>
-      <div class="status-bar" id="status-bar" role="status" aria-live="polite" aria-label="Agent status indicators"></div>
       <span id="connection-indicator" style="font-size:11px;margin-left:8px;white-space:nowrap;"></span>
     </div>
     <nav class="toolbar" role="toolbar" aria-label="Dashboard controls">
-      <input type="text" class="search-input" id="search-input" placeholder="Filter logs..." oninput="filterLogs(this.value)" aria-label="Filter log entries">
       <button class="toolbar-btn" onclick="exportLogs()" aria-label="Export logs to file">Export</button>
-      <button class="toolbar-btn" onclick="pauseAll()" style="color:#f59e0b;border-color:#f59e0b;" aria-label="Pause all projects" title="Pause all supervisors after their current cycles complete">Pause All</button>
-      <button class="toolbar-btn" onclick="resumeAll()" style="color:#22d3ee;border-color:#22d3ee;" aria-label="Resume all projects" title="Resume all paused supervisors immediately">Resume All</button>
+      <button class="toolbar-btn" id="hide-status-btn" onclick="toggleStatusVisibility()" aria-label="Hide status messages" title="Hide status lines (Started/Finished/etc.) — keeps only prompts and responses">Hide Status</button>
+      <button class="toolbar-btn" id="pause-all-btn" onclick="togglePauseAll()" style="color:#f59e0b;border-color:#f59e0b;" aria-label="Pause all projects" title="Pause all supervisors after their current cycles complete">Pause All</button>
       <button class="toolbar-btn" id="theme-btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme">Light</button>
     </nav>
   </header>
@@ -72,19 +70,42 @@
   <div class="admin-drawer" id="admin-drawer">
     <div class="admin-drawer-header">
       <span style="color:#8b8bff;font-weight:600;font-size:13px;">Admin Panels</span>
-      <button onclick="closeAdminDrawer()" style="background:none;border:none;color:#888;cursor:pointer;font-size:18px;line-height:1;" title="Close drawer (Esc)">&times;</button>
+      <div style="display:flex;align-items:center;gap:4px;">
+        <button class="admin-drawer-icon-btn" onclick="collapseAllAdminSections()" title="Collapse all sections" aria-label="Collapse all sections">&#9650;&#9660;</button>
+        <button class="admin-drawer-icon-btn" onclick="closeAdminDrawer()" title="Close drawer (Esc)" aria-label="Close drawer" style="font-size:18px;">&times;</button>
+      </div>
     </div>
     <div class="admin-drawer-body">
 
   <div class="brain-section" id="brain-section" role="region" aria-label="Brain orchestrator">
     <div class="brain-header" onclick="document.getElementById('brain-section').classList.toggle('open')" role="button" tabindex="0" aria-expanded="true" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click()}">
-      <h2><span class="brain-arrow" aria-hidden="true">&#9654;</span> Orchestrator Log</h2>
+      <h2><span class="brain-arrow" aria-hidden="true">&#9654;</span> Orchestrator Log <button class="info-tip-btn" onclick="event.stopPropagation();toggleInfoPanel('brain-info-panel')" aria-label="About the orchestrator brain" title="What is the brain?">&#9432;</button></h2>
       <div style="display:flex;align-items:center;gap:8px;" onclick="event.stopPropagation()">
         <button class="toolbar-btn" id="soft-stop-btn" onclick="softStop()" style="display:none;color:#facc15;border-color:#facc15;">Soft Stop</button>
         <span class="brain-status brain-idle" id="brain-badge">IDLE</span>
       </div>
     </div>
     <div class="brain-body">
+      <div class="info-panel" id="brain-info-panel" hidden>
+        <h3>What is the "brain"?</h3>
+        <p><strong>Brain</strong> (<code>brain.ts</code>) is the LLM-driven <em>orchestrator agent</em> — it reasons about the project, reads worker responses, and issues commands (<code>PROMPT</code>, <code>NOTIFY</code>, <code>NOTE</code>, etc.) to steer the fleet.</p>
+        <p>The <strong>Orchestrator</strong> class (<code>orchestrator.ts</code>) is the infrastructure layer it commands — spawns OpenCode subprocesses, delivers prompts, collects messages. No LLM reasoning; just plumbing.</p>
+        <p><em>Same conceptual role, two layers:</em> the brain thinks, the orchestrator dispatches.</p>
+        <h3>What the brain does each round</h3>
+        <ol>
+          <li><strong>Reads</strong> every worker's latest messages and current status.</li>
+          <li><strong>Decides</strong> what to do next by calling its own LLM with a system prompt + conversation history.</li>
+          <li><strong>Issues commands</strong>: <code>PROMPT</code> a worker, <code>PROMPT_ALL</code>, <code>NOTIFY</code>, record a <code>NOTE</code> to persistent memory, or declare <code>DONE</code>.</li>
+          <li><strong>Waits</strong> for workers to finish, collects new responses, feeds them back into the next round.</li>
+          <li><strong>Saves memory</strong>: persists learnings and per-agent notes for future sessions.</li>
+        </ol>
+        <h3>Arbitrator role (truncation handling)</h3>
+        <ul>
+          <li><strong>Brain's own response truncated:</strong> if the brain's LLM hits <code>max_tokens</code> mid-generation, any partial commands are <em>not</em> executed. A <code>[VALIDATION]</code> message asks the brain to retry more concisely — preventing half-formed PROMPTs from reaching workers.</li>
+          <li><strong>Worker response truncated:</strong> an <code>[ARBITRATOR NOTE]</code> is appended to the worker's reply so the brain sees the response was cut off and can PROMPT the worker to continue.</li>
+          <li><strong>Supervisor's own response truncated:</strong> same guard as the brain — skip commands, request a concise retry.</li>
+        </ul>
+      </div>
       <div class="brain-log" id="brain-log"></div>
     </div>
   </div>
@@ -304,40 +325,6 @@
     </div><!-- end admin-drawer-body -->
   </div><!-- end admin-drawer -->
 
-  <!-- A/B Test Modal -->
-  <div id="ab-test-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:1000;align-items:center;justify-content:center;">
-    <div style="background:#16162a;border:1px solid #2a2a3a;border-radius:8px;padding:20px;max-width:700px;width:90%;max-height:80vh;overflow-y:auto;">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-        <h3 style="color:#c084fc;font-size:14px;">A/B Test Configuration</h3>
-        <button onclick="closeABTestModal()" style="background:none;border:none;color:#888;cursor:pointer;font-size:16px;">&times;</button>
-      </div>
-      <input type="hidden" id="ab-project-id">
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
-        <div>
-          <h4 style="color:#f59e0b;font-size:12px;margin-bottom:8px;">Variant A</h4>
-          <label style="font-size:10px;color:#888;">Model</label>
-          <select id="ab-model-a" style="width:100%;background:#0f0f1a;color:#ccc;border:1px solid #333;border-radius:4px;padding:6px;margin-bottom:8px;font-size:11px;"></select>
-          <label style="font-size:10px;color:#888;">Directive</label>
-          <textarea id="ab-directive-a" rows="4" style="width:100%;background:#0f0f1a;color:#ccc;border:1px solid #333;border-radius:4px;padding:6px;margin-bottom:8px;font-size:11px;resize:vertical;"></textarea>
-          <label style="font-size:10px;color:#888;">Cycles</label>
-          <input type="number" id="ab-cycles-a" value="3" min="1" max="20" style="width:60px;background:#0f0f1a;color:#ccc;border:1px solid #333;border-radius:4px;padding:4px;font-size:11px;">
-        </div>
-        <div>
-          <h4 style="color:#22d3ee;font-size:12px;margin-bottom:8px;">Variant B</h4>
-          <label style="font-size:10px;color:#888;">Model</label>
-          <select id="ab-model-b" style="width:100%;background:#0f0f1a;color:#ccc;border:1px solid #333;border-radius:4px;padding:6px;margin-bottom:8px;font-size:11px;"></select>
-          <label style="font-size:10px;color:#888;">Directive</label>
-          <textarea id="ab-directive-b" rows="4" style="width:100%;background:#0f0f1a;color:#ccc;border:1px solid #333;border-radius:4px;padding:6px;margin-bottom:8px;font-size:11px;resize:vertical;"></textarea>
-          <label style="font-size:10px;color:#888;">Cycles</label>
-          <input type="number" id="ab-cycles-b" value="3" min="1" max="20" style="width:60px;background:#0f0f1a;color:#ccc;border:1px solid #333;border-radius:4px;padding:4px;font-size:11px;">
-        </div>
-      </div>
-      <div style="margin-top:16px;text-align:right;">
-        <button onclick="startABTest()" style="background:#c084fc;color:#000;border:none;border-radius:4px;padding:8px 20px;font-weight:600;cursor:pointer;">Start A/B Test</button>
-      </div>
-    </div>
-  </div>
-
   <div class="cmd-bar" role="toolbar" aria-label="Command bar">
     <span class="cmd-prompt" aria-hidden="true">orchestrator&gt;</span>
     <input type="text" id="cmd-input" placeholder="Type a command... (press ? for help)" autocomplete="off" spellcheck="false" aria-label="Command input" role="combobox" aria-expanded="false" aria-haspopup="listbox">
@@ -414,6 +401,6 @@
     </div>
   </div>
 
-  <script src="/dashboard-client.js"></script>
+  <script type="module" src="/dashboard-client.js"></script>
 </body>
 </html>

@@ -60,6 +60,21 @@ export type LLMResponse = {
   provider: string
   model: string
   usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number }
+  /** True when the upstream LLM hit its token/length limit and the response was cut off.
+   *  When true, a `[⚠ TRUNCATED ...]` marker is appended to `content` so downstream
+   *  consumers (and the models reading our transcripts) see the signal. */
+  truncated?: boolean
+  /** Raw finish/stop reason from the provider (e.g. "stop", "length", "max_tokens"). */
+  finishReason?: string
+}
+
+/** Marker appended to content when upstream truncation is detected.
+ *  Exported so consumers (brain, supervisor) can detect truncation in transcripts. */
+export const TRUNCATION_MARKER = "\n\n[⚠ TRUNCATED — upstream LLM hit max_tokens; content above may be incomplete]"
+
+/** Returns true if a string contains the truncation marker. */
+export function isTruncated(text: string): boolean {
+  return text.includes("[⚠ TRUNCATED —")
 }
 
 // ---------------------------------------------------------------------------
@@ -407,15 +422,18 @@ async function callOpenAICompatible(
   }
 
   type ChatResponse = {
-    choices?: Array<{ message?: { content?: string } }>
+    choices?: Array<{ message?: { content?: string }; finish_reason?: string }>
     usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
   }
 
   const data = await response.json() as ChatResponse
-  const content = data.choices?.[0]?.message?.content
-  if (typeof content !== "string") {
+  const rawContent = data.choices?.[0]?.message?.content
+  if (typeof rawContent !== "string") {
     throw new Error(`${provider.name} returned unexpected response: ${JSON.stringify(data).slice(0, 200)}`)
   }
+  const finishReason = data.choices?.[0]?.finish_reason
+  const truncated = finishReason === "length"
+  const content = truncated ? rawContent + TRUNCATION_MARKER : rawContent
 
   return {
     content,
@@ -426,6 +444,8 @@ async function callOpenAICompatible(
       completionTokens: data.usage.completion_tokens,
       totalTokens: data.usage.total_tokens,
     } : undefined,
+    truncated,
+    finishReason,
   }
 }
 
@@ -492,14 +512,18 @@ async function callAnthropic(
   type AnthropicResponse = {
     content?: Array<{ type: string; text?: string }>
     usage?: { input_tokens?: number; output_tokens?: number }
+    stop_reason?: string
   }
 
   const data = await response.json() as AnthropicResponse
   const textBlocks = (data.content ?? []).filter(b => b.type === "text" && b.text)
-  const content = textBlocks.map(b => b.text!).join("\n")
-  if (!content) {
+  const rawContent = textBlocks.map(b => b.text!).join("\n")
+  if (!rawContent) {
     throw new Error(`Anthropic returned no text content: ${JSON.stringify(data).slice(0, 200)}`)
   }
+  const stopReason = data.stop_reason
+  const truncated = stopReason === "max_tokens"
+  const content = truncated ? rawContent + TRUNCATION_MARKER : rawContent
 
   return {
     content,
@@ -510,5 +534,7 @@ async function callAnthropic(
       completionTokens: data.usage.output_tokens,
       totalTokens: (data.usage.input_tokens ?? 0) + (data.usage.output_tokens ?? 0),
     } : undefined,
+    truncated,
+    finishReason: stopReason,
   }
 }

@@ -22,24 +22,12 @@ header h1 {
   font-weight: 600;
   color: #8b8bff;
 }
-.status-bar {
-  display: flex;
-  gap: 16px;
-  font-size: 12px;
-}
 .status-dot {
   display: inline-block;
   width: 8px;
   height: 8px;
   border-radius: 50%;
   margin-right: 4px;
-}
-.status-dot-label {
-  font-size: 9px;
-  font-weight: 600;
-  text-transform: uppercase;
-  margin-right: 6px;
-  opacity: 0.7;
 }
 .dot-idle { background: #4ade80; }
 .dot-busy { background: #facc15; animation: pulse 1s infinite; }
@@ -78,17 +66,28 @@ header h1 {
   user-select: none;
 }
 .project-row-header:hover { background: #1a1a32; }
-.project-row-arrow {
-  font-size: 11px;
-  transition: transform 0.2s;
-  color: #666;
-  flex-shrink: 0;
+/* Fixed-width slots so collapsed rows line up vertically across projects.
+ * Each child gets a flex-basis and overflow rules; .project-row-badges uses
+ * margin-left:auto to pin to the right edge. */
+.project-row-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 28px;
 }
-.project-row.open .project-row-arrow { transform: rotate(90deg); }
+.project-row-dots .status-dot {
+  width: 10px;
+  height: 10px;
+  margin: 0;
+}
 .project-row-name {
   font-weight: 700;
   font-size: 14px;
   color: #e0e0e0;
+  flex: 0 0 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .project-row-dir {
   font-size: 11px;
@@ -96,13 +95,123 @@ header h1 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 300px;
+  flex: 0 0 300px;
+  cursor: pointer;
+  padding: 0 2px;
+  border-radius: 2px;
+  /* Truncate paths on the LEFT so the deeper (more informative) end stays visible:
+   *   "C:\Users\kevin\Workspace\multi-agent-orchestrator" → "…\multi-agent-orchestrator" */
+  direction: rtl;
+  text-align: left;
 }
+.project-row-port {
+  flex: 0 0 70px;
+  font-size: 9px;
+  color: #666;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-row-dir:hover {
+  color: #a0a0c0;
+  background: #1a1a2a;
+}
+body.light .project-row-dir:hover {
+  color: #4b3bcf;
+  background: #eef0ff;
+}
+
+/* Project info popup — tracking IDs shown on path click */
+.project-info-popup {
+  position: fixed;
+  z-index: 10000;
+  width: 360px;
+  max-width: calc(100vw - 16px);
+  background: #10101a;
+  border: 1px solid #2a2a3a;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  font-size: 11px;
+  color: #c0c0c0;
+}
+.pinfo-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-bottom: 1px solid #2a2a3a;
+  font-weight: 600;
+  color: #8b8bff;
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.pinfo-close {
+  background: transparent;
+  border: none;
+  color: #888;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.pinfo-close:hover { color: #eee; }
+.pinfo-body { padding: 4px 0; }
+.pinfo-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-bottom: 1px solid #1a1a24;
+}
+.pinfo-row:last-child { border-bottom: none; }
+.pinfo-label {
+  min-width: 90px;
+  color: #666;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.pinfo-value {
+  flex: 1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px;
+  color: #d0d0d0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+}
+.pinfo-copy {
+  background: transparent;
+  border: 1px solid transparent;
+  color: #666;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 3px;
+  line-height: 1;
+  font-size: 11px;
+}
+.pinfo-copy:hover { color: #8b8bff; border-color: #333; background: #1a1a2a; }
+body.light .project-info-popup {
+  background: #ffffff;
+  border-color: #cccccc;
+  color: #333333;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+}
+body.light .pinfo-header { color: #5b4bdf; border-color: #e0e0e0; }
+body.light .pinfo-row { border-color: #eee; }
+body.light .pinfo-label { color: #888; }
+body.light .pinfo-value { color: #222; }
+body.light .pinfo-copy:hover { color: #5b4bdf; border-color: #bbb; background: #eef0ff; }
 .project-row-badges {
   display: flex;
   gap: 8px;
   margin-left: auto;
   align-items: center;
+  flex: 0 0 auto;
+  justify-content: flex-end;
 }
 .project-row-badges .agent-badge {
   font-size: 9px;
@@ -126,25 +235,85 @@ header h1 {
 }
 .project-row-remove:hover { opacity: 1; background: #2a1010; }
 
+/* Compact icon-only action buttons in the project row header.
+ * Chrome matches .toolbar-btn so icons feel part of the same button system;
+ * only the glyph carries the per-action color (per modifier class). */
+.project-row-iconbtn {
+  width: 24px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #333;
+  border-radius: 4px;
+  background: #1a1a2a;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1;
+  color: #aaa;
+  opacity: 0.75;
+  transition: opacity 0.15s, background 0.15s, border-color 0.15s;
+}
+.project-row-iconbtn:hover { opacity: 1; background: #2a2a3a; border-color: currentColor; }
+.project-row-iconbtn:focus-visible { outline: 1px solid currentColor; outline-offset: 1px; }
+.iconbtn-pause   { color: #f59e0b; }
+.iconbtn-resume  { color: #22d3ee; }
+.iconbtn-merge   { color: #10b981; }
+.iconbtn-remove  { color: #ef4444; }
+body.light .project-row-iconbtn { background: #e0e0e0; border-color: #bbb; color: #666; }
+body.light .project-row-iconbtn:hover { background: #d0d0d0; border-color: currentColor; }
+
 /* Directive / settings section */
 .directive-section {
   padding: 0 12px 8px;
   background: #111122;
   border-bottom: 1px solid #2a2a3a;
 }
-.directive-toggle {
-  font-size: 10px;
-  color: #8b8bff;
-  cursor: pointer;
-  padding: 2px 0;
+/* Twin toggle bar that sits between the project header and the collapsible
+ * sections. Settings and Chats each have their own button; the master toggle
+ * (project header click) collapses/restores both at once. */
+.row-toggles {
+  display: flex;
+  gap: 6px;
+  padding: 4px 0 2px;
   user-select: none;
 }
-.directive-toggle:hover { text-decoration: underline; }
-.directive-content {
+.row-toggle {
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  color: #8b8bff;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  line-height: 1;
+}
+.row-toggle:hover { background: #1a1a32; border-color: #333; }
+.row-toggle[aria-expanded="true"] { color: #b0b0ff; }
+.row-toggle-arrow {
+  display: inline-block;
+  font-size: 9px;
+  color: #666;
+}
+body.light .row-toggle { color: #5b4bdf; }
+body.light .row-toggle:hover { background: #e8e8f0; border-color: #bbb; }
+body.light .row-toggle-arrow { color: #999; }
+.directive-content,
+.history-content,
+.notes-content {
   display: none;
   margin-top: 4px;
 }
-.directive-content.open { display: block; }
+.directive-content.open,
+.history-content.open,
+.notes-content.open { display: block; }
 
 /* Drawer tabs */
 .drawer-tabs {
@@ -169,6 +338,51 @@ header h1 {
 .drawer-tab.active { color: #c084fc; border-bottom-color: #c084fc; }
 .drawer-panel { display: none; }
 .drawer-panel.active { display: block; }
+
+/* Roles tab */
+.roles-section { margin-bottom: 12px; }
+.roles-section-title {
+  font-size: 11px;
+  color: #c084fc;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid #2a2a3a;
+}
+.role-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 4px;
+  border-bottom: 1px solid #1a1a24;
+  cursor: pointer;
+}
+.role-item:hover { background: #16162a; }
+.role-item input[type="checkbox"] { margin-top: 3px; cursor: pointer; }
+.role-item .role-body { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.role-item .role-label { font-size: 12px; color: #e2e8f0; }
+.role-item .role-desc { font-size: 10px; color: #888; line-height: 1.4; }
+.role-item .role-edit {
+  font-size: 10px;
+  padding: 2px 8px;
+  background: transparent;
+  color: #22d3ee;
+  border: 1px solid #22d3ee;
+  border-radius: 3px;
+  cursor: pointer;
+  align-self: center;
+  white-space: nowrap;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.role-item .role-edit:hover { background: #16162a; }
+body.light .roles-section-title { color: #7c3aed; border-bottom-color: #ddd; }
+body.light .role-item { border-bottom-color: #eee; }
+body.light .role-item:hover { background: #f5f5fa; }
+body.light .role-item .role-label { color: #222; }
+body.light .role-item .role-desc { color: #666; }
 
 /* Memory tab */
 .mem-section { margin-bottom: 12px; }
@@ -233,6 +447,7 @@ header h1 {
   display: flex;
   gap: 8px;
   margin-top: 4px;
+  align-items: center;
 }
 .directive-save {
   font-size: 10px;
@@ -246,6 +461,19 @@ header h1 {
   font-weight: 600;
 }
 .directive-save:hover { background: #2a3a2a; }
+.directive-save:disabled { opacity: 0.55; cursor: default; }
+.directive-save-secondary {
+  border-color: #3a3a4a;
+  background: transparent;
+  color: #9a9aaa;
+  font-weight: 500;
+}
+.directive-save-secondary:hover { background: #1a1a24; color: #c0c0c0; }
+.directive-save-hint {
+  font-size: 10px;
+  color: #4ade80;
+  font-style: italic;
+}
 
 /* Panels inside a project row */
 .project-row-body {
@@ -555,6 +783,17 @@ body.light .toast-info { background: #eff6ff; color: #2563eb; border-color: #256
   border-bottom: 1px solid #1a1a2a;
 }
 .log-entry.status { color: #60a5fa; }
+body.hide-status .log-entry.status { display: none; }
+.toolbar-btn-active {
+  background: #3a2a5a;
+  border-color: #a78bfa;
+  color: #c4b5fd;
+}
+body.light .toolbar-btn-active {
+  background: #e8e1fa;
+  border-color: #5b4bdf;
+  color: #5b4bdf;
+}
 .log-entry.prompt { color: #c084fc; white-space: pre-wrap; border-left: 3px solid #8b8bff; padding-left: 8px; }
 .log-entry.response { color: #e0e0e0; white-space: pre-wrap; }
 .log-entry.error { color: #ef4444; }
@@ -868,6 +1107,78 @@ body.light .toast-info { background: #eff6ff; color: #2563eb; border-color: #256
   background: #12121a;
   flex-shrink: 0;
 }
+.admin-drawer-icon-btn {
+  background: none;
+  border: none;
+  color: #888;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 3px;
+  letter-spacing: -1px;
+}
+.admin-drawer-icon-btn:hover { color: #c0c0c0; background: #1a1a2a; }
+body.light .admin-drawer-icon-btn { color: #666; }
+body.light .admin-drawer-icon-btn:hover { color: #222; background: #dedee8; }
+.info-tip-btn {
+  background: none;
+  border: none;
+  color: #7a7aa0;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  margin-left: 6px;
+  border-radius: 50%;
+  vertical-align: middle;
+}
+.info-tip-btn:hover { color: #a78bfa; background: rgba(167, 139, 250, 0.12); }
+body.light .info-tip-btn { color: #6b7280; }
+body.light .info-tip-btn:hover { color: #5b4bdf; background: rgba(91, 75, 223, 0.08); }
+.info-panel {
+  background: #12121e;
+  border: 1px solid #2a2a42;
+  border-left: 3px solid #a78bfa;
+  border-radius: 4px;
+  padding: 12px 16px;
+  margin: 8px 0 12px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: #c8c8d8;
+}
+.info-panel h3 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: #a78bfa;
+  margin: 10px 0 4px;
+}
+.info-panel h3:first-child { margin-top: 0; }
+.info-panel p, .info-panel ol, .info-panel ul { margin: 4px 0 6px; padding-left: 18px; }
+.info-panel p { padding-left: 0; }
+.info-panel code {
+  background: #1a1a2e;
+  color: #c4b5fd;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11.5px;
+}
+body.light .info-panel { background: #f4f2ff; border-color: #d4cbf5; border-left-color: #5b4bdf; color: #2a2a3a; }
+body.light .info-panel h3 { color: #5b4bdf; }
+body.light .info-panel code { background: #ece8fa; color: #4c3bb8; }
+@keyframes brainHeaderFlash {
+  0%   { box-shadow: inset 0 0 0 2px #facc15; background: #2a2420; }
+  60%  { box-shadow: inset 0 0 0 2px #facc15; background: #2a2420; }
+  100% { box-shadow: inset 0 0 0 2px transparent; background: inherit; }
+}
+.brain-header.highlight-flash { animation: brainHeaderFlash 1.6s ease-out; }
+body.light .brain-header.highlight-flash { animation: brainHeaderFlashLight 1.6s ease-out; }
+@keyframes brainHeaderFlashLight {
+  0%   { box-shadow: inset 0 0 0 2px #d97706; background: #fef3c7; }
+  60%  { box-shadow: inset 0 0 0 2px #d97706; background: #fef3c7; }
+  100% { box-shadow: inset 0 0 0 2px transparent; background: inherit; }
+}
 .admin-drawer-body {
   flex: 1;
   overflow-y: auto;
@@ -962,17 +1273,6 @@ body.light .admin-drawer-overlay.open { background: rgba(0,0,0,0.2); }
   color: #aaa;
 }
 .toolbar-btn:hover { background: #2a2a3a; color: #fff; }
-.search-input {
-  font-size: 11px;
-  padding: 4px 10px;
-  border: 1px solid #333;
-  border-radius: 4px;
-  background: #1a1a2a;
-  color: #e0e0e0;
-  font-family: inherit;
-  width: 180px;
-}
-.search-input::placeholder { color: #555; }
 
 /* Add project button */
 .add-project-btn {
@@ -1231,7 +1531,10 @@ body.light .admin-drawer-overlay.open { background: rgba(0,0,0,0.2); }
   .project-row-body .panel + .panel { border-left: none; border-top: 1px solid #2a2a3a; }
   .project-row-header { flex-wrap: wrap; gap: 6px; }
   .project-row-badges { flex-wrap: wrap; }
-  .project-row-dir { max-width: 180px; }
+  /* On narrow viewports let the slots shrink instead of forcing the row to wrap awkwardly. */
+  .project-row-name { flex: 1 1 120px; }
+  .project-row-dir { flex: 1 1 160px; }
+  .project-row-port { flex: 0 0 60px; }
   header { flex-direction: column; gap: 8px; align-items: flex-start; }
   .toolbar { flex-wrap: wrap; }
   .cmd-palette { min-width: 300px; max-height: 60vh; }
@@ -1243,15 +1546,14 @@ body.light .admin-drawer-overlay.open { background: rgba(0,0,0,0.2); }
 @media (max-width: 600px) {
   header { padding: 8px 12px; }
   header h1 { font-size: 14px; }
-  .status-bar { display: none; }
   .toolbar { gap: 4px; }
   .toolbar-btn { padding: 3px 6px; font-size: 10px; }
-  .search-input { width: 100px; font-size: 10px; }
   .project-row-header { padding: 6px 10px; }
   .project-row-name { font-size: 12px; }
   .project-row-badges { gap: 4px; }
   .agent-badge { font-size: 8px; padding: 1px 5px; }
   .project-row-remove { font-size: 9px; padding: 2px 6px; }
+  .project-row-iconbtn { width: 20px; height: 18px; font-size: 11px; }
   .panel-log { font-size: 11px; padding: 4px 6px; }
   .brain-body { max-height: 300px !important; }
   .brain-log { font-size: 11px; }
@@ -1322,8 +1624,6 @@ body.light .brain-log { background: #fff; color: #333; }
 body.light .brain-log::-webkit-scrollbar-thumb { background: #bbb; }
 body.light .toolbar-btn { background: #e0e0e0; color: #333; border-color: #bbb; }
 body.light .toolbar-btn:hover { background: #d0d0d0; }
-body.light .search-input { background: #fff; color: #222; border-color: #bbb; }
-body.light .search-input::placeholder { color: #aaa; }
 body.light .resize-handle { background: #ccc; }
 body.light .resize-handle:hover { background: #5b4bdf; }
 body.light .cmd-bar { background: #e8e8f0; border-color: #ccc; }

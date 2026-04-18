@@ -113,13 +113,20 @@ export async function agentListPermissions(agent: AgentState) {
   return res.data ?? []
 }
 
-/** Reply to a permission request on the agent */
+/** Reply to a permission request on the agent.
+ *
+ * `reply` maps directly to the opencode SDK's enum:
+ *   - "once"   — allow this request only
+ *   - "always" — allow this and all future matching requests
+ *   - "reject" — deny the request (pass `message` to explain why)
+ */
 export async function agentReplyPermission(
   agent: AgentState,
   requestID: string,
-  reply: { type: "approve" } | { type: "deny"; reason?: string } | { type: "approveAll" },
+  reply: "once" | "always" | "reject",
+  message?: string,
 ) {
-  const res = await agent.client.permission.reply({ requestID, reply })
+  const res = await agent.client.permission.reply({ requestID, reply, message })
   if (res.error) throw new Error(`Failed to reply to permission on ${agent.config.name}`)
 }
 

@@ -8,13 +8,18 @@ import { listDirectories } from "./project-manager"
 import type { TeamManager } from "./team-manager"
 import { loadBrainMemory, addBehavioralNote, addProjectNote, listArchives, loadAgentArchive, restoreAgentMemory } from "./brain-memory"
 import { detectCrash, formatCrashReport } from "./session-state"
+import { appendChatEvent, readChatEvents } from "./chat-log"
 
 /** Decode and sanitize a URL path segment — strips path traversal and control characters */
 function sanitizeParam(raw: string): string {
   return decodeURIComponent(raw).replace(/[\/\\\.]{2,}/g, "").replace(/[\x00-\x1f]/g, "")
 }
 
-export type DashboardEvent =
+/** Base shape shared by every dashboard event. `t` is stamped server-side by
+ *  DashboardLog.push so clients can dedupe between live SSE and replayed history. */
+type DashboardEventBase = { t?: number }
+
+export type DashboardEvent = DashboardEventBase & (
   | { type: "agent-event"; agent: string; event: { type: string; properties: Record<string, unknown> } }
   | { type: "agent-status"; agent: string; status: string; detail?: string }
   | { type: "agent-prompt"; agent: string; text: string }
@@ -27,6 +32,7 @@ export type DashboardEvent =
   | { type: "supervisor-thinking"; agent: string; text: string }
   | { type: "supervisor-status"; agent: string; status: "running" | "idle" | "done" | "reviewing" | "paused" }
   | { type: "supervisor-alert"; agent: string; text: string }
+)
 
 /** Shared event log that the dashboard reads from.
  *  Cursors are absolute indices (baseOffset + position in the current array).
@@ -39,6 +45,9 @@ export class DashboardLog {
   private baseOffset = 0
 
   push(event: DashboardEvent) {
+    // Stamp with a server-side timestamp so the client can dedupe between
+    // the live SSE stream and replayed chat history.
+    if (event.t == null) event.t = Date.now()
     this.history.push(event)
     if (this.history.length > this.maxHistory) {
       const trimCount = this.history.length - this.maxHistory
@@ -108,6 +117,12 @@ export async function startDashboard(
     "</head>",
     `<script>window.__API_TOKEN__="${apiToken}";</script></head>`,
   )
+
+  // Persist chat-relevant events to a per-agent JSONL so refreshes can replay history.
+  // Fire-and-forget — the in-memory broadcast is authoritative; disk is a durable mirror.
+  const persistUnsub = log.subscribe((event) => {
+    appendChatEvent(event).catch((err) => console.error("[chat-log] persist failed:", err))
+  })
 
   const server = Bun.serve({
     port,
@@ -306,10 +321,8 @@ export async function startDashboard(
         }
         try {
           const body = await req.json() as { decision: string; reason?: string }
-          const reply = body.decision === "approve"
-            ? { type: "approve" as const }
-            : { type: "deny" as const, reason: body.reason }
-          await agentReplyPermission(agent, requestID, reply)
+          const reply = body.decision === "approve" ? "once" : "reject"
+          await agentReplyPermission(agent, requestID, reply, body.reason)
           log.push({
             type: "permission-resolved",
             agent: agentName!,
@@ -455,23 +468,42 @@ export async function startDashboard(
         }
       }
 
-      // Update project directive
+      // Update project directive. By default hot-swaps on the live supervisor (takes effect next cycle);
+      // pass { restart: true } to additionally restart the supervisor (resets cycle count & session state).
       if (url.pathname.match(/^\/api\/projects\/[^/]+\/directive$/) && req.method === "PUT") {
         const pm = opts?.projectManager
         if (!pm) return Response.json({ error: "Project manager not available" }, { status: 500, headers: corsHeaders })
         const projectId = sanitizeParam(url.pathname.split("/")[3] ?? "")
         try {
-          const body = await req.json() as { directive: string }
+          const body = await req.json() as { directive: string; restart?: boolean }
           if (!body.directive?.trim()) {
             return Response.json({ error: "Directive is required" }, { status: 400, headers: corsHeaders })
           }
-          pm.updateDirective(projectId, body.directive.trim())
-          // Restart supervisor with new directive
-          pm.restartSupervisor(projectId, body.directive.trim())
-          return Response.json({ ok: true }, { headers: corsHeaders })
+          const directive = body.directive.trim()
+          pm.updateDirective(projectId, directive)
+          if (body.restart) {
+            pm.restartSupervisor(projectId, directive)
+          }
+          return Response.json({ ok: true, restarted: !!body.restart }, { headers: corsHeaders })
         } catch (err) {
           return Response.json({ ok: false, error: String(err) }, { status: 500, headers: corsHeaders })
         }
+      }
+
+      // Get chat history (paginated) for a project — resolves projectId to its agent name
+      // and returns events from the persisted JSONL ring log, oldest-first.
+      if (url.pathname.match(/^\/api\/projects\/[^/]+\/chat$/) && req.method === "GET") {
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ events: [] }, { headers: corsHeaders })
+        const projectId = sanitizeParam(url.pathname.split("/")[3] ?? "")
+        const project = pm.getProject(projectId)
+        if (!project) return Response.json({ events: [] }, { headers: corsHeaders })
+        const beforeRaw = url.searchParams.get("before")
+        const limitRaw = url.searchParams.get("limit")
+        const before = beforeRaw ? parseInt(beforeRaw, 10) : undefined
+        const limit = Math.min(Math.max(parseInt(limitRaw ?? "200", 10) || 200, 1), 1000)
+        const events = await readChatEvents(project.agentName, Number.isFinite(before) ? before : undefined, limit)
+        return Response.json({ events, agentName: project.agentName }, { headers: corsHeaders })
       }
 
       // Get directive history for a project
@@ -968,68 +1000,6 @@ export async function startDashboard(
         }
       }
 
-      // ---- A/B Test endpoints ----
-
-      if (url.pathname.match(/^\/api\/projects\/[^/]+\/ab-test$/) && req.method === "POST") {
-        const projectId = sanitizeParam(url.pathname.split("/")[3]!)
-        try {
-          const body = await req.json() as {
-            variants: [{ model: string; directive: string; maxCycles: number }, { model: string; directive: string; maxCycles: number }]
-            evalModel?: string
-          }
-          const project = opts?.projectManager?.getProject(projectId)
-          if (!project) {
-            return Response.json({ ok: false, error: "Project not found" }, { status: 404, headers: corsHeaders })
-          }
-          const pm = opts?.projectManager
-          if (!pm) {
-            return Response.json({ ok: false, error: "No project manager" }, { status: 500, headers: corsHeaders })
-          }
-          const { runABTest } = await import("./analytics")
-          const config: import("./analytics").ABTestConfig = {
-            projectId,
-            agentName: project.agentName,
-            projectDirectory: (project as any).directory,
-            variants: [
-              { label: "A", ...body.variants[0] },
-              { label: "B", ...body.variants[1] },
-            ],
-            ollamaUrl: pm.getOllamaUrl(),
-            evalModel: body.evalModel ?? (project as any).model ?? "llama3",
-          }
-          // Run in background — don't block the HTTP response
-          const resultPromise = runABTest(config, pm, (status, result) => {
-            log.push({ type: "brain-thinking", text: `[A/B Test ${result.id}] ${status}` })
-          })
-          resultPromise.catch(() => {})
-          return Response.json({ ok: true, message: "A/B test started" }, { headers: corsHeaders })
-        } catch (err) {
-          return Response.json({ ok: false, error: String(err) }, { status: 400, headers: corsHeaders })
-        }
-      }
-
-      if (url.pathname.match(/^\/api\/projects\/[^/]+\/ab-test$/) && req.method === "GET") {
-        try {
-          const { loadAnalytics } = await import("./analytics")
-          const store = await loadAnalytics()
-          const projectId = sanitizeParam(url.pathname.split("/")[3]!)
-          const tests = (store.abTests ?? []).filter(t => t.config.projectId === projectId)
-          return Response.json(tests, { headers: corsHeaders })
-        } catch {
-          return Response.json([], { headers: corsHeaders })
-        }
-      }
-
-      if (url.pathname === "/api/ab-tests" && req.method === "GET") {
-        try {
-          const { loadAnalytics } = await import("./analytics")
-          const store = await loadAnalytics()
-          return Response.json(store.abTests ?? [], { headers: corsHeaders })
-        } catch {
-          return Response.json([], { headers: corsHeaders })
-        }
-      }
-
       // ---- Event Bus endpoints ----
       if (url.pathname === "/api/events/bus/recent" && req.method === "GET") {
         if (!opts?.eventBus) return Response.json([], { headers: corsHeaders })
@@ -1086,6 +1056,45 @@ export async function startDashboard(
           const body = (await req.json()) as { targetBranch?: string }
           const result = await pm.mergeAgentBranch(projectId, body.targetBranch)
           return Response.json(result, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 400, headers: corsHeaders })
+        }
+      }
+
+      // ---- Responsibilities endpoints ----
+      if (url.pathname === "/api/responsibilities/catalog" && req.method === "GET") {
+        const { RESPONSIBILITY_CATALOG } = await import("./responsibilities")
+        return Response.json(RESPONSIBILITY_CATALOG, { headers: corsHeaders })
+      }
+
+      if (req.method === "GET" && url.pathname.match(/^\/api\/projects\/[^/]+\/responsibilities$/)) {
+        const projectId = sanitizeParam(url.pathname.split("/")[3]!)
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Not available" }, { status: 500, headers: corsHeaders })
+        try {
+          return Response.json(pm.listResponsibilities(projectId), { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 404, headers: corsHeaders })
+        }
+      }
+
+      if (req.method === "PATCH" && url.pathname.match(/^\/api\/projects\/[^/]+\/responsibilities\/[^/]+$/)) {
+        const parts = url.pathname.split("/")
+        const projectId = sanitizeParam(parts[3]!)
+        const responsibilityId = decodeURIComponent(parts[5]!)
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Not available" }, { status: 500, headers: corsHeaders })
+        try {
+          const body = (await req.json()) as { enabled?: boolean; config?: Record<string, unknown> }
+          let result
+          if (body.config !== undefined) {
+            result = pm.setResponsibilityConfig(projectId, responsibilityId, body.config)
+          }
+          if (body.enabled !== undefined) {
+            result = pm.setResponsibilityEnabled(projectId, responsibilityId, body.enabled)
+          }
+          if (!result) return Response.json({ error: "No changes supplied" }, { status: 400, headers: corsHeaders })
+          return Response.json({ ok: true, responsibility: result }, { headers: corsHeaders })
         } catch (err) {
           return Response.json({ error: String(err) }, { status: 400, headers: corsHeaders })
         }
@@ -1179,6 +1188,7 @@ export async function startDashboard(
 
   return {
     stop() {
+      persistUnsub()
       server.stop(true) // close all open connections immediately
     },
   }

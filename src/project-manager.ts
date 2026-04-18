@@ -26,6 +26,13 @@ import { isOrchestratorRepo, canonicalAgentName } from "./repo-identity"
 import type { EventBus } from "./event-bus"
 import type { ResourceManager } from "./resource-manager"
 import { archiveAgentMemory, hasAgentArchive, restoreAgentMemory } from "./brain-memory"
+import {
+  type Responsibility,
+  buildDefaultResponsibilities,
+  reconcileResponsibilities,
+  resolveValidationConfig,
+  applyValidationConfig,
+} from "./responsibilities"
 
 // ---------------------------------------------------------------------------
 // Process tree cleanup — kills a process and all its descendants
@@ -63,6 +70,8 @@ export type DirectiveHistoryEntry = {
   comment?: string
   /** Whether the supervisor has read this comment */
   commentRead?: boolean
+  /** The last completed cycle number when this edit was made. Undefined if no cycle has completed yet. */
+  cycleNumber?: number
 }
 
 export type ProjectState = {
@@ -88,8 +97,10 @@ export type ProjectState = {
   agentBranch?: string
   /** Base branch the agent branch was cut from — used as merge target and for unmerged-work detection. */
   baseBranch?: string
-  /** Post-cycle validation config */
+  /** Post-cycle validation config (legacy; responsibility "supervisor.run-validation" takes precedence) */
   postCycleValidation?: { command?: string; preset?: ValidationPreset; timeoutMs?: number; failAction?: "warn" | "inject" | "pause" }
+  /** Per-project responsibilities (toggleable capabilities). Reconciled against the catalog on load. */
+  responsibilities?: Responsibility[]
 }
 
 /** Optional knobs passed to addProject. Any callers that don't set these get
@@ -100,6 +111,8 @@ export type AddProjectOptions = {
   baseBranch?: string
   /** Permit adding the orchestrator's own repo. Default false. */
   allowSelfIngest?: boolean
+  /** Restore a persisted responsibilities list (used by restoreProjects). Reconciled against catalog. */
+  responsibilities?: Responsibility[]
 }
 
 type SavedProjects = {
@@ -110,6 +123,7 @@ type SavedProjects = {
     model?: string
     directiveHistory?: DirectiveHistoryEntry[]
     baseBranch?: string
+    responsibilities?: Responsibility[]
   }>
 }
 
@@ -216,8 +230,10 @@ export class ProjectManager {
   private llmCircuitBreakerCounts = new Map<string, number>()
   private static LLM_CIRCUIT_BREAKER_COOLDOWN_MS = 300_000 // 5-minute cooldown after LLM circuit breaker
   private pauseStates = new Map<string, PauseState>()
-  /** Cycle limit callbacks — auto-pause after N cycles (used by A/B test) */
-  private cycleLimitCallbacks = new Map<string, { maxCycles: number; count: number }>()
+  /** Live directive refs per project — supervisor reads .value at each cycle boundary, so updateDirective can hot-swap without restart. */
+  private directiveRefs = new Map<string, { value: string }>()
+  /** Last completed cycle number per project — stamped on directive history entries for cross-reference. */
+  private lastCycleNumbers = new Map<string, number>()
   /** Lock that serializes all project mutations (add/remove/restart) to prevent races */
   private projectLock: Promise<void> = Promise.resolve()
   private idCounter = 0
@@ -229,7 +245,24 @@ export class ProjectManager {
     private supervisorLimits?: import("./supervisor").SupervisorLimits,
     private eventBus?: EventBus,
     private resourceManager?: ResourceManager,
-  ) {}
+  ) {
+    // Mirror validation outcomes into the owning project's responsibility so
+    // lastStatus/lastRunAt survive restarts and are visible in the checklist UI.
+    this.eventBus?.on({ type: "validation-result" }, (event) => {
+      const project = Array.from(this.projects.values()).find(p => p.agentName === event.agentName)
+      if (!project) return
+      const data = event.data as { passed?: boolean; command?: string; exitCode?: number } | undefined
+      const detail = data?.command
+        ? `${data.command}${data.exitCode != null ? ` (exit ${data.exitCode})` : ""}`
+        : undefined
+      this.recordResponsibilityOutcome(
+        project.id,
+        "supervisor.run-validation",
+        data?.passed ? "success" : "failure",
+        detail,
+      )
+    })
+  }
 
   /** Add a project: spawns a worker agent and starts its supervisor.
    *  Uses a promise-chain mutex so concurrent mutations queue up instead of racing. */
@@ -321,6 +354,9 @@ export class ProjectManager {
       pendingComments: [],
       status: "starting",
       addedAt: Date.now(),
+      responsibilities: opts?.responsibilities
+        ? reconcileResponsibilities(opts.responsibilities)
+        : buildDefaultResponsibilities(),
     }
 
     this.projects.set(id, project)
@@ -463,6 +499,8 @@ export class ProjectManager {
     this.softStops.set(projectId, softStop)
     const pauseState = createPauseState()
     this.pauseStates.set(projectId, pauseState)
+    const directiveRef = { value: project.directive }
+    this.directiveRefs.set(projectId, directiveRef)
 
     project.status = "supervising"
 
@@ -474,6 +512,7 @@ export class ProjectManager {
           agentName: project.agentName,
           directory: project.directory,
           directive: project.directive,
+          directiveRef,
           cyclePauseSeconds: this.supervisorLimits?.cyclePauseSeconds ?? 30,
           maxRoundsPerCycle: this.supervisorLimits?.maxRoundsPerCycle ?? 30,
           reviewEnabled: true,
@@ -482,7 +521,7 @@ export class ProjectManager {
           signal: ac.signal,
           softStop,
           pauseState,
-          postCycleValidation: project.postCycleValidation,
+          postCycleValidation: resolveValidationConfig(project.responsibilities, project.postCycleValidation) as typeof project.postCycleValidation,
           eventBus: this.eventBus,
           resourceManager: this.resourceManager,
           // Fast coordination: listen for notifications from other agents
@@ -521,14 +560,7 @@ export class ProjectManager {
             // Successful cycle — reset auto-restart count and LLM breaker count (failure was transient)
             this.autoRestartCounts.delete(projectId)
             this.llmCircuitBreakerCounts.delete(projectId)
-            const limit = this.cycleLimitCallbacks.get(projectId)
-            if (limit) {
-              limit.count = cycleNumber
-              if (cycleNumber >= limit.maxCycles) {
-                this.cycleLimitCallbacks.delete(projectId)
-                this.pauseProject(projectId)
-              }
-            }
+            this.lastCycleNumbers.set(projectId, cycleNumber)
           },
           onSupervisorStop: (agentName, summary, isFailure, reason) => {
             if (isFailure) {
@@ -597,6 +629,7 @@ export class ProjectManager {
         if (this.supervisorAborts.get(projectId) === ac) this.supervisorAborts.delete(projectId)
         if (this.softStops.get(projectId) === softStop) this.softStops.delete(projectId)
         if (this.pauseStates.get(projectId) === pauseState) this.pauseStates.delete(projectId)
+        if (this.directiveRefs.get(projectId) === directiveRef) this.directiveRefs.delete(projectId)
       }
     })()
   }
@@ -791,16 +824,6 @@ export class ProjectManager {
     return this.pauseStates.get(projectId)
   }
 
-  /** Set a cycle limit — supervisor auto-pauses after N cycles. Used by A/B testing. */
-  setCycleLimit(projectId: string, maxCycles: number): void {
-    this.cycleLimitCallbacks.set(projectId, { maxCycles, count: 0 })
-  }
-
-  /** Clear any active cycle limit */
-  clearCycleLimit(projectId: string): void {
-    this.cycleLimitCallbacks.delete(projectId)
-  }
-
   // ---- Branch Isolation ----
 
   /** Get the git branch name for a project's agent */
@@ -846,6 +869,69 @@ export class ProjectManager {
     const project = this.projects.get(projectId)
     if (!project) throw new Error(`Unknown project: ${projectId}`)
     project.postCycleValidation = config
+    // Mirror into the responsibility so both sources of truth agree.
+    project.responsibilities = applyValidationConfig(project.responsibilities, config)
+    this.saveProjects()
+  }
+
+  /** List a project's responsibilities, reconciled against the current catalog. */
+  listResponsibilities(projectId: string): Responsibility[] {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    project.responsibilities = reconcileResponsibilities(project.responsibilities)
+    return project.responsibilities
+  }
+
+  /** Toggle a responsibility on or off. */
+  setResponsibilityEnabled(projectId: string, responsibilityId: string, enabled: boolean): Responsibility {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    const list = reconcileResponsibilities(project.responsibilities)
+    const target = list.find(r => r.id === responsibilityId)
+    if (!target) throw new Error(`Unknown responsibility: ${responsibilityId}`)
+    target.enabled = enabled
+    project.responsibilities = list
+    // Keep legacy validation field in sync so the supervisor pipeline sees the change immediately.
+    if (responsibilityId === "supervisor.run-validation") {
+      project.postCycleValidation = enabled && target.config ? (target.config as typeof project.postCycleValidation) : undefined
+    }
+    this.saveProjects()
+    return target
+  }
+
+  /** Update a responsibility's config. Does not change its enabled state. */
+  setResponsibilityConfig(projectId: string, responsibilityId: string, config: Record<string, unknown>): Responsibility {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    const list = reconcileResponsibilities(project.responsibilities)
+    const target = list.find(r => r.id === responsibilityId)
+    if (!target) throw new Error(`Unknown responsibility: ${responsibilityId}`)
+    target.config = { ...config }
+    project.responsibilities = list
+    if (responsibilityId === "supervisor.run-validation" && target.enabled) {
+      project.postCycleValidation = target.config as typeof project.postCycleValidation
+    }
+    this.saveProjects()
+    return target
+  }
+
+  /** Record the outcome of a responsibility run (called by event subscribers). */
+  recordResponsibilityOutcome(
+    projectId: string,
+    responsibilityId: string,
+    status: "success" | "failure" | "skipped" | "unknown",
+    detail?: string,
+  ): void {
+    const project = this.projects.get(projectId)
+    if (!project) return
+    const list = reconcileResponsibilities(project.responsibilities)
+    const target = list.find(r => r.id === responsibilityId)
+    if (!target) return
+    target.lastStatus = status
+    target.lastRunAt = Date.now()
+    if (detail !== undefined) target.lastDetail = detail
+    project.responsibilities = list
+    this.saveProjects()
   }
 
   /** Soft stop all supervisors */
@@ -891,18 +977,26 @@ export class ProjectManager {
     }, 500)
   }
 
-  /** Update a project's directive (from dashboard or supervisor) */
+  /** Update a project's directive (from dashboard or supervisor).
+   *  Hot-swaps the live supervisor's directive ref when a supervisor is running, so the change
+   *  takes effect at the next cycle boundary without restarting. Cycle count is preserved. */
   updateDirective(projectId: string, directive: string, source: "user" | "supervisor" = "user") {
     const project = this.projects.get(projectId)
     if (!project) throw new Error(`Unknown project: ${projectId}`)
     project.directive = directive
-    project.directiveHistory.push({ timestamp: Date.now(), text: directive, source })
+    const ref = this.directiveRefs.get(projectId)
+    if (ref) ref.value = directive
+    const cycleNumber = this.lastCycleNumbers.get(projectId)
+    const entry: DirectiveHistoryEntry = { timestamp: Date.now(), text: directive, source }
+    if (cycleNumber !== undefined) entry.cycleNumber = cycleNumber
+    project.directiveHistory.push(entry)
     // Keep last 20 entries
     if (project.directiveHistory.length > 20) {
       project.directiveHistory = project.directiveHistory.slice(-20)
     }
     this.saveProjects()
-    this.dashLog.push({ type: "brain-thinking", text: `${project.name} directive updated by ${source}.` })
+    const liveNote = ref ? " (applies next cycle)" : ""
+    this.dashLog.push({ type: "brain-thinking", text: `${project.name} directive updated by ${source}${liveNote}.` })
   }
 
   /** Add a user comment on a directive entry for the supervisor to read.
@@ -999,6 +1093,7 @@ export class ProjectManager {
           ...(p.model ? { model: p.model } : {}),
           ...(p.directiveHistory.length > 1 ? { directiveHistory: p.directiveHistory } : {}),
           ...(p.baseBranch ? { baseBranch: p.baseBranch } : {}),
+          ...(p.responsibilities ? { responsibilities: p.responsibilities } : {}),
         })),
     }
     writeJsonFile(resolve(process.cwd(), PROJECTS_FILE), data).catch(err => {
@@ -1029,6 +1124,7 @@ export class ProjectManager {
       try {
         await this.addProject(p.directory, p.directive, p.name, p.directiveHistory, {
           baseBranch: p.baseBranch,
+          responsibilities: p.responsibilities,
         })
         restored.push(p.name)
       } catch (err) {

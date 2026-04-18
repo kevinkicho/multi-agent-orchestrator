@@ -86,6 +86,13 @@ function escapeHtml(text) {
   return div.innerHTML
 }
 
+// Sanitize agent name for use in DOM IDs and querySelector.
+// Replaces characters that are invalid in CSS identifiers (., #, [, ], etc.)
+// or that could break onclick string interpolation (quotes).
+function sanitizeId(name) {
+  return name.replace(/[^a-zA-Z0-9-]/g, '_')
+}
+
 // Derive a human-friendly project name from the agent name
 function projectLabel(agentName) {
   // Agent names are like "my-project" — capitalize nicely
@@ -115,62 +122,64 @@ function ensureAgent(name) {
   if (removedAgents.has(name)) return null
   if (projectRows[name]) return projectRows[name]
 
+  const sid = sanitizeId(name)
   const row = document.createElement('div')
   row.className = 'project-row open'
-  row.id = 'row-' + name
+  row.id = 'row-' + sid
+  row.dataset.agent = name
 
   row.innerHTML = `
-    <div class="project-row-header" onclick="toggleProjectRow(this.parentElement)" role="button" tabindex="0" aria-expanded="true" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click()}">
+    <div class="project-row-header" role="button" tabindex="0" aria-expanded="true">
       <span class="project-row-arrow" aria-hidden="true">&#9654;</span>
       <span class="project-row-name">${escapeHtml(projectLabel(name))}</span>
-      <span class="project-row-dir" id="dir-${name}"></span>
-      <span class="project-row-port" id="port-${name}" style="font-size:9px;color:#666;margin-left:4px;font-family:monospace;"></span>
+      <span class="project-row-dir" id="dir-${sid}"></span>
+      <span class="project-row-port" id="port-${sid}" style="font-size:9px;color:#666;margin-left:4px;font-family:monospace;"></span>
       <div class="project-row-badges">
-        <span class="agent-badge badge-starting" id="projstatus-${name}" style="margin-right:8px;">STARTING</span>
+        <span class="agent-badge badge-starting" id="projstatus-${sid}" style="margin-right:8px;">STARTING</span>
         <span style="font-size:10px;color:#666;">Worker:</span>
-        <span class="agent-badge badge-idle" id="wbadge-${name}">IDLE</span>
+        <span class="agent-badge badge-idle" id="wbadge-${sid}">IDLE</span>
         <span style="font-size:10px;color:#666;margin-left:4px;">Supervisor:</span>
-        <span class="agent-badge badge-idle" id="sbadge-${name}">IDLE</span>
-        <span class="agent-badge" id="pausebadge-${name}" style="display:none;margin-right:4px;"></span>
-        <button class="project-row-remove" id="pausebtn-${name}" onclick="event.stopPropagation();togglePause('${name}')" title="Pause supervisor after current cycle completes (click again to resume)" style="color:#f59e0b;border-color:#f59e0b;">Pause</button>
-        <span class="agent-badge" id="branchbadge-${name}" style="display:none;background:#1e293b;color:#10b981;font-size:9px;margin-right:4px;"></span>
-        <button class="project-row-remove" onclick="event.stopPropagation();mergeBranch(projectRows['${name}']?.projectId)" title="Merge the agent's isolated git branch back into the main branch" style="color:#10b981;border-color:#10b981;">Merge</button>
-        <button class="project-row-remove" onclick="event.stopPropagation();setValidation(projectRows['${name}']?.projectId)" title="Set a shell command to run after each cycle (e.g. test suite) — fails trigger re-work" style="color:#22d3ee;border-color:#22d3ee;">Validate</button>
-        <button class="project-row-remove" onclick="event.stopPropagation();openABTestModal('${name}')" title="Run two models side-by-side on the same task and compare results" style="color:#c084fc;border-color:#c084fc;">A/B</button>
-        <button class="project-row-remove" onclick="event.stopPropagation();removeProject('${name}')" title="Stop supervisor, kill agent process, and remove this project">Remove</button>
+        <span class="agent-badge badge-idle" id="sbadge-${sid}">IDLE</span>
+        <span class="agent-badge" id="pausebadge-${sid}" style="display:none;margin-right:4px;"></span>
+        <button class="project-row-remove" data-action="pause" title="Pause supervisor after current cycle completes (click again to resume)" style="color:#f59e0b;border-color:#f59e0b;">Pause</button>
+        <span class="agent-badge" id="branchbadge-${sid}" style="display:none;background:#1e293b;color:#10b981;font-size:9px;margin-right:4px;"></span>
+        <button class="project-row-remove" data-action="merge" title="Merge the agent's isolated git branch back into the main branch" style="color:#10b981;border-color:#10b981;">Merge</button>
+        <button class="project-row-remove" data-action="validate" title="Set a shell command to run after each cycle (e.g. test suite) — fails trigger re-work" style="color:#22d3ee;border-color:#22d3ee;">Validate</button>
+        <button class="project-row-remove" data-action="ab" title="Run two models side-by-side on the same task and compare results" style="color:#c084fc;border-color:#c084fc;">A/B</button>
+        <button class="project-row-remove" data-action="remove" title="Stop supervisor, kill agent process, and remove this project">Remove</button>
       </div>
     </div>
-    <div class="directive-section" onclick="event.stopPropagation()">
-      <div class="directive-toggle" onclick="this.nextElementSibling.classList.toggle('open')">&#9660; Settings</div>
-      <div class="directive-content" id="dcontent-${name}">
+    <div class="directive-section">
+      <div class="directive-toggle" data-action="toggle-settings">&#9660; Settings</div>
+      <div class="directive-content" id="dcontent-${sid}">
         <div class="drawer-tabs">
-          <button class="drawer-tab active" onclick="switchDrawerTab('${name}','settings',this)">Settings</button>
-          <button class="drawer-tab" onclick="switchDrawerTab('${name}','history',this)">History</button>
-          <button class="drawer-tab" onclick="switchDrawerTab('${name}','memory',this)">Memory</button>
+          <button class="drawer-tab active" data-action="drawer-tab" data-tab="settings">Settings</button>
+          <button class="drawer-tab" data-action="drawer-tab" data-tab="history">History</button>
+          <button class="drawer-tab" data-action="drawer-tab" data-tab="memory">Memory</button>
         </div>
-        <div class="drawer-panel active" id="dtab-settings-${name}">
+        <div class="drawer-panel active" id="dtab-settings-${sid}">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
             <span style="font-size:10px;color:#888;min-width:40px;">Model:</span>
-            <select class="directive-text" id="msel-${name}" style="min-height:auto;height:26px;padding:2px 6px;flex:1;max-width:300px;">
+            <select class="directive-text" id="msel-${sid}" style="min-height:auto;height:26px;padding:2px 6px;flex:1;max-width:300px;">
               <option value="">(global default)</option>
             </select>
-            <button class="directive-save" onclick="saveModel('${name}')" style="white-space:nowrap;">Change Model</button>
+            <button class="directive-save" data-action="save-model">Change Model</button>
           </div>
           <div style="margin-bottom:4px;font-size:10px;color:#888;">Directive:</div>
-          <textarea class="directive-text" id="dtxt-${name}" rows="3"></textarea>
+          <textarea class="directive-text" id="dtxt-${sid}" rows="3"></textarea>
           <div class="directive-actions">
-            <button class="directive-save" onclick="saveDirective('${name}')">Save Directive &amp; Restart Supervisor</button>
+            <button class="directive-save" data-action="save-directive">Save Directive &amp; Restart Supervisor</button>
           </div>
           <div style="margin-top:8px;display:flex;gap:6px;align-items:center;">
-            <input type="text" class="directive-text" id="dcmt-${name}" placeholder="Leave feedback for supervisor..." style="min-height:auto;height:26px;padding:2px 8px;flex:1;">
-            <button class="directive-save" onclick="sendComment('${name}')" style="white-space:nowrap;">Send Comment</button>
+            <input type="text" class="directive-text" id="dcmt-${sid}" placeholder="Leave feedback for supervisor..." style="min-height:auto;height:26px;padding:2px 8px;flex:1;">
+            <button class="directive-save" data-action="send-comment" style="white-space:nowrap;">Send Comment</button>
           </div>
         </div>
-        <div class="drawer-panel" id="dtab-history-${name}">
-          <div id="dhist-${name}" style="max-height:280px;overflow-y:auto;"></div>
+        <div class="drawer-panel" id="dtab-history-${sid}">
+          <div id="dhist-${sid}" style="max-height:280px;overflow-y:auto;"></div>
         </div>
-        <div class="drawer-panel" id="dtab-memory-${name}">
-          <div id="dmem-${name}" style="max-height:280px;overflow-y:auto;"><em style="color:#555;">Click to load memory...</em></div>
+        <div class="drawer-panel" id="dtab-memory-${sid}">
+          <div id="dmem-${sid}" style="max-height:280px;overflow-y:auto;"><em style="color:#555;">Click to load memory...</em></div>
         </div>
       </div>
     </div>
@@ -182,12 +191,12 @@ function ensureAgent(name) {
             <span class="label">Worker</span>
             <span class="name">${escapeHtml(name)}</span>
           </div>
-          <span class="agent-badge badge-idle" id="badge-${name}">IDLE</span>
+          <span class="agent-badge badge-idle" id="badge-${sid}">IDLE</span>
         </div>
-        <div class="panel-log" id="wlog-${name}"></div>
+        <div class="panel-log" id="wlog-${sid}"></div>
         <div class="agent-chatbox">
-          <input type="text" id="chat-${name}" placeholder="Send prompt to ${name}..." onkeydown="if(event.key==='Enter')sendPrompt('${name}')">
-          <button onclick="sendPrompt('${name}')">Send</button>
+          <input type="text" id="chat-${sid}" placeholder="Send prompt to ${escapeHtml(name)}...">
+          <button data-action="send-prompt">Send</button>
         </div>
       </div>
       <div class="panel">
@@ -197,35 +206,76 @@ function ensureAgent(name) {
             <span class="label">Supervisor</span>
           </div>
         </div>
-        <div class="panel-log" id="slog-${name}"></div>
+        <div class="panel-log" id="slog-${sid}"></div>
       </div>
     </div>
   `
+
+  // Attach direct event listeners for header toggle (no inline onclick)
+  const header = row.querySelector('.project-row-header')
+  header.addEventListener('click', function() { toggleProjectRow(row) })
+  header.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleProjectRow(row) }
+  })
+
+  // Directive toggle (no inline onclick)
+  const dirToggle = row.querySelector('.directive-toggle')
+  if (dirToggle) dirToggle.addEventListener('click', function() { this.nextElementSibling.classList.toggle('open') })
+
+  // Chatbox Enter key (no inline onkeydown)
+  const chatInput = row.querySelector('#chat-' + sid)
+  if (chatInput) chatInput.addEventListener('keydown', function(e) { if (e.key === 'Enter') sendPrompt(name) })
+
+  // Stop propagation on directive section and chatbox clicks
+  const dirSection = row.querySelector('.directive-section')
+  if (dirSection) dirSection.addEventListener('click', function(e) { e.stopPropagation() })
+
+  // Event delegation for all data-action buttons (no inline onclick)
+  row.addEventListener('click', function(e) {
+    const btn = e.target.closest('[data-action]')
+    if (!btn) return
+    e.stopPropagation()
+    const action = btn.dataset.action
+    switch (action) {
+      case 'pause': togglePause(name); break
+      case 'merge': mergeBranch(projectRows[name]?.projectId); break
+      case 'validate': setValidation(projectRows[name]?.projectId); break
+      case 'ab': openABTestModal(name); break
+      case 'remove': removeProject(name); break
+      case 'drawer-tab': switchDrawerTab(name, btn.dataset.tab, btn); break
+      case 'save-model': saveModel(name); break
+      case 'save-directive': saveDirective(name); break
+      case 'send-comment': sendComment(name); break
+      case 'send-prompt': sendPrompt(name); break
+      case 'perm-approve': replyPermission(btn.dataset.agent, btn.dataset.reqid, 'approve', btn.dataset.id); break
+      case 'perm-deny': replyPermission(btn.dataset.agent, btn.dataset.reqid, 'deny', btn.dataset.id); break
+    }
+  })
 
   container.appendChild(row)
 
   const data = {
     row,
-    workerLog: row.querySelector('#wlog-' + name),
-    supervisorLog: row.querySelector('#slog-' + name),
-    workerBadge: row.querySelector('#badge-' + name),
-    supervisorBadge: row.querySelector('#sbadge-' + name),
-    rowWorkerBadge: row.querySelector('#wbadge-' + name),
-    rowSupervisorBadge: row.querySelector('#sbadge-' + name),
-    projStatusBadge: row.querySelector('#projstatus-' + name),
-    branchBadge: row.querySelector('#branchbadge-' + name),
-    directiveText: row.querySelector('#dtxt-' + name),
-    modelSelect: row.querySelector('#msel-' + name),
-    dirLabel: row.querySelector('#dir-' + name),
-    portLabel: row.querySelector('#port-' + name),
-    link: row.querySelector('#link-' + name),
-    chatInput: row.querySelector('#chat-' + name),
+    workerLog: row.querySelector('#wlog-' + sid),
+    supervisorLog: row.querySelector('#slog-' + sid),
+    workerBadge: row.querySelector('#badge-' + sid),
+    supervisorBadge: row.querySelector('#sbadge-' + sid),
+    rowWorkerBadge: row.querySelector('#wbadge-' + sid),
+    rowSupervisorBadge: row.querySelector('#sbadge-' + sid),
+    projStatusBadge: row.querySelector('#projstatus-' + sid),
+    branchBadge: row.querySelector('#branchbadge-' + sid),
+    directiveText: row.querySelector('#dtxt-' + sid),
+    modelSelect: row.querySelector('#msel-' + sid),
+    dirLabel: row.querySelector('#dir-' + sid),
+    portLabel: row.querySelector('#port-' + sid),
+    link: row.querySelector('#link-' + sid),
+    chatInput: row.querySelector('#chat-' + sid),
     chatBtn: row.querySelector('.agent-chatbox button'),
     projectId: null,
     // Aliases for backward compat with handleEvent/sendPrompt
     get log() { return this.workerLog },
     get badge() { return this.workerBadge },
-    project: row.querySelector('#dir-' + name),
+    project: row.querySelector('#dir-' + sid),
     status: 'idle',
     supervisorStatus: 'idle',
   }
@@ -520,7 +570,7 @@ function updateStatusBar() {
       const dotClass = statusToDot(combined)
       const label = statusToLabel(combined)
     const labelColor = dotClass === 'dot-busy' ? '#facc15' : dotClass === 'dot-disconnected' || dotClass === 'dot-error' ? '#ef4444' : dotClass === 'dot-done' ? '#60a5fa' : dotClass === 'dot-paused' ? '#f59e0b' : dotClass === 'dot-stuck' ? '#fb923c' : '#4ade80'
-      return '<a href="javascript:void(0)" onclick="document.getElementById(\'row-' + name + '\')?.scrollIntoView({behavior:\'smooth\',block:\'center\'})" style="text-decoration:none;color:inherit;cursor:pointer"><span class="status-dot ' + dotClass + '" aria-hidden="true"></span>' + name + '<span class="status-dot-label" style="color:' + labelColor + ';margin-left:4px;">' + label + '</span></a>'
+      return '<a href="javascript:void(0)" onclick="document.getElementById(\'row-' + sanitizeId(name) + '\')?.scrollIntoView({behavior:\'smooth\',block:\'center\'})" style="text-decoration:none;color:inherit;cursor:pointer"><span class="status-dot ' + dotClass + '" aria-hidden="true"></span>' + escapeHtml(name) + '<span class="status-dot-label" style="color:' + labelColor + ';margin-left:4px;">' + label + '</span></a>'
     })
     statusBar.innerHTML = items.join('')
   })
@@ -588,8 +638,8 @@ function handleEvent(event) {
       + '<div class="perm-title">Permission Request</div>'
       + '<div class="perm-detail">' + escapeHtml(desc) + '</div>'
       + '<div class="perm-actions">'
-      + '<button class="perm-btn perm-approve" onclick="replyPermission(&#39;' + event.agent + '&#39;, &#39;' + event.requestID + '&#39;, &#39;approve&#39;, &#39;' + id + '&#39;)">Approve</button>'
-      + '<button class="perm-btn perm-deny" onclick="replyPermission(&#39;' + event.agent + '&#39;, &#39;' + event.requestID + '&#39;, &#39;deny&#39;, &#39;' + id + '&#39;)">Deny</button>'
+      + '<button class="perm-btn perm-approve" data-action="perm-approve" data-agent="' + escapeHtml(event.agent) + '" data-reqid="' + escapeHtml(event.requestID) + '" data-id="' + escapeHtml(id) + '">Approve</button>'
+      + '<button class="perm-btn perm-deny" data-action="perm-deny" data-agent="' + escapeHtml(event.agent) + '" data-reqid="' + escapeHtml(event.requestID) + '" data-id="' + escapeHtml(id) + '">Deny</button>'
       + '</div></div>'
     pushEntry(agent.workerLog, { type: ENTRY_RAW, className: '', html })
   }
@@ -1421,7 +1471,7 @@ function _filterLogs(query) {
 
   // Filter log entries in worker/supervisor panels using backing arrays
   for (const [name, agent] of Object.entries(projectRows)) {
-    const rowEl = document.getElementById('row-' + name)
+    const rowEl = document.getElementById('row-' + sanitizeId(name))
     if (!rowEl) continue
 
     const nameMatch = !q || name.toLowerCase().includes(q)
@@ -1613,7 +1663,7 @@ async function saveModel(agentName) {
 async function sendComment(agentName) {
   const agent = projectRows[agentName]
   if (!agent || !agent.projectId) { alert('Project not found'); return }
-  const input = document.getElementById('dcmt-' + agentName)
+  const input = document.getElementById('dcmt-' + sanitizeId(agentName))
   const btn = input?.nextElementSibling
   const comment = input.value.trim()
   if (!comment) { alert('Please enter a comment.'); return }
@@ -1628,7 +1678,7 @@ async function sendComment(agentName) {
     if (data.ok) {
       input.value = ''
       addLogEntry(agent.supervisorLog, 'status', 'Comment sent to supervisor: "' + comment.slice(0, 80) + '"')
-      const histEl = document.getElementById('dhist-' + agentName)
+      const histEl = document.getElementById('dhist-' + sanitizeId(agentName))
       if (histEl && histEl.style.display !== 'none') loadHistory(agentName)
     } else {
       alert('Failed: ' + (data.error || 'Unknown error'))
@@ -1641,14 +1691,15 @@ async function sendComment(agentName) {
 }
 
 function switchDrawerTab(agentName, tabName, btn) {
-  var content = document.getElementById('dcontent-' + agentName)
+  const sid = sanitizeId(agentName)
+  var content = document.getElementById('dcontent-' + sid)
   if (!content) return
   // Deactivate all tabs and panels
   content.querySelectorAll('.drawer-tab').forEach(function(t) { t.classList.remove('active') })
   content.querySelectorAll('.drawer-panel').forEach(function(p) { p.classList.remove('active') })
   // Activate selected
   btn.classList.add('active')
-  var panel = document.getElementById('dtab-' + tabName + '-' + agentName)
+  var panel = document.getElementById('dtab-' + tabName + '-' + sid)
   if (panel) panel.classList.add('active')
   // Auto-load data when switching to tabs
   if (tabName === 'history') loadHistory(agentName)
@@ -1656,7 +1707,7 @@ function switchDrawerTab(agentName, tabName, btn) {
 }
 
 async function loadMemory(agentName) {
-  var el = document.getElementById('dmem-' + agentName)
+  var el = document.getElementById('dmem-' + sanitizeId(agentName))
   if (!el) return
   el.innerHTML = '<em style="color:#555;">Loading memory...</em>'
   try {
@@ -1733,7 +1784,7 @@ function toggleHistory(agentName) {
 async function loadHistory(agentName) {
   const agent = projectRows[agentName]
   if (!agent || !agent.projectId) return
-  const histEl = document.getElementById('dhist-' + agentName)
+  const histEl = document.getElementById('dhist-' + sanitizeId(agentName))
   if (!histEl) return
   histEl.innerHTML = '<div style="color:#666;font-size:10px;">Loading...</div>'
   try {
@@ -1771,14 +1822,24 @@ async function loadHistory(agentName) {
       if (!isLatest) {
         const origIdx = history.length - 1 - i
         html += '<div style="margin-top:3px;display:flex;gap:8px;align-items:center;">'
-        html += '<span style="cursor:pointer;color:#6366f1;text-decoration:underline;font-size:9px;" onclick="revertDirective(\'' + agentName + '\', ' + origIdx + ')">Revert to this version</span>'
-        html += '<input type="text" id="hcmt-' + agentName + '-' + origIdx + '" placeholder="Add comment..." style="flex:1;font-size:9px;padding:2px 6px;background:#0a0a14;border:1px solid #2a2a3a;border-radius:3px;color:#c0c0c0;font-family:inherit;" onclick="event.stopPropagation()">'
-        html += '<span style="cursor:pointer;color:#4ade80;font-size:9px;font-weight:600;" onclick="sendHistoryComment(\'' + agentName + '\', ' + origIdx + ')">Send</span>'
+        html += '<span style="cursor:pointer;color:#6366f1;text-decoration:underline;font-size:9px;" data-action="revert" data-idx="' + origIdx + '">Revert to this version</span>'
+        html += '<input type="text" id="hcmt-' + sanitizeId(agentName) + '-' + origIdx + '" placeholder="Add comment..." style="flex:1;font-size:9px;padding:2px 6px;background:#0a0a14;border:1px solid #2a2a3a;border-radius:3px;color:#c0c0c0;font-family:inherit;" onclick="event.stopPropagation()">'
+        html += '<span style="cursor:pointer;color:#4ade80;font-size:9px;font-weight:600;" data-action="send-hcmt" data-idx="' + origIdx + '">Send</span>'
         html += '</div>'
       }
       html += '</div>'
     }
     histEl.innerHTML = html
+    // Delegate clicks for revert and send-history-comment buttons
+    histEl.onclick = function(e) {
+      const target = e.target.closest('[data-action]')
+      if (!target) return
+      if (target.dataset.action === 'revert') {
+        revertDirective(agentName, parseInt(target.dataset.idx, 10))
+      } else if (target.dataset.action === 'send-hcmt') {
+        sendHistoryComment(agentName, parseInt(target.dataset.idx, 10))
+      }
+    }
   } catch (err) {
     histEl.innerHTML = '<div style="color:#ef4444;font-size:10px;">Error loading history: ' + err + '</div>'
   }
@@ -1800,7 +1861,7 @@ function revertDirective(agentName, historyIndex) {
 async function sendHistoryComment(agentName, historyIndex) {
   const agent = projectRows[agentName]
   if (!agent || !agent.projectId) { alert('Project not found'); return }
-  const input = document.getElementById('hcmt-' + agentName + '-' + historyIndex)
+  const input = document.getElementById('hcmt-' + sanitizeId(agentName) + '-' + historyIndex)
   if (!input) return
   const comment = input.value.trim()
   if (!comment) { alert('Please enter a comment.'); return }
@@ -1879,7 +1940,7 @@ async function removeProject(agentName) {
     // Mark as removed so polling/events don't re-create the row
     removedAgents.add(agentName)
     // Remove the row from DOM
-    const row = document.getElementById('row-' + agentName)
+    const row = document.getElementById('row-' + sanitizeId(agentName))
     if (row) row.remove()
     delete projectRows[agentName]
     delete agents[agentName]
@@ -1932,8 +1993,10 @@ async function resumeAll() {
 
 // Update pause button text based on status
 function updatePauseUI(agentName, pauseStatus, pauseRequestedAt) {
-  const btn = document.getElementById('pausebtn-' + agentName)
-  const badge = document.getElementById('pausebadge-' + agentName)
+  const sid = sanitizeId(agentName)
+  const row = document.getElementById('row-' + sid)
+  const btn = row ? row.querySelector('[data-action="pause"]') : null
+  const badge = document.getElementById('pausebadge-' + sid)
   if (!btn) return
   if (pauseStatus === 'requested') {
     btn.textContent = 'Resume'
@@ -1950,7 +2013,7 @@ function updatePauseUI(agentName, pauseStatus, pauseRequestedAt) {
       badge.title = 'Requested ' + ago + 's ago'
     }
     // Hide supervisor badge — pause badge shows the state
-    const sBadge = document.getElementById('sbadge-' + agentName)
+    const sBadge = document.getElementById('sbadge-' + sid)
     if (sBadge) sBadge.style.display = 'none'
   } else if (pauseStatus === 'paused') {
     btn.textContent = 'Resume'
@@ -1963,10 +2026,9 @@ function updatePauseUI(agentName, pauseStatus, pauseRequestedAt) {
       badge.style.fontSize = '9px'
     }
     // Hide supervisor badge — pause badge already shows the state
-    const sBadge = document.getElementById('sbadge-' + agentName)
+    const sBadge = document.getElementById('sbadge-' + sid)
     if (sBadge) sBadge.style.display = 'none'
     // Add amber left border to project row
-    const row = document.getElementById('row-' + agentName)
     if (row) row.style.borderLeft = '3px solid #f59e0b'
   } else {
     btn.textContent = 'Pause'
@@ -1974,9 +2036,8 @@ function updatePauseUI(agentName, pauseStatus, pauseRequestedAt) {
     btn.style.borderColor = '#f59e0b'
     if (badge) badge.style.display = 'none'
     // Restore supervisor badge visibility
-    const sBadge = document.getElementById('sbadge-' + agentName)
+    const sBadge = document.getElementById('sbadge-' + sid)
     if (sBadge) sBadge.style.display = ''
-    const row = document.getElementById('row-' + agentName)
     if (row) row.style.borderLeft = ''
   }
 }
@@ -2890,13 +2951,13 @@ function appendEventToLog(evt) {
   }
   const color = typeColors[evt.type] || '#888'
   const time = new Date(evt.timestamp).toLocaleTimeString()
-  const agent = evt.agentName ? ' <span style="color:#22d3ee;">' + evt.agentName + '</span>' : ''
+  const agent = evt.agentName ? ' <span style="color:#22d3ee;">' + escapeHtml(evt.agentName) + '</span>' : ''
   const summary = evt.data ? ' ' + JSON.stringify(evt.data).slice(0, 120) : ''
   const line = document.createElement('div')
   line.style.cssText = 'padding:2px 0;border-bottom:1px solid #111;'
-  line.innerHTML = '<span style="color:#555;">' + time + '</span> ' +
-    '<span style="color:' + color + ';">' + evt.type + '</span>' +
-    agent + '<span style="color:#666;">' + summary + '</span>'
+  line.innerHTML = '<span style="color:#555;">' + escapeHtml(time) + '</span> ' +
+    '<span style="color:' + color + ';">' + escapeHtml(evt.type) + '</span>' +
+    agent + '<span style="color:#666;">' + escapeHtml(summary) + '</span>'
   container.appendChild(line)
   // Keep max 200 entries
   while (container.children.length > 200) container.removeChild(container.firstChild)
@@ -2980,7 +3041,7 @@ async function mergeBranch(projectId) {
   let mergeBtn = null
   for (const [name, agent] of Object.entries(projectRows)) {
     if (agent.projectId === projectId) {
-      const row = document.getElementById('row-' + name)
+      const row = document.getElementById('row-' + sanitizeId(name))
       if (row) {
         const btns = row.querySelectorAll('.project-row-remove')
         for (const btn of btns) { if (btn.textContent.trim() === 'Merge') { mergeBtn = btn; break } }

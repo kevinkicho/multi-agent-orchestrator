@@ -160,6 +160,32 @@ export const PROVIDER_TEMPLATES: Omit<LLMProvider, "apiKey" | "enabled">[] = [
     defaultTemperature: 0.3,
     defaultMaxTokens: 16384,
   },
+  {
+    // OpenCode Go subscription gateway — chat-completions lane
+    // (https://opencode.ai/docs/go/). Covers GLM/Qwen/Kimi/MiMo which Zen
+    // serves at /v1/chat/completions. MiniMax on Go lives on /v1/messages
+    // and is handled by the opencode-go-anthropic entry below.
+    id: "opencode-go",
+    name: "OpenCode Go",
+    baseUrl: "https://opencode.ai/zen/go",
+    type: "openai-compatible",
+    apiKeyEnv: "OPENCODE_GO_API_KEY",
+    models: ["glm-5.1", "kimi-k2.5", "mimo-v2-omni", "qwen3.6-plus"],
+    defaultTemperature: 0.3,
+    defaultMaxTokens: 16384,
+  },
+  {
+    // OpenCode Go subscription gateway — messages lane. MiniMax on Go is
+    // only reachable at /v1/messages (Anthropic-style). Reuses OPENCODE_GO_API_KEY.
+    id: "opencode-go-anthropic",
+    name: "OpenCode Go (MiniMax)",
+    baseUrl: "https://opencode.ai/zen/go",
+    type: "anthropic",
+    apiKeyEnv: "OPENCODE_GO_API_KEY",
+    models: ["minimax-m2.7"],
+    defaultTemperature: 0.3,
+    defaultMaxTokens: 16384,
+  },
 ]
 
 // ---------------------------------------------------------------------------
@@ -178,6 +204,17 @@ export async function loadProviders(): Promise<LLMProvider[]> {
   if (_providerCache) return _providerCache
   const store = await readJsonFile<ProvidersStore | null>(PROVIDERS_FILE, null)
   if (store?.providers) {
+    // Merge in any templates missing from the persisted store (disabled by
+    // default — user opts in). Keeps older configs fresh as new providers ship.
+    const existing = new Set(store.providers.map(p => p.id))
+    const added = PROVIDER_TEMPLATES
+      .filter(t => !existing.has(t.id))
+      .map(t => ({ ...t, apiKey: "", enabled: false }))
+    if (added.length > 0) {
+      const merged = [...store.providers, ...added]
+      await saveProviders(merged)
+      return merged
+    }
     _providerCache = store.providers
     return _providerCache
   }

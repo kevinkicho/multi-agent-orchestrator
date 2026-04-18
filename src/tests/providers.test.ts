@@ -111,6 +111,8 @@ describe("PROVIDER_TEMPLATES", () => {
     expect(ids).toContain("together")
     expect(ids).toContain("deepseek")
     expect(ids).toContain("fireworks")
+    expect(ids).toContain("opencode-go")
+    expect(ids).toContain("opencode-go-anthropic")
   })
 
   test("all templates have required fields", () => {

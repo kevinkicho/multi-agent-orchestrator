@@ -845,8 +845,9 @@ export async function runAgentSupervisor(
       if (knowledgeText) {
         sharedKnowledgeBlock = "\n## Knowledge from Other Agents\n" + knowledgeText
       }
-    } catch {
-      // shared knowledge unavailable — skip silently
+    } catch (err) {
+      console.error(`[${agentName}] Failed to load shared knowledge:`, err)
+      config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Could not load shared knowledge from other agents: ${err}` })
     }
 
     const initialContent = [
@@ -1409,12 +1410,17 @@ Be specific with file paths, line numbers, and code snippets.`
             // and these saves must not happen — they would create duplicate entries.
             const cycleSummary = cmd.summary
             const cycleCompleteActions = async () => {
-              await addMemoryEntry(memory, {
-                timestamp: Date.now(),
-                objective: `${agentName} cycle ${cycleCount}: ${directive}`,
-                summary: cycleSummary,
-                agentLearnings: {},
-              }, agentName)
+              try {
+                memory = await addMemoryEntry(memory, {
+                  timestamp: Date.now(),
+                  objective: `${agentName} cycle ${cycleCount}: ${directive}`,
+                  summary: cycleSummary,
+                  agentLearnings: {},
+                }, agentName)
+              } catch (err) {
+                console.error(`[${agentName}] Failed to save memory entry for cycle ${cycleCount}:`, err)
+                config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save memory entry for cycle ${cycleCount}: ${err}` })
+              }
               saveConversationCheckpoint(agentName, cycleCount, directive, messages).catch(err => console.error(`[${agentName}] Failed to save conversation checkpoint: ${err}`))
               emit(`Cycle ${cycleCount} complete: ${cycleSummary}`)
               config.dashboardLog?.push({
@@ -1642,12 +1648,17 @@ Be specific with file paths, line numbers, and code snippets.`
             config.resourceManager?.clearIntent(agentName)
             // Detect if this is a failure stop (mentions non-responsive, stuck, failure, cannot, etc.)
             const isFailure = /non-responsive|stuck|fail|cannot|unable|broken|crash|unresponsive|dead/i.test(cmd.summary)
-            await addMemoryEntry(memory, {
-              timestamp: Date.now(),
-              objective: `${agentName} supervisor: ${directive}`,
-              summary: cmd.summary,
-              agentLearnings: {},
-            }, agentName)
+            try {
+              memory = await addMemoryEntry(memory, {
+                timestamp: Date.now(),
+                objective: `${agentName} supervisor: ${directive}`,
+                summary: cmd.summary,
+                agentLearnings: {},
+              }, agentName)
+            } catch (err) {
+              console.error(`[${agentName}] Failed to save memory entry on stop:`, err)
+              config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save memory entry on stop: ${err}` })
+            }
             emit(`Supervisor stopping: ${cmd.summary}`)
             config.dashboardLog?.push({
               type: "cycle-summary",
@@ -1955,12 +1966,17 @@ Be specific with file paths, line numbers, and code snippets.`
     // Check soft stop — intentionally before pause check: soft stop (exit) takes priority over pause (hold)
     if (config.softStop?.requested) {
       emit(`Soft stop — ${agentName} supervisor finishing after cycle ${cycleCount}.`)
-      await addMemoryEntry(await loadBrainMemory(), {
-        timestamp: Date.now(),
-        objective: `${agentName} supervisor: ${directive}`,
-        summary: `Soft-stopped after cycle ${cycleCount}.`,
-        agentLearnings: {},
-      }, agentName)
+      try {
+        await addMemoryEntry(await loadBrainMemory(), {
+          timestamp: Date.now(),
+          objective: `${agentName} supervisor: ${directive}`,
+          summary: `Soft-stopped after cycle ${cycleCount}.`,
+          agentLearnings: {},
+        }, agentName)
+      } catch (err) {
+        console.error(`[${agentName}] Failed to save memory entry on soft stop:`, err)
+        config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save memory entry on soft stop: ${err}` })
+      }
       break
     }
 

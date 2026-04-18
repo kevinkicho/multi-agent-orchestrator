@@ -682,6 +682,7 @@ export async function runAgentSupervisor(
   const RESTART_BACKOFF_BASE = limits.restartBackoffBaseMs ?? 30_000
   let consecutiveLlmFailures = 0 // tracks persistent Ollama failures across cycles
   let consecutive429s = 0 // tracks consecutive rate-limit (429) errors — distinct from other failures
+  const MAX_CONSECUTIVE_429S = 10 // cap to prevent unbounded escalation
 
   const emit = (text: string) => {
     config.onThinking?.(text)
@@ -1005,7 +1006,9 @@ export async function runAgentSupervisor(
           ? await config.resourceManager.withLlmSlot(llmCallFn)
           : await llmCallFn()
         consecutiveLlmFailures = 0
-        consecutive429s = 0
+        // Decay 429 counter on success instead of resetting — allows
+        // escalation across cycles while recovering naturally
+        consecutive429s = Math.max(0, consecutive429s - 1)
       } catch (err) {
         if (isTimeoutError(err)) {
           consecutiveLlmFailures++
@@ -1023,7 +1026,7 @@ export async function runAgentSupervisor(
           }
           llmBreakCycle = true
         } else if (isRateLimitError(err)) {
-          consecutive429s++
+          consecutive429s = Math.min(consecutive429s + 1, MAX_CONSECUTIVE_429S)
           config.resourceManager?.reportRateLimit(agentName)
           const cooldownMs = Math.min(30_000 * Math.pow(2, consecutive429s - 1), 300_000)
           emit(`RATE LIMITED (429) — attempt ${consecutive429s}, cooling down ${cooldownMs / 1000}s then skipping to next cycle`)
@@ -1049,8 +1052,10 @@ export async function runAgentSupervisor(
               : await llmCallFn()
             llmResult = retryResult
             consecutiveLlmFailures = 0
+            consecutive429s = Math.max(0, consecutive429s - 1)
           } catch (retryErr) {
-            emit(`LLM retry failed — skipping to next cycle: ${retryErr}`)
+            consecutiveLlmFailures++
+            emit(`LLM retry failed (failure #${consecutiveLlmFailures}) — skipping to next cycle: ${retryErr}`)
             logPerformance({
               timestamp: Date.now(), projectName: directory, agentName, model,
               event: "cycle_error", cycleNumber: cycleCount, details: String(retryErr),
@@ -1925,9 +1930,7 @@ Be specific with file paths, line numbers, and code snippets.`
       const rateLimitPause = Math.min(60_000 * consecutive429s, 300_000) // 60s, 120s, ... up to 5min
       cyclePause = Math.max(rateLimitPause, baseCyclePause)
       emit(`Rate-limited (${consecutive429s} consecutive 429s) — next cycle pause: ${Math.round(cyclePause / 1000)}s`)
-      // Reset 429 counter after applying the pause — we've already backed off, and if the API
-      // is still rate-limiting, the next 429 will re-increment the counter.
-      consecutive429s = 0
+      // The 429 counter persists across cycles and decays on success (see LLM call catch block).
       // Don't increment consecutiveIdleCycles — this isn't the agent's fault
     } else if (consecutiveEmptyResponses > 0 || cycleRestartCount > 0) {
       // Agent genuinely struggling — exponential backoff

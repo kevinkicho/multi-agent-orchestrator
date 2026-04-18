@@ -497,3 +497,21 @@ The shared knowledge store uses the same write-lock pattern as brain memory (`wi
 ### 25d. `@share:` Requires Supervisor Judgment
 
 `@share:` is explicit, not automatic. Behavioral notes (`@lesson:`) are still per-agent in brain memory — they're subjective observations about how a specific worker operates best, which may not apply to other agents. The supervisor must decide whether a discovery is worth broadcasting. This prevents the shared store from filling with low-value notes, but it means important discoveries may go unshared if the supervisor doesn't think to use `@share:`. Progress summaries, by contrast, are auto-published because they're structured and low-noise.
+
+## 26. Rate-Limit (429) Backoff — Persistent with Decay
+
+### 26a. Behavior
+
+The 429 counter (`consecutive429s`) persists across supervisor cycles and decays by 1 on each successful LLM call, rather than resetting to 0. This means sustained rate-limiting produces escalating inter-cycle pauses (60s, 120s, 180s, ...) that persist even after a single successful call, and only fully recover after as many successes as there were 429s. The counter is capped at 10 to prevent unbounded escalation. The per-request cooldown within a cycle follows `min(30s × 2^(n-1), 5min)`.
+
+### 26b. Tradeoff: Decay Rate Is a Heuristic
+
+The per-success decay of `max(0, counter - 1)` means 3 successes fully recover from 3 consecutive 429s. This favors recovery speed over caution. A more conservative decay (e.g., halving: `counter / 2`) would take longer to recover but risk less under a truly rate-limited provider. The `-1` decay is appropriate because rate limits are typically burst limits that recover on their own — if the provider is truly down, 429s continue and the counter grows again.
+
+### 26c. Tradeoff: Dual-Scope Escalation
+
+The counter works alongside ResourceManager's global rate-limit cooldown, which blocks all agents after `reportRateLimit()`. An individual agent that hits 429 gets both the global pause AND its own escalating inter-cycle pause. This is intentional (the most-affected agent should back off the most) but can be surprising in multi-agent setups where one agent triggers rate limiting for all — the triggering agent gets double-penalized while other agents only get the global cooldown.
+
+### 26d. Tradeoff: No Distinction Between Provider-Down and Burst-Limit
+
+The counter doesn't distinguish between "provider entirely down" (infinite 429s) and "burst limit exceeded" (temporary 429s followed by recovery). A persistent counter treats both the same — it grows on every 429 and only shrinks on success. For a truly down provider, the counter caps at 10 (5-minute inter-cycle pause) and the supervisor keeps trying indefinitely, which is correct behavior. For a burst limit, the decay ensures rapid recovery once the quota resets.

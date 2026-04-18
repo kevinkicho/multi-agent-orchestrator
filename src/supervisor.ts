@@ -27,6 +27,7 @@ import { isTruncated } from "./providers"
 import { assessProgress, parseGitDiffStat, addAssessmentRecord, type AssessmentRecord, type ValidationResult } from "./progress-assessor"
 import { loadSharedKnowledge, publishNote, publishProgress, formatRelevantKnowledge, clearAgentKnowledge } from "./shared-knowledge"
 import { extractLessonsFromReview } from "./lesson-extractor"
+import { reflectOnAgentHistory } from "./meta-reflection"
 import { compressTranscript, createCompressorState, type CompressorState } from "./transcript-compressor"
 import {
   type NudgeState, createNudgeState, resetNudge,
@@ -131,6 +132,17 @@ export type AgentSupervisorConfig = {
     enabled?: boolean
     thresholdTokens?: number
     /** Aux model for the summary call. Defaults to config.model. */
+    auxModel?: string
+  }
+  /** Periodic meta-reflection over recent cycle summaries (inspired by Hermes
+   *  Agent / Nous Research). Every `everyNCycles` successful cycles, an aux
+   *  LLM pass reads session summaries + existing lessons and distills 0-3
+   *  higher-level PRINCIPLEs, saved via addBehavioralNote. Default: enabled
+   *  with everyNCycles=5. */
+  metaReflection?: {
+    enabled?: boolean
+    everyNCycles?: number
+    /** Aux model for the reflection call. Defaults to config.model. */
     auxModel?: string
   }
   /** Token usage tracker — records tokens per call for budget monitoring */
@@ -1548,6 +1560,40 @@ Be specific with file paths, line numbers, and code snippets.`
               }
               config.onCycleSummary?.(cycleSummary)
               config.onCycleComplete?.(cycleCount)
+
+              // Periodic meta-reflection (inspired by Hermes Agent / Nous Research).
+              // Every N cycles, distill cross-cycle PRINCIPLEs from recent summaries
+              // and fold them into behavioral notes (topic-dedup handles overlap).
+              // Best-effort: failures must not block the supervisor loop.
+              const metaEnabled = config.metaReflection?.enabled !== false
+              const everyN = config.metaReflection?.everyNCycles ?? 5
+              if (metaEnabled && cycleCount > 0 && cycleCount % everyN === 0) {
+                try {
+                  const summaries = memory.agentEntries?.[agentName] ?? []
+                  const principles = await reflectOnAgentHistory({
+                    agentName,
+                    directory,
+                    recentSummaries: summaries.slice(-everyN),
+                    behavioralNotes: memory.behavioralNotes?.[agentName] ?? [],
+                    projectNotes: memory.projectNotes[agentName] ?? [],
+                    model: config.metaReflection?.auxModel ?? config.model,
+                    ollamaUrl: config.ollamaUrl,
+                  })
+                  for (const p of principles) {
+                    memory = await addBehavioralNote(memory, agentName, p)
+                    emit(`Meta-reflection principle: ${p}`)
+                  }
+                  if (principles.length > 0) {
+                    config.dashboardLog?.push({
+                      type: "supervisor-alert",
+                      agent: agentName,
+                      text: `Meta-reflection after cycle ${cycleCount}: captured ${principles.length} principle(s).`,
+                    })
+                  }
+                } catch (err) {
+                  console.error(`[${agentName}] Meta-reflection failed:`, err)
+                }
+              }
             }
 
             // --- Post-cycle validation ---

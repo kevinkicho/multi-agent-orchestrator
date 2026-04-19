@@ -6,13 +6,20 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test"
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "fs"
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, unlinkSync } from "fs"
 import { tmpdir } from "os"
 import { resolve, join } from "path"
 import { ProjectManager } from "../project-manager"
 import { DashboardLog } from "../dashboard"
 import { gitExec } from "../git-utils"
 import type { Orchestrator } from "../orchestrator"
+
+// saveProjects writes to `<cwd>/orchestrator-projects.json`. The mutating tests
+// below (setBaseBranch, mergeAgentBranch) trigger it, which would otherwise
+// clobber the developer's real project registry at the repo root when
+// `bun test` runs. Snapshot the file up-front and restore it at teardown.
+const PROJECTS_PATH = resolve(process.cwd(), "orchestrator-projects.json")
+let projectsSnap: string | null = null
 
 type Mutable<T> = { -readonly [K in keyof T]: T[K] }
 
@@ -50,6 +57,7 @@ let workdir: string
 let root: string
 
 beforeAll(async () => {
+  projectsSnap = existsSync(PROJECTS_PATH) ? readFileSync(PROJECTS_PATH, "utf8") : null
   root = mkdtempSync(resolve(tmpdir(), "pm-timeline-"))
   workdir = join(root, "work")
   mkdirSync(workdir, { recursive: true })
@@ -65,8 +73,17 @@ beforeAll(async () => {
   await gitExec(workdir, "commit", "-m", "agent-1")
 })
 
-afterAll(() => {
+afterAll(async () => {
   rmSync(root, { recursive: true, force: true })
+  // saveProjects() is fire-and-forget — give any still-in-flight writes a
+  // moment to land, then unconditionally restore so a late write can't
+  // re-clobber the developer's real registry after we've finished.
+  await new Promise(r => setTimeout(r, 250))
+  if (projectsSnap === null) {
+    if (existsSync(PROJECTS_PATH)) unlinkSync(PROJECTS_PATH)
+  } else {
+    writeFileSync(PROJECTS_PATH, projectsSnap)
+  }
 })
 
 describe("project timeline", () => {

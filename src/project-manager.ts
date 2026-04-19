@@ -587,6 +587,12 @@ export class ProjectManager {
       })
       this.processes.set(id, proc)
 
+      // Drain opencode's stdout/stderr into the dashboard log. Previously these
+      // pipes were created and never read, so provider-load errors, missing-key
+      // errors, and SDK loading failures disappeared — which is exactly how the
+      // "Round N → no commands" stall hid the real failure for so long.
+      this.streamOpencodeOutput(id, projectName, proc)
+
       // Monitor for unexpected process death
       this.monitorProcess(id, proc)
 
@@ -902,6 +908,47 @@ export class ProjectManager {
         if (this.directiveRefs.get(projectId) === directiveRef) this.directiveRefs.delete(projectId)
       }
     })()
+  }
+
+  /** Drain an opencode serve subprocess's stdout/stderr into the dashboard
+   *  log. The pipes MUST be read or the child's buffer fills and it blocks —
+   *  but more importantly, when the pipes are ignored, opencode's own
+   *  provider-load / API-key / model-resolution errors are never surfaced.
+   *  That's the failure mode that made the silent-fallback-to-ollama bug
+   *  invisible for so long. Anything on stderr is tagged as an error; stdout
+   *  is surfaced as plain brain-thinking so it doesn't dominate the log. */
+  private streamOpencodeOutput(projectId: string, projectName: string, proc: Subprocess): void {
+    const log = this.dashLog
+    const drain = async (stream: ReadableStream<Uint8Array> | null, kind: "stdout" | "stderr") => {
+      if (!stream) return
+      const reader = stream.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ""
+      try {
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          let idx: number
+          while ((idx = buffer.indexOf("\n")) >= 0) {
+            const line = buffer.slice(0, idx).replace(/\r$/, "")
+            buffer = buffer.slice(idx + 1)
+            if (line.trim()) {
+              log.push({
+                type: "brain-thinking",
+                text: `[opencode:${kind}] ${projectName}: ${line.slice(0, 500)}`,
+              })
+              // Also mirror to the parent console so the terminal shows it too —
+              // operators most often look there first when a worker hangs.
+              if (kind === "stderr") console.error(`[opencode:${projectName}] ${line}`)
+              else console.log(`[opencode:${projectName}] ${line}`)
+            }
+          }
+        }
+      } catch { /* stream ended / process died — monitorProcess handles it */ }
+    }
+    void drain(proc.stdout as unknown as ReadableStream<Uint8Array> | null, "stdout")
+    void drain(proc.stderr as unknown as ReadableStream<Uint8Array> | null, "stderr")
   }
 
   /** Watch a spawned process for unexpected crashes */

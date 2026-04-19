@@ -249,7 +249,7 @@ export async function addMemoryEntry(
 }
 
 export async function addProjectNote(
-  _store: BrainMemoryStore,
+  _store: BrainMemoryStore | null,
   agentName: string,
   note: string,
 ): Promise<BrainMemoryStore> {

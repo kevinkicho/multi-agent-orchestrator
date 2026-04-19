@@ -67,7 +67,7 @@ type ConfigFile = {
   dashboardPort?: number
   /** Operating mode: "projects" (isolated per-project supervisors) or "teams" (shared goal with manager) */
   mode?: "projects" | "teams"
-  brain?: { model?: string; ollamaUrl?: string }
+  brain?: { model?: string; ollamaUrl?: string; observer?: { enabled?: boolean } }
   /** Tunable supervisor limits */
   supervisor?: SupervisorLimits
   /** Phase 3: optional project role mapping { agentName: { coder, reviewer? } } */
@@ -127,7 +127,7 @@ function parseArgs(): {
   /** Legacy brain config: `model` may be undefined when orchestrator.json omits it —
    *  per-project models + resolveDefaultModel() provide the fallback. `ollamaUrl` is
    *  still required for Ollama-specific warmup and local model listing. */
-  brain: { model?: string; ollamaUrl: string }
+  brain: { model?: string; ollamaUrl: string; observer?: { enabled: boolean } }
   supervisor: SupervisorLimits
   projects?: Record<string, { coder: string; reviewer?: string }>
   scheduling: "parallel" | "sequential"
@@ -212,6 +212,9 @@ function parseArgs(): {
         return fileConfig?.brain?.model
       })(),
       ollamaUrl: fileConfig?.brain?.ollamaUrl ?? "http://127.0.0.1:11434",
+      observer: {
+        enabled: fileConfig?.brain?.observer?.enabled === true,
+      },
     },
     supervisor: fileConfig?.supervisor ?? {},
     projects: fileConfig?.projects,
@@ -461,6 +464,36 @@ async function main() {
 
   // ProjectManager — handles dynamic agent provisioning from the dashboard
   const projectManager = new ProjectManager(orchestrator, dashLog, brainConfig, supervisorLimits, eventBus, resourceManager, security)
+
+  // Phase 3: episodic brain observer — gated by brain.observer.enabled.
+  // Structurally read-only: only the narrow BrainObserverInput crosses this
+  // boundary; we never hand the observer an Orchestrator or prompt-sending handle.
+  if (brainConfig.observer?.enabled) {
+    eventBus.on({ type: "cycle-done" }, (event) => {
+      const data = event.data as { cycleNumber?: number; summary?: string; factualSummary?: string }
+      const summary = (data.factualSummary && String(data.factualSummary).trim())
+        || (data.summary && String(data.summary).trim())
+        || ""
+      if (!summary) return
+      const agentName = event.agentName ?? "unknown"
+      const cycleNumber = typeof data.cycleNumber === "number" ? data.cycleNumber : 0
+      const recentEventTypes = eventBus.getRecent(undefined, 20).map(e => e.type)
+      ;(async () => {
+        try {
+          const model = await resolveBrainModel(brainConfig)
+          const { runBrainObserver } = await import("./brain")
+          await runBrainObserver({
+            agentName,
+            cycleNumber,
+            lastSummary: summary,
+            recentEventTypes,
+            ollamaUrl: brainConfig.ollamaUrl,
+            model,
+          })
+        } catch { /* observer errors are non-fatal by design */ }
+      })()
+    })
+  }
 
   // REPL reader — declared early so handleCommand can re-prompt after background brain tasks
   let reader: any = null

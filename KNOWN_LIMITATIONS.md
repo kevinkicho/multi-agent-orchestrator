@@ -636,3 +636,15 @@ Dashboard mutating endpoints now require a `Content-Length` header (rejects chun
 **Tradeoff:** A note that fires heavily in a single cycle but never again (e.g., a one-off incident) will not promote. A note that accrues 3 fires across 2 cycles with weak signal (two heuristic false positives in the same review) will promote. The directive calls the tradeoff explicitly: fire evidence drives promotion; the LLM pass only rewrites text for clarity.
 
 **Ruled out:** Adaptive thresholds or per-agent tuning. Both add state to track and a feedback loop of their own. Before tuning, we need observations from a real long-run session — that's what Phase 3's observer is for.
+
+---
+
+## 35. Brain observer is episodic and narrowly scoped
+
+**What:** `runBrainObserver` (Phase 3) fires once per `cycle-done` event when `brain.observer.enabled` is true in orchestrator.json. It reads the cycle's session summary plus the last 20 event types off the bus, sends one LLM call gated to a 150-char response, and either writes a single `[observer] ...` project-note via `addProjectNote` or does nothing. Default is `enabled: false`.
+
+**Why:** The read-only boundary is enforced by the shape of `BrainObserverInput` — the observer never receives an `Orchestrator`, a `DashboardLog`, an `EventBus`, or any handle that could send a prompt or edit a directive. That's the structural guarantee: even if the LLM output were adversarial, the observer can only add one short note per cycle to a persisted file. Errors (LLM timeout, parse failure, write failure) are all swallowed — the observer is advisory, not part of any critical path.
+
+**Tradeoff:** The observer sees only a single cycle summary at a time. It can't synthesize across long horizons on its own — that's delegated to the existing meta-reflection pass, which now also runs on evidence (fires) rather than raw history. The observer is a low-rate channel for incidental cross-project patterns the meta-reflection pass misses; expect most invocations to produce `NONE`.
+
+**Ruled out:** A continuous observer that reads the event bus in real time. Would add another always-on LLM consumer and tangle the observer with transient state. Episodic-per-cycle keeps the budget predictable and the contract verifiable by reading one function signature. Also ruled out: letting the observer emit directives or prompts. That would collapse the read-only boundary and was the exact failure mode the directive called out.

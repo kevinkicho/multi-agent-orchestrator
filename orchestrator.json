@@ -4,7 +4,10 @@
   "dashboardPort": 4000,
   "mode": "projects",
   "brain": {
-    "ollamaUrl": "http://127.0.0.1:11434"
+    "ollamaUrl": "http://127.0.0.1:11434",
+    "observer": {
+      "enabled": false
+    }
   },
   "supervisor": {
     "cyclePauseSeconds": 30,

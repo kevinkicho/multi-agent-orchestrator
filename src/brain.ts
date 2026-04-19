@@ -647,3 +647,105 @@ async function waitForAgents(orchestrator: Orchestrator, timeoutMs = 300_000): P
     await new Promise((r) => setTimeout(r, 2000))
   }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: Brain as observer
+//
+// Episodic, read-only learning pass. Invoked once per completed cycle when
+// `brain.observer.enabled` is true in orchestrator.json.
+//
+// The read-only boundary is STRUCTURAL: BrainObserverInput must never carry
+// an Orchestrator, DashboardLog, prompt ledger, or any handle that could
+// send prompts or edit directives. The only writer the observer may invoke
+// is `addProjectNote` from brain-memory. Do not widen this type.
+// ---------------------------------------------------------------------------
+
+export type BrainObserverInput = {
+  agentName: string
+  cycleNumber: number
+  lastSummary: string
+  recentEventTypes: string[]
+  ollamaUrl: string
+  model: string
+  timeoutMs?: number
+  /** Test-only injection hook. Production callers should leave this unset. */
+  _chat?: (messages: Message[]) => Promise<string>
+}
+
+export type BrainObserverResult = {
+  noteEmitted: string | null
+}
+
+const OBSERVER_SYSTEM_PROMPT = `You are a silent observer of a multi-agent engineering orchestrator. You watch completed cycles and emit at most ONE short durable note when you notice a pattern worth remembering for future sessions. Most cycles should produce NONE.
+
+Output rules:
+- Respond with exactly "NONE" when nothing is worth recording.
+- Otherwise respond with exactly one line starting with "NOTE: " followed by a terse durable observation (under 150 chars).
+- Never suggest code changes, directives, or prompts.
+- Never ask a question. Never explain. Only "NONE" or one "NOTE: ..." line.
+- Prefer cross-project, cross-cycle patterns (recurring mistakes, generalizable insights). Skip anything agent-specific or task-specific.`
+
+const MAX_OBSERVER_NOTE_CHARS = 150
+
+export async function runBrainObserver(input: BrainObserverInput): Promise<BrainObserverResult> {
+  const summary = (input.lastSummary ?? "").trim()
+  if (!summary) return { noteEmitted: null }
+
+  const events = input.recentEventTypes.length > 0
+    ? input.recentEventTypes.join(", ")
+    : "(none)"
+
+  const userContent = [
+    `Agent: ${input.agentName}`,
+    `Cycle: ${input.cycleNumber}`,
+    `Recent events: ${events}`,
+    `Last session summary:`,
+    summary.slice(0, 4000),
+  ].join("\n")
+
+  const messages: Message[] = [
+    { role: "system", content: OBSERVER_SYSTEM_PROMPT },
+    { role: "user", content: userContent },
+  ]
+
+  let raw: string
+  try {
+    raw = input._chat
+      ? await input._chat(messages)
+      : await chatCompletion(input.ollamaUrl, input.model, messages, {
+          temperature: 0.2,
+          maxTokens: 120,
+          timeoutMs: input.timeoutMs ?? 45_000,
+        })
+  } catch {
+    return { noteEmitted: null }
+  }
+
+  const note = parseObserverOutput(raw)
+  if (!note) return { noteEmitted: null }
+
+  try {
+    await addProjectNote(null, input.agentName, `[observer] ${note}`)
+  } catch {
+    return { noteEmitted: null }
+  }
+
+  return { noteEmitted: note }
+}
+
+/** Parse observer LLM output: "NONE" → null, "NOTE: <text>" → trimmed text. */
+export function parseObserverOutput(raw: string): string | null {
+  const text = stripThinkTags(raw ?? "").trim()
+  if (!text) return null
+  // Scan lines so we tolerate leading prose the model may slip in.
+  for (const line of text.split(/\r?\n/)) {
+    const t = line.trim()
+    if (!t) continue
+    if (/^NONE\b/i.test(t)) return null
+    const m = t.match(/^NOTE\s*:\s*(.+)$/i)
+    if (m && m[1]) {
+      return m[1].trim().slice(0, MAX_OBSERVER_NOTE_CHARS)
+    }
+  }
+  return null
+}

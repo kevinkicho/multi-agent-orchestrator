@@ -1151,7 +1151,7 @@ export async function runAgentSupervisor(
 
       // LLM call: semaphore is held only during the actual API call, not during backoff.
       // On failure, we release the slot, back off, then re-acquire for retry.
-      const llmCallFn = () => chatCompletionWithUsage(ollamaUrl, model, messages, { ...(config.structuredOutput ? { jsonMode: true } : {}), timeoutMs: LLM_CALL_TIMEOUT_MS })
+      const llmCallFn = () => chatCompletionWithUsage(ollamaUrl, model, messages, { ...(config.structuredOutput ? { jsonMode: true } : {}), timeoutMs: LLM_CALL_TIMEOUT_MS, role: "supervisor", agentName })
 
       let llmResult: { content: string; usage?: import("./brain").TokenUsage } | null = null
 

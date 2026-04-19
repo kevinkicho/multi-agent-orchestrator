@@ -6,7 +6,12 @@
   "brain": {
     "ollamaUrl": "http://127.0.0.1:11434",
     "observer": {
-      "enabled": false
+      "enabled": true
+    },
+    "manager": {
+      "enabled": true,
+      "intervalMs": 120000,
+      "stuckThreshold": 3
     }
   },
   "supervisor": {

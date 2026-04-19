@@ -13,6 +13,7 @@
     <button class="sidebar-link" onclick="scrollToSection('projects-container')" title="Projects"><span class="sb-icon">&#9881;</span><span class="sb-label">Projects</span></button>
     <button class="sidebar-link" onclick="scrollToSection('brain-section')" title="Brain — the LLM orchestrator agent that reasons about the project and commands workers. Click ⓘ in the header for details."><span class="sb-icon">&#9670;</span><span class="sb-label">Brain</span></button>
     <button class="sidebar-link" onclick="scrollToSection('perf-section')" title="Performance"><span class="sb-icon">&#9734;</span><span class="sb-label">Performance</span></button>
+    <button class="sidebar-link" onclick="scrollToSection('llm-usage-section')" title="LLM Usage — tokens &amp; calls over time"><span class="sb-icon">&#9737;</span><span class="sb-label">LLM Usage</span></button>
     <button class="sidebar-link" onclick="scrollToSection('analytics-section')" title="Analytics"><span class="sb-icon">&#9733;</span><span class="sb-label">Analytics</span></button>
     <button class="sidebar-link" onclick="scrollToSection('ledger-section')" title="Prompt Log"><span class="sb-icon">&#9998;</span><span class="sb-label">Prompt Log</span></button>
     <button class="sidebar-link" onclick="scrollToSection('providers-section')" title="Providers"><span class="sb-icon">&#9729;</span><span class="sb-label">Providers</span></button>
@@ -125,6 +126,27 @@
     </div>
     <div class="brain-body">
       <div id="perf-content" style="padding:8px 12px;font-size:12px;color:#aaa;">Click refresh to load performance data.</div>
+    </div>
+  </div>
+
+  <div class="brain-section" id="llm-usage-section" style="border-color:#a78bfa;" role="region" aria-label="LLM usage">
+    <div class="brain-header" onclick="document.getElementById('llm-usage-section').classList.toggle('open')" style="border-color:#a78bfa;" role="button" tabindex="0" aria-expanded="false" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click()}">
+      <h2><span class="brain-arrow" aria-hidden="true">&#9654;</span> LLM Usage</h2>
+      <div style="display:flex;gap:6px;align-items:center;" onclick="event.stopPropagation()">
+        <select id="llm-usage-window" onchange="refreshLlmUsage()" style="background:#16162a;color:#ccc;border:1px solid #333;border-radius:4px;padding:4px 8px;font-size:11px;">
+          <option value="3600000">Last hour</option>
+          <option value="21600000">Last 6 hours</option>
+          <option value="86400000" selected>Last 24 hours</option>
+          <option value="604800000">Last 7 days</option>
+          <option value="2592000000">Last 30 days</option>
+        </select>
+        <button class="toolbar-btn" onclick="refreshLlmUsage()" style="font-size:10px;">Refresh</button>
+      </div>
+    </div>
+    <div class="brain-body">
+      <div id="llm-usage-summary" style="padding:8px 12px;font-size:12px;color:#aaa;">Click refresh to load usage data.</div>
+      <div id="llm-usage-chart" style="padding:8px 12px;"></div>
+      <div id="llm-usage-breakdown" style="padding:8px 12px;"></div>
     </div>
   </div>
 

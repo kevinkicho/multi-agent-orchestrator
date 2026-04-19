@@ -67,7 +67,15 @@ type ConfigFile = {
   dashboardPort?: number
   /** Operating mode: "projects" (isolated per-project supervisors) or "teams" (shared goal with manager) */
   mode?: "projects" | "teams"
-  brain?: { model?: string; ollamaUrl?: string; observer?: { enabled?: boolean } }
+  brain?: {
+    model?: string
+    ollamaUrl?: string
+    observer?: { enabled?: boolean }
+    /** Phase 5: persistent manager/overseer loop. Default on.
+     *  `intervalMs` — how often the stuck-project detector polls. Floor 30000.
+     *  `stuckThreshold` — N consecutive partial|failure outcomes before alert. */
+    manager?: { enabled?: boolean; intervalMs?: number; stuckThreshold?: number }
+  }
   /** Tunable supervisor limits */
   supervisor?: SupervisorLimits
   /** Phase 3: optional project role mapping { agentName: { coder, reviewer? } } */
@@ -127,7 +135,12 @@ function parseArgs(): {
   /** Legacy brain config: `model` may be undefined when orchestrator.json omits it —
    *  per-project models + resolveDefaultModel() provide the fallback. `ollamaUrl` is
    *  still required for Ollama-specific warmup and local model listing. */
-  brain: { model?: string; ollamaUrl: string; observer?: { enabled: boolean } }
+  brain: {
+    model?: string
+    ollamaUrl: string
+    observer?: { enabled: boolean }
+    manager?: { enabled: boolean; intervalMs?: number; stuckThreshold?: number }
+  }
   supervisor: SupervisorLimits
   projects?: Record<string, { coder: string; reviewer?: string }>
   scheduling: "parallel" | "sequential"
@@ -213,7 +226,12 @@ function parseArgs(): {
       })(),
       ollamaUrl: fileConfig?.brain?.ollamaUrl ?? "http://127.0.0.1:11434",
       observer: {
-        enabled: fileConfig?.brain?.observer?.enabled === true,
+        enabled: fileConfig?.brain?.observer?.enabled !== false,
+      },
+      manager: {
+        enabled: fileConfig?.brain?.manager?.enabled !== false,
+        intervalMs: fileConfig?.brain?.manager?.intervalMs,
+        stuckThreshold: fileConfig?.brain?.manager?.stuckThreshold,
       },
     },
     supervisor: fileConfig?.supervisor ?? {},
@@ -464,6 +482,37 @@ async function main() {
 
   // ProjectManager — handles dynamic agent provisioning from the dashboard
   const projectManager = new ProjectManager(orchestrator, dashLog, brainConfig, supervisorLimits, eventBus, resourceManager, security)
+
+  // Phase 5: persistent brain manager — session briefing + stuck detection.
+  // Emits advisory dashboard events (manager-briefing, manager-alert) and
+  // advisory project notes. Still can NOT send prompts or edit directives —
+  // it receives only the narrow BrainManagerEmit, not the orchestrator.
+  let managerHandle: { stop: () => void } | null = null
+  if (brainConfig.manager?.enabled) {
+    ;(async () => {
+      try {
+        const model = await resolveBrainModel(brainConfig)
+        const { startBrainManager } = await import("./brain")
+        managerHandle = startBrainManager({
+          ollamaUrl: brainConfig.ollamaUrl,
+          model,
+          intervalMs: brainConfig.manager?.intervalMs,
+          stuckThreshold: brainConfig.manager?.stuckThreshold,
+          emit: {
+            push: (event) => {
+              if (event.type === "manager-briefing") {
+                dashLog.push({ type: "manager-briefing", text: event.text })
+              } else {
+                dashLog.push({ type: "manager-alert", agent: event.agent, text: event.text })
+              }
+            },
+          },
+        })
+      } catch (err) {
+        console.warn(`[manager] Failed to start: ${err}`)
+      }
+    })()
+  }
 
   // Phase 3: episodic brain observer — gated by brain.observer.enabled.
   // Structurally read-only: only the narrow BrainObserverInput crosses this
@@ -1166,6 +1215,7 @@ async function main() {
     clearInterval(heartbeatTimer)
     // Mark session as cleanly shut down before stopping components
     markCleanShutdown().catch(() => {})
+    if (managerHandle) { try { managerHandle.stop() } catch {} }
     projectManager.shutdown()
     dashboard.stop()
     orchestrator.shutdown()

@@ -1165,6 +1165,18 @@ function handleEvent(event) {
     addExpandableEntry(brainLog, '', event.text || '')
   }
 
+  if (event.type === 'manager-briefing') {
+    addExpandableEntry(brainLog, 'sv-meta', '[manager] ' + (event.text || ''))
+  }
+
+  if (event.type === 'manager-alert') {
+    addLogEntry(brainLog, 'error', '<strong>[manager]</strong> ' + escapeHtml(event.text || ''))
+    if (event.agent) {
+      notify('Manager alert — ' + event.agent, event.text || '')
+      showNotification('Manager: ' + (event.text || '').slice(0, 120), 'warning')
+    }
+  }
+
   if (event.type === 'brain-status') {
     brainBadge.textContent = event.status.toUpperCase()
     brainBadge.className = 'brain-status ' + (event.status === 'running' ? 'brain-running' : 'brain-idle')
@@ -1611,6 +1623,116 @@ window.refreshPerformance = async function() {
     el.innerHTML = html
   } catch (err) {
     el.innerHTML = 'Error loading: ' + err
+  }
+}
+
+// --- LLM Usage UI ---
+const ROLE_COLORS = {
+  brain: '#60a5fa',
+  supervisor: '#f472b6',
+  observer: '#a78bfa',
+  manager: '#fbbf24',
+  'team-manager': '#4ade80',
+  other: '#888',
+}
+
+function roleColor(role) { return ROLE_COLORS[role] || '#888' }
+
+function renderUsageBarChart(container, buckets) {
+  if (!buckets || buckets.length === 0) {
+    container.innerHTML = '<div style="color:#666;font-size:11px;">No calls in this window.</div>'
+    return
+  }
+  const maxCalls = Math.max(...buckets.map(b => b.calls), 1)
+  const width = Math.max(240, buckets.length * 14)
+  const height = 140
+  const barW = Math.max(6, Math.floor(width / buckets.length) - 2)
+  const roles = ['brain', 'supervisor', 'observer', 'manager', 'team-manager', 'other']
+
+  let svg = '<svg width="' + width + '" height="' + (height + 28) + '" style="display:block;">'
+  // y-axis label
+  svg += '<text x="0" y="10" fill="#666" font-size="10">calls/hour</text>'
+  svg += '<text x="0" y="22" fill="#888" font-size="10">max ' + maxCalls + '</text>'
+  for (let i = 0; i < buckets.length; i++) {
+    const b = buckets[i]
+    const x = i * (barW + 2)
+    let yCursor = height
+    for (const role of roles) {
+      const n = b.byRole[role] || 0
+      if (n === 0) continue
+      const h = Math.round(n / maxCalls * (height - 20))
+      yCursor -= h
+      svg += '<rect x="' + x + '" y="' + yCursor + '" width="' + barW + '" height="' + h + '" fill="' + roleColor(role) + '" opacity="0.85"><title>' + b.hour + ' — ' + role + ': ' + n + '</title></rect>'
+    }
+    // x-axis hour tick
+    if (i % Math.max(1, Math.floor(buckets.length / 6)) === 0) {
+      svg += '<text x="' + x + '" y="' + (height + 14) + '" fill="#666" font-size="9">' + escapeHtml(b.hour.slice(-5)) + '</text>'
+    }
+  }
+  svg += '</svg>'
+
+  // Legend
+  let legend = '<div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:6px;font-size:10px;">'
+  for (const role of roles) {
+    legend += '<span style="display:inline-flex;align-items:center;gap:4px;"><span style="display:inline-block;width:10px;height:10px;background:' + roleColor(role) + ';"></span>' + role + '</span>'
+  }
+  legend += '</div>'
+  container.innerHTML = svg + legend
+}
+
+function renderUsageBreakdown(container, summary) {
+  if (!summary || summary.totalCalls === 0) {
+    container.innerHTML = ''
+    return
+  }
+  function row(label, obj) {
+    const entries = Object.entries(obj).sort((a, b) => b[1].calls - a[1].calls)
+    if (entries.length === 0) return ''
+    let html = '<div style="margin-top:8px;"><div style="color:#888;font-size:10px;text-transform:uppercase;margin-bottom:4px;">' + label + '</div>'
+    html += '<table style="width:100%;border-collapse:collapse;font-size:11px;">'
+    for (const [k, v] of entries) {
+      html += '<tr><td style="padding:2px 6px;color:#ccc;">' + escapeHtml(k) + '</td>'
+      html += '<td style="padding:2px 6px;color:#888;text-align:right;">' + v.calls + ' calls</td>'
+      html += '<td style="padding:2px 6px;color:#888;text-align:right;">' + (v.totalTokens || 0).toLocaleString() + ' tok</td></tr>'
+    }
+    html += '</table></div>'
+    return html
+  }
+  container.innerHTML = row('By role', summary.byRole) + row('By provider', summary.byProvider) + row('By model', summary.byModel)
+}
+
+window.refreshLlmUsage = async function() {
+  const summaryEl = document.getElementById('llm-usage-summary')
+  const chartEl = document.getElementById('llm-usage-chart')
+  const breakdownEl = document.getElementById('llm-usage-breakdown')
+  if (!summaryEl || !chartEl) return
+  const windowSel = document.getElementById('llm-usage-window')
+  const windowMs = windowSel ? windowSel.value : '86400000'
+  summaryEl.textContent = 'Loading...'
+  try {
+    const res = await fetch('/api/llm-usage?window=' + encodeURIComponent(windowMs))
+    if (!res.ok) {
+      summaryEl.textContent = 'Failed to load (HTTP ' + res.status + ')'
+      return
+    }
+    const data = await res.json()
+    const s = data.summary
+    if (!s || s.totalCalls === 0) {
+      summaryEl.innerHTML = '<span style="color:#666;">No calls recorded in this window.</span>'
+      chartEl.innerHTML = ''
+      if (breakdownEl) breakdownEl.innerHTML = ''
+      return
+    }
+    const failPct = (s.failureRate * 100).toFixed(1)
+    summaryEl.innerHTML =
+      '<span style="color:#e0e0e0;font-weight:600;">' + s.totalCalls + '</span> calls · ' +
+      '<span style="color:#e0e0e0;">' + s.totalTokens.toLocaleString() + '</span> tokens ' +
+      '(<span style="color:#888;">' + s.totalPromptTokens.toLocaleString() + ' in / ' + s.totalCompletionTokens.toLocaleString() + ' out</span>) · ' +
+      'failure rate <span style="color:' + (s.failureRate > 0.1 ? '#ef4444' : '#888') + ';">' + failPct + '%</span>'
+    renderUsageBarChart(chartEl, data.buckets || [])
+    if (breakdownEl) renderUsageBreakdown(breakdownEl, s)
+  } catch (err) {
+    summaryEl.textContent = 'Error loading: ' + err
   }
 }
 
@@ -3871,6 +3993,9 @@ setInterval(() => {
   try {
     if (document.getElementById('perf-section')?.classList.contains('open')) refreshPerformance()
   } catch (e) { console.error('[orchestrator-dashboard] refreshPerformance error:', e) }
+  try {
+    if (document.getElementById('llm-usage-section')?.classList.contains('open')) refreshLlmUsage()
+  } catch (e) { console.error('[orchestrator-dashboard] refreshLlmUsage error:', e) }
   try {
     if (document.getElementById('eventbus-section')?.classList.contains('open')) refreshBusEvents()
   } catch (e) { console.error('[orchestrator-dashboard] refreshBusEvents error:', e) }

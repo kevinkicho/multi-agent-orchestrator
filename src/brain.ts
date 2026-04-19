@@ -157,11 +157,21 @@ function stripThinkTags(text: string): string {
   return cleaned.trim()
 }
 
+export type ChatCompletionOpts = {
+  temperature?: number
+  maxTokens?: number
+  jsonMode?: boolean
+  timeoutMs?: number
+  /** Attribution for llm-usage telemetry. */
+  role?: import("./llm-usage").LLMUsageRole
+  agentName?: string
+}
+
 export async function chatCompletion(
   ollamaUrl: string,
   model: string,
   messages: Message[],
-  opts?: { temperature?: number; maxTokens?: number; jsonMode?: boolean; timeoutMs?: number },
+  opts?: ChatCompletionOpts,
 ): Promise<string> {
   const result = await chatCompletionWithUsage(ollamaUrl, model, messages, opts)
   return stripThinkTags(result.content)
@@ -172,7 +182,7 @@ export async function chatCompletionWithUsage(
   ollamaUrl: string,
   model: string,
   messages: Message[],
-  opts?: { temperature?: number; maxTokens?: number; jsonMode?: boolean; timeoutMs?: number },
+  opts?: ChatCompletionOpts,
 ): Promise<{ content: string; usage?: TokenUsage }> {
   const ref = parseModelRef(model)
   const timeoutMs = opts?.timeoutMs ?? 180_000
@@ -191,6 +201,8 @@ export async function chatCompletionWithUsage(
         maxTokens,
         jsonMode: opts?.jsonMode,
         timeoutMs,
+        role: opts?.role,
+        agentName: opts?.agentName,
       })
       return { content: result.content, usage: result.usage }
     } catch (err) {
@@ -209,6 +221,8 @@ export async function chatCompletionWithUsage(
     maxTokens: opts?.maxTokens,
     jsonMode: opts?.jsonMode,
     timeoutMs,
+    role: opts?.role,
+    agentName: opts?.agentName,
   })
   return { content: result.content, usage: result.usage }
 }
@@ -378,7 +392,7 @@ export async function runBrain(
       }).catch(() => {})
     }
     try {
-      response = await chatCompletion(config.ollamaUrl, config.model, messages)
+      response = await chatCompletion(config.ollamaUrl, config.model, messages, { role: "brain" })
       consecutiveLlmFailures = 0
       // Ledger: record brain inbound response
       recordPrompt({
@@ -392,7 +406,7 @@ export async function runBrain(
       config.onThinking?.(`Retrying in ${retryDelay / 1000}s...`)
       await new Promise(r => setTimeout(r, retryDelay))
       try {
-        response = await chatCompletion(config.ollamaUrl, config.model, messages)
+        response = await chatCompletion(config.ollamaUrl, config.model, messages, { role: "brain" })
         consecutiveLlmFailures = 0
       } catch (retryErr) {
         config.onThinking?.(`LLM retry failed (failure #${consecutiveLlmFailures}): ${retryErr}`)
@@ -716,6 +730,8 @@ export async function runBrainObserver(input: BrainObserverInput): Promise<Brain
           temperature: 0.2,
           maxTokens: 120,
           timeoutMs: input.timeoutMs ?? 45_000,
+          role: "observer",
+          agentName: input.agentName,
         })
   } catch {
     return { noteEmitted: null }
@@ -748,4 +764,238 @@ export function parseObserverOutput(raw: string): string | null {
     }
   }
   return null
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: Brain as persistent manager (overseer / PM).
+//
+// Unlike the Phase 3 observer, the Manager can emit *advisory writes* —
+// dashboard alerts and project notes — but it still never sends prompts to
+// workers or edits directives. Two capabilities in this first slice:
+//
+//   #1 Stuck-project detector — N consecutive partial/failure outcomes →
+//      dashboard alert + advisory note.
+//   #2 Session-start briefing — at app init, summarize promoted/unpromoted
+//      principles across all projects since last run, emit one dashboard
+//      event so the user sees the state of the factory at a glance.
+//
+// The Manager runs on a persistent timer started at app init. It reads
+// brain-memory directly; it does NOT receive an Orchestrator handle. The
+// narrow `BrainManagerInput` below is the boundary that keeps it honest.
+// ---------------------------------------------------------------------------
+
+export type BrainManagerAlert = {
+  agentName: string
+  consecutiveBadOutcomes: number
+  recentOutcomes: ("success" | "partial" | "failure")[]
+  suggestion: string
+}
+
+export type BrainManagerBriefing = {
+  atTs: number
+  totalAgents: number
+  totalPromoted: number
+  totalUnpromoted: number
+  recentPromotedPerAgent: Record<string, number>
+  recentUnpromotedPerAgent: Record<string, number>
+  text: string
+}
+
+export type BrainManagerEmit = {
+  /** Push a dashboard alert or briefing event. Implemented by the caller so
+   *  the manager never touches DashboardLog directly. */
+  push: (event: { type: "manager-alert" | "manager-briefing"; agent?: string; text: string }) => void
+}
+
+export type BrainManagerInput = {
+  ollamaUrl: string
+  model: string
+  /** Threshold for capability #1: N consecutive partial|failure outcomes
+   *  before the stuck detector fires. Default 3. */
+  stuckThreshold?: number
+  /** Emit surface. Kept narrow to preserve the read-only-for-prompts boundary. */
+  emit: BrainManagerEmit
+  /** Test-only chat injection. Production leaves this unset. */
+  _chat?: (messages: Message[]) => Promise<string>
+}
+
+export const MANAGER_DEFAULT_STUCK_THRESHOLD = 3
+
+/** Evaluate the last N outcomes per agent; return one alert per agent that
+ *  has `stuckThreshold` consecutive non-success outcomes. Pure function —
+ *  no I/O, easy to unit-test. */
+export function detectStuckProjects(
+  cycleOutcomes: Record<string, Record<number, { outcome: "success" | "partial" | "failure" }>>,
+  stuckThreshold: number,
+): BrainManagerAlert[] {
+  const alerts: BrainManagerAlert[] = []
+  for (const agentName of Object.keys(cycleOutcomes)) {
+    const byCycle = cycleOutcomes[agentName] ?? {}
+    const cycles = Object.keys(byCycle).map(Number).sort((a, b) => b - a)
+    if (cycles.length < stuckThreshold) continue
+    const recent = cycles.slice(0, stuckThreshold).map(c => byCycle[c]!.outcome)
+    const allBad = recent.every(o => o === "partial" || o === "failure")
+    if (!allBad) continue
+    alerts.push({
+      agentName,
+      consecutiveBadOutcomes: stuckThreshold,
+      recentOutcomes: recent,
+      suggestion: recent.every(o => o === "failure")
+        ? "All recent cycles ended in failure. Consider pausing, reviewing recent directives, or resetting the session."
+        : "Recent cycles ended partial — worker may be spinning without reaching @done. Consider narrowing the directive.",
+    })
+  }
+  return alerts
+}
+
+/** Compose a session-start briefing from memory. Summarizes promoted /
+ *  unpromoted principles per agent since last run. Pure function. */
+export function composeSessionBriefing(args: {
+  behavioralNotesByAgent: Record<string, Array<{ promotedAt?: unknown; unpromotedAt?: unknown }>>
+  archivedBehavioralNotesByAgent?: Record<string, Array<unknown>>
+  now: number
+}): BrainManagerBriefing {
+  const recentPromoted: Record<string, number> = {}
+  const recentUnpromoted: Record<string, number> = {}
+  let totalPromoted = 0
+  let totalUnpromoted = 0
+  const agents = new Set<string>()
+  for (const [agent, notes] of Object.entries(args.behavioralNotesByAgent)) {
+    agents.add(agent)
+    let p = 0, u = 0
+    for (const n of notes) {
+      if (n.promotedAt) { p++; totalPromoted++ }
+      if (n.unpromotedAt) { u++; totalUnpromoted++ }
+    }
+    if (p > 0) recentPromoted[agent] = p
+    if (u > 0) recentUnpromoted[agent] = u
+  }
+  for (const agent of Object.keys(args.archivedBehavioralNotesByAgent ?? {})) agents.add(agent)
+
+  const lines: string[] = []
+  lines.push(`Manager briefing: ${agents.size} agent(s).`)
+  lines.push(`Principles in force: ${totalPromoted}. Un-promoted notes: ${totalUnpromoted}.`)
+  if (Object.keys(recentPromoted).length > 0) {
+    const top = Object.entries(recentPromoted).sort((a, b) => b[1] - a[1]).slice(0, 5)
+    lines.push(`Top promoters: ${top.map(([a, n]) => `${a}(${n})`).join(", ")}`)
+  }
+  if (Object.keys(recentUnpromoted).length > 0) {
+    const top = Object.entries(recentUnpromoted).sort((a, b) => b[1] - a[1]).slice(0, 5)
+    lines.push(`Recent un-promotions: ${top.map(([a, n]) => `${a}(${n})`).join(", ")}`)
+  }
+
+  return {
+    atTs: args.now,
+    totalAgents: agents.size,
+    totalPromoted,
+    totalUnpromoted,
+    recentPromotedPerAgent: recentPromoted,
+    recentUnpromotedPerAgent: recentUnpromoted,
+    text: lines.join(" "),
+  }
+}
+
+const MANAGER_BRIEFING_PROMPT = `You are the persistent manager of a multi-agent engineering orchestrator. You have just been handed a factual snapshot of every agent's current state. Produce a short briefing for the human operator:
+- 3-6 sentences, plain prose.
+- Lead with what matters most: stuck agents, newly un-promoted principles, unexpected patterns.
+- End with one actionable suggestion if anything obvious stands out, otherwise say "No action needed right now."
+- Never invent numbers not present in the snapshot.`
+
+/** Run the manager's session-start briefing. Called once at app init. */
+export async function runManagerBriefing(input: BrainManagerInput): Promise<BrainManagerBriefing> {
+  const { loadBrainMemory } = await import("./brain-memory")
+  const store = await loadBrainMemory()
+  const briefing = composeSessionBriefing({
+    behavioralNotesByAgent: store.behavioralNotes ?? {},
+    archivedBehavioralNotesByAgent: store.archivedBehavioralNotes ?? {},
+    now: Date.now(),
+  })
+
+  // Optional LLM enrichment — converts the factual snapshot into prose.
+  let narrative: string | null = null
+  try {
+    const snapshot = JSON.stringify({
+      totalAgents: briefing.totalAgents,
+      totalPromoted: briefing.totalPromoted,
+      totalUnpromoted: briefing.totalUnpromoted,
+      recentPromotedPerAgent: briefing.recentPromotedPerAgent,
+      recentUnpromotedPerAgent: briefing.recentUnpromotedPerAgent,
+    })
+    const messages: Message[] = [
+      { role: "system", content: MANAGER_BRIEFING_PROMPT },
+      { role: "user", content: snapshot },
+    ]
+    const raw = input._chat
+      ? await input._chat(messages)
+      : await chatCompletion(input.ollamaUrl, input.model, messages, {
+          temperature: 0.2,
+          maxTokens: 300,
+          timeoutMs: 60_000,
+          role: "manager",
+        })
+    const cleaned = stripThinkTags(raw).trim()
+    if (cleaned) narrative = cleaned.slice(0, 2000)
+  } catch { /* LLM enrichment failure is non-fatal — fall back to factual text */ }
+
+  const finalText = narrative ?? briefing.text
+  input.emit.push({ type: "manager-briefing", text: finalText })
+  return { ...briefing, text: finalText }
+}
+
+/** Run one pass of the manager's stuck-project detector. Called on a timer.
+ *  Emits at most one alert per stuck agent per pass (alerts aren't deduped
+ *  across passes — if an agent stays stuck, the user sees steady reminders). */
+export async function runManagerStuckPass(input: BrainManagerInput): Promise<BrainManagerAlert[]> {
+  const { loadBrainMemory, addProjectNote } = await import("./brain-memory")
+  const store = await loadBrainMemory()
+  const outcomes = store.cycleOutcomes ?? {}
+
+  // Normalize to the pure-function input shape.
+  const shaped: Record<string, Record<number, { outcome: "success" | "partial" | "failure" }>> = {}
+  for (const [agent, byCycle] of Object.entries(outcomes)) {
+    shaped[agent] = {}
+    for (const c of Object.keys(byCycle)) {
+      shaped[agent]![Number(c)] = { outcome: byCycle[Number(c)]!.outcome }
+    }
+  }
+
+  const threshold = input.stuckThreshold ?? MANAGER_DEFAULT_STUCK_THRESHOLD
+  const alerts = detectStuckProjects(shaped, threshold)
+
+  for (const alert of alerts) {
+    const text = `[stuck] ${alert.agentName} — ${alert.consecutiveBadOutcomes} consecutive ${alert.recentOutcomes.join("/")} outcomes. ${alert.suggestion}`
+    input.emit.push({ type: "manager-alert", agent: alert.agentName, text })
+    try {
+      await addProjectNote(null, alert.agentName, `[manager] ${alert.suggestion}`)
+    } catch { /* advisory note failure is non-fatal */ }
+  }
+  return alerts
+}
+
+/** Start the persistent manager loop. Returns a stop function. Runs briefing
+ *  once immediately, then the stuck pass every `intervalMs` until stopped. */
+export function startBrainManager(
+  input: BrainManagerInput & { intervalMs?: number },
+): { stop: () => void } {
+  const intervalMs = Math.max(30_000, input.intervalMs ?? 120_000)
+  let stopped = false
+  let timer: ReturnType<typeof setTimeout> | null = null
+
+  // Fire briefing once at start (best-effort; don't block the timer).
+  runManagerBriefing(input).catch(() => {})
+
+  const tick = async () => {
+    if (stopped) return
+    try { await runManagerStuckPass(input) } catch { /* non-fatal */ }
+    if (!stopped) timer = setTimeout(tick, intervalMs)
+  }
+  timer = setTimeout(tick, intervalMs)
+
+  return {
+    stop: () => {
+      stopped = true
+      if (timer) clearTimeout(timer)
+      timer = null
+    },
+  }
 }

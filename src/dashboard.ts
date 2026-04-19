@@ -32,6 +32,8 @@ export type DashboardEvent = DashboardEventBase & (
   | { type: "supervisor-thinking"; agent: string; text: string }
   | { type: "supervisor-status"; agent: string; status: "running" | "idle" | "done" | "reviewing" | "paused" }
   | { type: "supervisor-alert"; agent: string; text: string }
+  | { type: "manager-briefing"; text: string }
+  | { type: "manager-alert"; agent?: string; text: string }
 )
 
 /** Shared event log that the dashboard reads from.
@@ -798,6 +800,26 @@ export async function startDashboard(
           return Response.json(await loadPerformanceLog(), { headers: corsHeaders })
         } catch {
           return Response.json({ entries: [] }, { headers: corsHeaders })
+        }
+      }
+
+      if (url.pathname === "/api/llm-usage" && req.method === "GET") {
+        try {
+          const { loadLLMUsage, bucketUsageByHour, summarizeUsage } = await import("./llm-usage")
+          const store = await loadLLMUsage()
+          const sinceParam = url.searchParams.get("since")
+          const windowParam = url.searchParams.get("window")
+          // Default window: 24 hours
+          const sinceMs = sinceParam
+            ? Number(sinceParam)
+            : windowParam
+              ? Date.now() - Number(windowParam)
+              : Date.now() - 24 * 60 * 60 * 1000
+          const buckets = bucketUsageByHour(store, sinceMs)
+          const summary = summarizeUsage(store, sinceMs)
+          return Response.json({ buckets, summary }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ buckets: [], summary: null, error: String(err) }, { headers: corsHeaders })
         }
       }
 

@@ -596,7 +596,7 @@ export class TeamManager {
         }).catch(() => {})
       }
       try {
-        response = await chatCompletion(config.ollamaUrl, config.model, this.managerMessages)
+        response = await chatCompletion(config.ollamaUrl, config.model, this.managerMessages, { role: "team-manager" })
         consecutiveLlmFailures = 0
         // Ledger: record manager inbound response
         recordPrompt({
@@ -615,7 +615,7 @@ export class TeamManager {
         emit(`Retrying in ${retryDelay / 1000}s...`)
         await new Promise(r => setTimeout(r, retryDelay))
         try {
-          response = await chatCompletion(config.ollamaUrl, config.model, this.managerMessages)
+          response = await chatCompletion(config.ollamaUrl, config.model, this.managerMessages, { role: "team-manager" })
           consecutiveLlmFailures = 0
         } catch (retryErr) {
           emit(`Manager LLM retry failed: ${retryErr}`)

@@ -53,6 +53,10 @@ export type LLMRequestParams = {
   timeoutMs?: number
   /** Request JSON-formatted output (Ollama format:"json", OpenAI response_format) */
   jsonMode?: boolean
+  /** Caller role — used by llm-usage telemetry. Defaults to "other" when unset. */
+  role?: import("./llm-usage").LLMUsageRole
+  /** Agent the call is associated with (for per-project usage breakdown). */
+  agentName?: string
 }
 
 export type LLMResponse = {
@@ -468,14 +472,41 @@ export async function llmCall(params: LLMRequestParams): Promise<LLMResponse> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
 
+  const startedAt = Date.now()
+  let result: LLMResponse | null = null
+  let err: unknown = null
   try {
     if (provider.type === "anthropic") {
-      return await callAnthropic(provider, apiKey, params, temperature, maxTokens, controller, params.jsonMode)
+      result = await callAnthropic(provider, apiKey, params, temperature, maxTokens, controller, params.jsonMode)
     } else {
-      return await callOpenAICompatible(provider, apiKey, params, temperature, maxTokens, controller, params.jsonMode)
+      result = await callOpenAICompatible(provider, apiKey, params, temperature, maxTokens, controller, params.jsonMode)
     }
+    return result
+  } catch (e) {
+    err = e
+    throw e
   } finally {
     clearTimeout(timeout)
+    const durationMs = Date.now() - startedAt
+    // Fire-and-forget usage recording; never let it break the caller.
+    void (async () => {
+      try {
+        const { recordLLMUsage } = await import("./llm-usage")
+        await recordLLMUsage({
+          ts: startedAt,
+          provider: params.provider,
+          model: params.model,
+          role: params.role ?? "other",
+          agentName: params.agentName,
+          promptTokens: result?.usage?.promptTokens,
+          completionTokens: result?.usage?.completionTokens,
+          totalTokens: result?.usage?.totalTokens,
+          durationMs,
+          ok: !err,
+          errorKind: err ? (err instanceof Error ? err.name : "Error") : undefined,
+        })
+      } catch { /* telemetry is best-effort */ }
+    })()
   }
 }
 

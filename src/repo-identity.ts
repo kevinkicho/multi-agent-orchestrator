@@ -74,32 +74,22 @@ export function slugifyAgentName(name: string): string {
 // ---------------------------------------------------------------------------
 
 export type RepoIdentityDeps = {
-  /** Resolver for `git remote get-url <remote>` — returns the URL or null. */
+  /** Resolver for `git remote get-url <remote>` — kept for `canonicalAgentName`
+   *  which still uses it; `isOrchestratorRepo` itself no longer calls it. */
   getOriginUrl: (cwd: string) => Promise<string | null>
   /** Absolute path of the orchestrator's own repo root (defaults to process.cwd()). */
   orchestratorRoot?: string
 }
 
-/** True when `directory` is the orchestrator's own checkout.
- *  Matches on two signals:
- *    1. Resolved absolute path equals the orchestrator root.
- *    2. Both repos resolve the same normalized `origin` URL. */
+/** True when `directory` resolves to the exact running orchestrator root.
+ *  Guards against a genuine footgun: creating `agent/` branches inside the
+ *  working tree currently executing the orchestrator. Sibling clones that
+ *  share the same `origin` URL at a different path are allowed — their
+ *  supervisor cuts branches inside the clone, not the running tree. */
 export async function isOrchestratorRepo(directory: string, deps: RepoIdentityDeps): Promise<boolean> {
   const root = resolve(deps.orchestratorRoot ?? process.cwd())
   const target = resolve(directory)
-
-  if (target === root) return true
-
-  const [projectUrl, orchestratorUrl] = await Promise.all([
-    deps.getOriginUrl(target).catch(() => null),
-    deps.getOriginUrl(root).catch(() => null),
-  ])
-  if (!projectUrl || !orchestratorUrl) return false
-
-  const a = normalizeGitUrl(projectUrl)
-  const b = normalizeGitUrl(orchestratorUrl)
-  if (!a || !b) return false
-  return a === b
+  return target === root
 }
 
 /** Derive the canonical agent name for a project directory.

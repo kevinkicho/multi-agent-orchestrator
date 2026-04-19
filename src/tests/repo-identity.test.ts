@@ -63,24 +63,18 @@ describe("isOrchestratorRepo", () => {
     expect(await isOrchestratorRepo(resolve("/repo") + "/", deps)).toBe(true)
   })
 
-  test("true when both checkouts share origin URL", async () => {
+  test("false for a sibling clone with matching origin at a different path", async () => {
+    // Clones of the same GitHub repo at different paths used to trip this
+    // guard; the narrowed guard now allows them since the supervisor operates
+    // on the clone directory, not the running tree.
     const deps = {
       getOriginUrl: async (_cwd: string) => "https://github.com/k/repo.git",
-      orchestratorRoot: "/other/path",
+      orchestratorRoot: "/running/tree",
     }
-    expect(await isOrchestratorRepo("/some/clone", deps)).toBe(true)
+    expect(await isOrchestratorRepo("/another/clone/of/repo", deps)).toBe(false)
   })
 
-  test("false when origins differ", async () => {
-    const deps = {
-      getOriginUrl: async (cwd: string) =>
-        cwd.includes("self") ? "https://github.com/k/repo.git" : "https://github.com/k/other.git",
-      orchestratorRoot: "/self",
-    }
-    expect(await isOrchestratorRepo("/target", deps)).toBe(false)
-  })
-
-  test("false when either origin lookup returns null", async () => {
+  test("false when paths differ and no origin info is available", async () => {
     const deps = {
       getOriginUrl: async () => null,
       orchestratorRoot: "/root",

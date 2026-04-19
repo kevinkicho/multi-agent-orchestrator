@@ -123,7 +123,7 @@ Each project gets:
 - **Event bus** -- System-wide in-memory pub/sub with ring buffer (200 events), pattern-matched subscriptions, and SSE streaming to the dashboard
 - **Resource manager** -- Advisory file locks prevent agents from stepping on each other's files. LLM concurrency semaphore throttles parallel Ollama requests. Work intent declarations enable conflict detection before work begins
 - **Git branch isolation** -- Each project works on an `agent/<name>` branch cut from a configurable base (defaults to current HEAD; missing branches are materialized from `origin` when possible). Canonical `<name>` is derived from the `origin` remote slug when available so two clones of the same repo share one agent identity. Merge back via dashboard or CLI when work is complete
-- **Self-ingest guard** -- `addProject` refuses the orchestrator's own repo (detected via matching path or shared `origin` URL) unless `allowSelfIngest: true` is passed, preventing the confusing state of the orchestrator mutating its own working tree
+- **Self-ingest guard** -- `addProject` refuses the exact directory currently running the orchestrator, preventing the supervisor from cutting `agent/` branches inside its own working tree. Sibling clones of the same repo at a different path are allowed (their supervisor operates on the clone, not the running tree)
 - **Unmerged-work warning** -- When a project is removed, commits on its agent branch that haven't landed on the base branch trigger an `unmerged-agent-branch` event and dashboard warning; the branch is preserved (non-force delete) so nothing is silently lost
 - **Rate-limit coordination** -- Shared 429 cooldown with escalating backoff across all agents
 - **Token tracking** -- Per-agent token usage accounting with budget limits
@@ -384,7 +384,7 @@ When the orchestrator is running, the interactive REPL accepts:
 ### Project Lifecycle
 
 1. **Add a project** -- via dashboard or `project add <directory>`. The ProjectManager:
-   - Refuses the orchestrator's own repo (detected via matching path or shared `origin` URL) unless `allowSelfIngest: true` is passed
+   - Refuses the exact directory currently running the orchestrator (other clones of the same repo at different paths are accepted)
    - Derives a canonical agent name from the `origin` remote slug when available, so two clones of the same repo share one agent identity (falls back to folder basename)
    - Finds a free random port (10000–60000) to avoid conflicts with other local services
    - Spawns an `opencode serve` instance pointed at the project directory
@@ -596,7 +596,7 @@ The dashboard server exposes these REST endpoints. `GET` requests are unauthenti
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/api/projects` | List active projects |
-| `POST` | `/api/projects` | Add a project (`{ directory, directive?, name?, baseBranch?, allowSelfIngest? }`). Returns 409 if already active or if the directory is the orchestrator's own repo (unless `allowSelfIngest: true`), 404 if directory missing |
+| `POST` | `/api/projects` | Add a project (`{ directory, directive?, name?, baseBranch?, model? }`). Returns 409 if already active or if the directory is the one currently running the orchestrator, 404 if the directory does not exist |
 | `DELETE` | `/api/projects/<id>` | Remove a project |
 | `PUT` | `/api/projects/<id>/directive` | Update directive and restart supervisor (`{ directive }`) |
 | `PUT` | `/api/projects/<id>/model` | Update model and restart supervisor (`{ model }`) |

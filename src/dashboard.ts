@@ -444,7 +444,6 @@ export async function startDashboard(
             undefined,
             {
               baseBranch: body.baseBranch?.trim() || undefined,
-              allowSelfIngest: false,
               model: body.model?.trim() || undefined,
               // Seed the timeline with a clone event so the History drawer shows
               // "project began by cloning <url>" as the oldest entry.
@@ -472,7 +471,6 @@ export async function startDashboard(
             name?: string
             directiveHistory?: any[]
             baseBranch?: string
-            allowSelfIngest?: boolean
             model?: string
           }
           if (!body.directory?.trim()) {
@@ -485,7 +483,6 @@ export async function startDashboard(
             body.directiveHistory || undefined,
             {
               baseBranch: body.baseBranch?.trim() || undefined,
-              allowSelfIngest: body.allowSelfIngest === true,
               model: body.model?.trim() || undefined,
             },
           )
@@ -494,7 +491,7 @@ export async function startDashboard(
           const msg = String(err)
           const status = msg.includes("already active") ? 409
             : msg.includes("does not exist") ? 404
-            : msg.includes("orchestrator's own repo") ? 409
+            : msg.includes("currently running the orchestrator") ? 409
             : 500
           return Response.json({ ok: false, error: msg }, { status, headers: corsHeaders })
         }

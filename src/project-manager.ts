@@ -182,13 +182,10 @@ export type GitInfo = {
 }
 
 /** Optional knobs passed to addProject. Any callers that don't set these get
- *  the previous behavior — except `allowSelfIngest` which defaults to false
- *  (new guard refuses to add the orchestrator's own repo). */
+ *  the previous behavior. */
 export type AddProjectOptions = {
   /** Branch to cut the agent branch off of. Falls back to current HEAD when absent. */
   baseBranch?: string
-  /** Permit adding the orchestrator's own repo. Default false. */
-  allowSelfIngest?: boolean
   /** Restore a persisted responsibilities list (used by restoreProjects). Reconciled against catalog. */
   responsibilities?: Responsibility[]
   /** Pre-select a `provider:model` (or bare ollama model) for this project's supervisor.
@@ -487,19 +484,19 @@ export class ProjectManager {
       throw new Error(`Directory does not exist: ${resolvedDir}`)
     }
 
-    // Self-ingest guard — refuse to add the orchestrator's own repo unless explicitly opted in.
-    // Protects against a confusing state where the orchestrator creates agent branches
-    // inside its own working tree (see KNOWN_LIMITATIONS "Self-ingest guard").
-    if (!opts?.allowSelfIngest) {
-      const isSelf = await isOrchestratorRepo(resolvedDir, {
-        getOriginUrl: (cwd) => gitRemoteUrl(cwd),
-      })
-      if (isSelf) {
-        throw new Error(
-          `Refusing to add ${resolvedDir}: it is the orchestrator's own repo. ` +
-          `Pass allowSelfIngest=true only if you really mean to run the orchestrator on itself.`,
-        )
-      }
+    // Self-ingest guard — refuse to add the exact directory currently running
+    // the orchestrator. Prevents the supervisor from cutting `agent/` branches
+    // inside its own working tree. Sibling clones at different paths (even
+    // with matching `origin`) are allowed — their supervisor operates on the
+    // clone, not the running tree.
+    const isSelf = await isOrchestratorRepo(resolvedDir, {
+      getOriginUrl: (cwd) => gitRemoteUrl(cwd),
+    })
+    if (isSelf) {
+      throw new Error(
+        `Refusing to add ${resolvedDir}: this is the directory currently running the orchestrator. ` +
+        `Clone the repo to a different path and add that instead.`,
+      )
     }
 
     const projectName = name || basename(resolvedDir)

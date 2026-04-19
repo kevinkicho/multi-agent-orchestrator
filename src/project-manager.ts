@@ -30,7 +30,7 @@ import { isOrchestratorRepo, canonicalAgentName } from "./repo-identity"
 import type { EventBus } from "./event-bus"
 import type { ResourceManager } from "./resource-manager"
 import { archiveAgentMemory, hasAgentArchive, restoreAgentMemory } from "./brain-memory"
-import { resolveDefaultModel, validateModelRoutable, parseModelRef, selectProjectModel } from "./providers"
+import { resolveDefaultModel, validateModelRoutable, parseModelRef, selectProjectModel, toAgentModelRef } from "./providers"
 import {
   type Responsibility,
   buildDefaultResponsibilities,
@@ -571,11 +571,16 @@ export class ProjectManager {
         throw new Error(`Agent for ${projectName} failed to start on port ${port}`)
       }
 
-      // Register with orchestrator
+      // Register with orchestrator. Include the project's model so the worker's
+      // opencode session uses it (without a model field, opencode falls back to
+      // its own default, making the dashboard's per-project model picker a no-op
+      // for worker prompts).
+      const workerModel = toAgentModelRef(project.model)
       await this.orchestrator.addAgent({
         name: agentName,
         url,
         directory: resolvedDir,
+        ...(workerModel ? { model: workerModel } : {}),
       })
 
       project.status = "running"
@@ -1764,6 +1769,12 @@ export class ProjectManager {
     const project = this.projects.get(projectId)
     if (!project) throw new Error(`Unknown project: ${projectId}`)
     project.model = model
+    // Propagate the new model to the live worker so the next prompt uses it.
+    // Without this, the supervisor restart picks up the new model for its own
+    // LLM calls but the worker's opencode session keeps using whatever model
+    // was baked in when its serve process was spawned.
+    const agent = this.orchestrator.agents.get(project.agentName)
+    if (agent) agent.config.model = toAgentModelRef(model)
     this.saveProjects()
     this.dashLog.push({ type: "brain-thinking", text: `${project.name} model changed to: ${model}` })
   }

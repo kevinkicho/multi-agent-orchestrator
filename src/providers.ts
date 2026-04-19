@@ -446,6 +446,18 @@ export function formatModelRef(ref: ModelRef): string {
   return `${ref.provider}:${ref.model}`
 }
 
+/** Convert our orchestrator model string ("opencode-go:glm-5.1") into the
+ *  { providerID, modelID } shape that the opencode SDK's session.promptAsync
+ *  expects. Returns undefined when the input is empty/nullish so callers can
+ *  fall through to opencode's own default. */
+export function toAgentModelRef(
+  modelStr: string | undefined | null,
+): { providerID: string; modelID: string } | undefined {
+  if (!modelStr) return undefined
+  const ref = parseModelRef(modelStr)
+  return { providerID: ref.provider, modelID: ref.model }
+}
+
 // ---------------------------------------------------------------------------
 // LLM API call — routes to correct provider
 // ---------------------------------------------------------------------------

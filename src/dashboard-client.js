@@ -2717,7 +2717,12 @@ function populateModelSelect(select, byProvider, { keepFirstOption = true } = {}
   if (!select) return
   const current = select.value
   const keep = keepFirstOption ? 1 : 0
+  // Remove stale options…
   while (select.options.length > keep) select.remove(keep)
+  // …and stale optgroups. select.options flattens across groups, so the loop
+  // above empties each group but leaves the <optgroup> shell behind. Without
+  // this, every 60s refresh stacks a fresh set of empty group labels.
+  select.querySelectorAll('optgroup').forEach(og => og.remove())
   for (const [providerId, group] of byProvider) {
     const og = document.createElement('optgroup')
     og.label = group.providerName

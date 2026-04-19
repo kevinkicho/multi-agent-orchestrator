@@ -17,6 +17,19 @@ bun run dev
 
 Advanced: if you're hacking on opencode itself and want to run against a local source checkout, set `OPENCODE_DIR` to the checkout path and the orchestrator will launch from source instead of the bundled binary.
 
+### Fresh-clone provider setup
+
+The orchestrator owns its own provider registry (`orchestrator-providers.json`) and automatically synthesizes a per-worker `opencode.json` into `.orchestrator-workspaces/<projectId>/` so opencode serve routes to exactly the providers you've enabled in the dashboard. **You do NOT need to edit `~/.config/opencode/opencode.json` or run `opencode auth login` for orchestrator workers.**
+
+On first run:
+
+1. `bun install` — installs opencode-ai and deps.
+2. Put any provider API keys in `.env` (see `.env.example`). For the default setup: `OPENCODE_GO_API_KEY=<your-key>`.
+3. `bun run start` — the **Boot Status** panel in the dashboard will show each provider's health (reachable / quota / auth) within a few seconds of startup.
+4. Open the dashboard, enable at least one provider under **LLM Providers**, add its models, then add a project.
+
+If the Boot Status panel shows a provider as `QUOTA`, `AUTH`, or `DOWN`, fix it before starting a worker — the worker will silently fall back to whatever opencode's default is otherwise (historically this caused "Round N → no commands" loops where the supervisor kept prompting a worker that was misrouted to an exhausted provider).
+
 ## Table of Contents
 
 - [Architecture](#architecture)
@@ -234,6 +247,21 @@ Configuration is loaded from `orchestrator.json` in the project root:
 |----------|-------------|
 | `OPENCODE_DIR` | Optional. Path to an opencode **source checkout** for running from TypeScript source (fork development). When unset, the orchestrator uses the `opencode-ai` npm package binary from `node_modules/.bin`. |
 | `OPENCODE_PROJECT_DIR` | Set automatically per agent process to scope each opencode instance to its project directory. |
+| `OPENCODE_GO_API_KEY` | API key for the OpenCode Go provider. Injected into the per-worker opencode config via `{env:OPENCODE_GO_API_KEY}` so it never gets written to disk. |
+| `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `DEEPSEEK_API_KEY`, `FIREWORKS_API_KEY` | Keys for the corresponding providers. Each provider has an `apiKeyEnv` field in `orchestrator-providers.json` that points to the env var it reads from. |
+
+### How worker provider routing works (and why it won't silently fall back to Ollama)
+
+Every project's worker runs as its own `opencode serve` subprocess. Opencode normally reads its provider list from `~/.config/opencode/opencode.json`, which on a fresh opencode install only knows about Ollama. Without this orchestrator's glue, any worker pinned to OpenCode Go / OpenAI / Anthropic would silently fall back to Ollama's default model.
+
+To close that gap, every time a worker spawns the orchestrator:
+
+1. Reads enabled providers from `orchestrator-providers.json`.
+2. Serializes them into an `opencode.json` written to `.orchestrator-workspaces/<projectId>/` (gitignored, cleaned up when the project is removed).
+3. Spawns `opencode serve` with `cwd` set to that scratch directory, so opencode picks up the generated config.
+4. Still sets `OPENCODE_PROJECT_DIR` to the actual project directory, so filesystem tools target the right worktree.
+
+API keys are injected as `{env:VAR}` templates — the generated `opencode.json` contains no plaintext secrets. If you see a worker stuck in "Round N → no commands", check the **Boot Status** panel first; the most common cause is a provider showing `QUOTA` or `AUTH` that the worker is pinned to.
 
 ---
 

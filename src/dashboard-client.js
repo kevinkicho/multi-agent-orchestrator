@@ -281,8 +281,11 @@ function ensureAgent(name) {
       <span class="project-row-name">${escapeHtml(projectLabel(name))}</span>
       <span class="project-row-dir" id="dir-${sid}" data-action="show-project-info" role="button" tabindex="0" title="Click to show tracking IDs"></span>
       <span class="project-row-port" id="port-${sid}"></span>
-      <select id="hmsel-${sid}" data-action="header-model" title="AI model — switching restarts the supervisor for this project" style="background:#0f0f1a;border:1px solid #333;color:#aaa;font-size:10px;padding:1px 4px;border-radius:3px;max-width:160px;margin-left:6px;">
-        <option value="">(default)</option>
+      <select id="hmsel-${sid}" data-action="header-model" title="Worker model — switching restarts the supervisor and re-registers the worker so its opencode session uses the new model." style="background:#0f0f1a;border:1px solid #333;color:#aaa;font-size:10px;padding:1px 4px;border-radius:3px;max-width:140px;margin-left:6px;">
+        <option value="">worker: (default)</option>
+      </select>
+      <select id="hspsel-${sid}" data-action="header-supervisor-model" title="Supervisor-only model override — leave as '(same as worker)' to mirror the worker. Switching restarts the supervisor; the worker's opencode session is untouched." style="background:#0f0f1a;border:1px solid #333;color:#aaa;font-size:10px;padding:1px 4px;border-radius:3px;max-width:140px;margin-left:4px;">
+        <option value="">supv: (same as worker)</option>
       </select>
       <div class="project-row-badges">
         <button class="project-row-iconbtn iconbtn-pause" data-action="pause" aria-label="Pause supervisor" title="Pause / resume supervisor. When paused, the supervisor finishes its current cycle and then stops running new ones until you click again. The worker agent stays alive; your chat messages still reach it.">&#9208;</button>
@@ -414,6 +417,14 @@ function ensureAgent(name) {
     headerSel.addEventListener('click', function(e) { e.stopPropagation() })
     headerSel.addEventListener('change', function() { saveHeaderModel(name) })
   }
+  // Header supervisor-model picker: hits the supervisor-only endpoint so the
+  // worker's opencode session is NOT re-registered. Empty value clears the
+  // override and the supervisor falls back to the worker model.
+  const headerSupSel = row.querySelector('#hspsel-' + sid)
+  if (headerSupSel) {
+    headerSupSel.addEventListener('click', function(e) { e.stopPropagation() })
+    headerSupSel.addEventListener('change', function() { saveHeaderSupervisorModel(name) })
+  }
 
   // Event delegation for all data-action buttons (no inline onclick).
   // Buttons inside .directive-section (row-toggles, drawer-tabs, save-directive,
@@ -479,6 +490,7 @@ function ensureAgent(name) {
     modelSelect: row.querySelector('#msel-' + sid),
     supervisorModelSelect: row.querySelector('#spmsel-' + sid),
     headerModelSelect: row.querySelector('#hmsel-' + sid),
+    headerSupervisorModelSelect: row.querySelector('#hspsel-' + sid),
     dirLabel: row.querySelector('#dir-' + sid),
     portLabel: row.querySelector('#port-' + sid),
     link: row.querySelector('#link-' + sid),
@@ -1259,8 +1271,8 @@ function applyProjectData(projects) {
       })
     }
     // Supervisor model override — empty string means "mirror worker model".
-    if (agent.supervisorModelSelect) {
-      var spSel = agent.supervisorModelSelect
+    ;[agent.supervisorModelSelect, agent.headerSupervisorModelSelect].forEach(function(spSel) {
+      if (!spSel) return
       if (proj.supervisorModel) {
         var hasSpOpt = Array.from(spSel.options).some(function(o) { return o.value === proj.supervisorModel })
         if (!hasSpOpt) {
@@ -1273,7 +1285,7 @@ function applyProjectData(projects) {
       } else {
         spSel.value = ''
       }
-    }
+    })
     // Update project-level status badge
     if (agent.projStatusBadge && proj.status) {
       setProjectStatus(agent.projStatusBadge, proj.status)
@@ -2327,6 +2339,32 @@ async function saveModel(agentName) {
   }
 }
 
+// Header-level supervisor model picker — fires the same supervisor-only PUT
+// as the Settings drawer but skips the per-row disable/re-enable ceremony.
+// Syncs the drawer's spmsel so both views agree after the change lands.
+async function saveHeaderSupervisorModel(agentName) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) return
+  const model = agent.headerSupervisorModelSelect?.value || ''
+  try {
+    const res = await apiFetch('/api/projects/' + agent.projectId + '/supervisor-model', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model }),
+    })
+    const data = await res.json()
+    if (data.ok) {
+      if (agent.supervisorModelSelect) agent.supervisorModelSelect.value = model
+      const label = model ? model : '(same as worker)'
+      addLogEntry(agent.supervisorLog, 'status', 'Supervisor model changed to: ' + label + '. Supervisor restarting...')
+    } else {
+      alert('Failed to change supervisor model: ' + (data.error || 'Unknown error'))
+    }
+  } catch (err) {
+    alert('Error changing supervisor model: ' + err)
+  }
+}
+
 // Supervisor-only model change — separate endpoint so the worker's opencode
 // session keeps running with the worker model. Empty value clears the override
 // and the supervisor falls back to the worker model.
@@ -2807,6 +2845,7 @@ async function refreshAvailableModels() {
       populateModelSelect(agent.modelSelect, byProvider)
       populateModelSelect(agent.supervisorModelSelect, byProvider)
       populateModelSelect(agent.headerModelSelect, byProvider)
+      populateModelSelect(agent.headerSupervisorModelSelect, byProvider)
     }
     // Add-project modal pickers (worker + supervisor)
     populateModelSelect(document.getElementById('proj-model'), byProvider)

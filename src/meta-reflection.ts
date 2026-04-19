@@ -126,6 +126,59 @@ export async function reflectOnAgentHistory(
   return parsePrinciples(raw)
 }
 
+// ---------------------------------------------------------------------------
+// Evidence-driven principle clarification
+//
+// Phase 2 rewires meta-reflection so promotion is driven by fire evidence
+// (counted by fire-tracker and gated by brain-memory.shouldPromote). The LLM
+// pass below is scoped: it does not INVENT principles, it only rewrites one
+// already-earned note at a time for concision and clarity. Failures return
+// null so the caller keeps the original wording.
+// ---------------------------------------------------------------------------
+
+export type ClarifyInput = {
+  noteText: string
+  agentName: string
+  directory: string
+  model: string
+  ollamaUrl: string
+  timeoutMs?: number
+}
+
+const CLARIFY_PROMPT = `You rewrite a single behavioral note as a concise operating PRINCIPLE.
+
+Rules:
+- Preserve the meaning exactly — do not add caveats, generalize beyond the note, or invent new rules.
+- Prefer the form: WHEN <situation> DO <action> BECAUSE <reason>. Short variations are fine if the original doesn't have all three.
+- Under 180 characters. No list prefixes, no quotes, no commentary.
+- Output the rewritten principle only, one line. If you cannot compress without losing meaning, output the original text verbatim.`
+
+/**
+ * Rewrite a single promoted note for clarity. Returns the rewrite (may equal
+ * the input) or null on any LLM failure. Callers should substitute only when
+ * the result is non-null and materially different from the input.
+ */
+export async function clarifyPromotedPrinciple(input: ClarifyInput): Promise<string | null> {
+  if (!input.noteText.trim()) return null
+  try {
+    const raw = await chatCompletion(
+      input.ollamaUrl,
+      input.model,
+      [
+        { role: "system", content: CLARIFY_PROMPT },
+        { role: "user", content: `Agent: ${input.agentName}\nProject: ${input.directory}\n\nNote:\n${input.noteText.trim()}` },
+      ],
+      { temperature: 0.1, maxTokens: 200, timeoutMs: input.timeoutMs ?? 45_000 },
+    )
+    const trimmed = raw.trim().replace(/^["'`]+|["'`]+$/g, "").split("\n")[0]?.trim()
+    if (!trimmed) return null
+    if (trimmed.length > 220) return null
+    return trimmed
+  } catch {
+    return null
+  }
+}
+
 /**
  * Parse a meta-reflection response into principle strings. Exported for
  * testability. Drops >200 chars, trims to at most 3.

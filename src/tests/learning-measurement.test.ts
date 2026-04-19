@@ -15,6 +15,10 @@ import {
   loadBrainMemory,
   addBehavioralNote,
   recordBehavioralNoteFires,
+  pruneAndPromoteBehavioralNotes,
+  shouldPromote,
+  shouldArchive,
+  ARCHIVE_THRESHOLD_CYCLES,
   type BehavioralNote,
 } from "../brain-memory"
 import { matchFiresInText } from "../fire-tracker"
@@ -187,5 +191,184 @@ describe("matchFiresInText", () => {
     const notes = [mkNote("n1", "something")]
     const hits = matchFiresInText(notes, "")
     expect(hits).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 2: prune + promote with evidence
+// ---------------------------------------------------------------------------
+
+describe("shouldPromote / shouldArchive predicates", () => {
+  const mkNote = (opts: Partial<BehavioralNote> & { cycle?: number | null }): BehavioralNote => ({
+    id: "x",
+    text: "t",
+    provenance: { source: "manual", cycle: opts.cycle ?? 0, createdAt: 0 },
+    fires: [],
+    ...opts,
+  })
+
+  test("promotes with 3 fires across 2 cycles", () => {
+    const n = mkNote({
+      fires: [
+        { cycle: 1, at: 1 }, { cycle: 1, at: 2 }, { cycle: 2, at: 3 },
+      ],
+    })
+    expect(shouldPromote(n)).toBe(true)
+  })
+
+  test("does not promote with 3 fires all in same cycle", () => {
+    const n = mkNote({
+      fires: [{ cycle: 5, at: 1 }, { cycle: 5, at: 2 }, { cycle: 5, at: 3 }],
+    })
+    expect(shouldPromote(n)).toBe(false)
+  })
+
+  test("does not promote with only 2 fires", () => {
+    const n = mkNote({
+      fires: [{ cycle: 1, at: 1 }, { cycle: 2, at: 2 }],
+    })
+    expect(shouldPromote(n)).toBe(false)
+  })
+
+  test("archives after threshold with zero fires", () => {
+    const n = mkNote({ cycle: 1 })
+    expect(shouldArchive(n, 1 + ARCHIVE_THRESHOLD_CYCLES)).toBe(true)
+  })
+
+  test("does not archive before threshold", () => {
+    const n = mkNote({ cycle: 1 })
+    expect(shouldArchive(n, 5)).toBe(false)
+  })
+
+  test("does not archive when note has fires", () => {
+    const n = mkNote({ cycle: 1, fires: [{ cycle: 2, at: 1 }] })
+    expect(shouldArchive(n, 50)).toBe(false)
+  })
+
+  test("legacy cycle=null uses baseline 0", () => {
+    const n = mkNote({ cycle: null })
+    expect(shouldArchive(n, ARCHIVE_THRESHOLD_CYCLES)).toBe(true)
+    expect(shouldArchive(n, ARCHIVE_THRESHOLD_CYCLES - 1)).toBe(false)
+  })
+
+  test("promoted notes are not re-promoted and not archived", () => {
+    const n = mkNote({
+      cycle: 1,
+      promotedAt: { at: 1, cycle: 2, originalText: "t", clarified: false },
+    })
+    expect(shouldPromote(n)).toBe(false)
+    expect(shouldArchive(n, 100)).toBe(false)
+  })
+
+  test("already-archived notes are not re-archived or promoted", () => {
+    const n = mkNote({
+      archivedAt: { at: 1, cycle: 2, reason: "no-fires" },
+      fires: [{ cycle: 3, at: 1 }, { cycle: 4, at: 2 }, { cycle: 5, at: 3 }],
+    })
+    expect(shouldPromote(n)).toBe(false)
+    expect(shouldArchive(n, 100)).toBe(false)
+  })
+})
+
+describe("pruneAndPromoteBehavioralNotes", () => {
+  test("archives a zero-fire note older than threshold and keeps it visible via archivedBehavioralNotes", async () => {
+    const store = await loadBrainMemory()
+    await addBehavioralNote(store, "agent", "forgotten note", { source: "manual", cycle: 1 })
+
+    const result = await pruneAndPromoteBehavioralNotes("agent", 1 + ARCHIVE_THRESHOLD_CYCLES)
+    expect(result.archived.length).toBe(1)
+    expect(result.promoted.length).toBe(0)
+
+    const after = await loadBrainMemory()
+    expect(after.behavioralNotes?.agent ?? []).toEqual([])
+    const archived = after.archivedBehavioralNotes?.agent ?? []
+    expect(archived.length).toBe(1)
+    expect(archived[0]!.text).toBe("forgotten note")
+    expect(archived[0]!.archivedAt?.reason).toBe("no-fires")
+  })
+
+  test("promotes a note with ≥3 fires across ≥2 cycles; preserves originalText when no clarifier", async () => {
+    const store = await loadBrainMemory()
+    await addBehavioralNote(store, "agent", "restart worker when non-responsive", { source: "manual", cycle: 1 })
+    const loaded = await loadBrainMemory()
+    const noteId = loaded.behavioralNotes!.agent![0]!.id
+    await recordBehavioralNoteFires("agent", [noteId], 2)
+    await recordBehavioralNoteFires("agent", [noteId], 3)
+    await recordBehavioralNoteFires("agent", [noteId], 4)
+
+    const result = await pruneAndPromoteBehavioralNotes("agent", 5)
+    expect(result.promoted.length).toBe(1)
+    expect(result.promoted[0]!.promotedAt?.originalText).toBe("restart worker when non-responsive")
+    expect(result.promoted[0]!.promotedAt?.clarified).toBe(false)
+    expect(result.promoted[0]!.text).toBe("restart worker when non-responsive")
+
+    const after = await loadBrainMemory()
+    expect(after.behavioralNotes?.agent?.length).toBe(1)
+    expect(after.behavioralNotes?.agent?.[0]?.promotedAt).toBeDefined()
+  })
+
+  test("clarifier rewrites the text; originalText preserves the pre-rewrite wording", async () => {
+    const store = await loadBrainMemory()
+    await addBehavioralNote(store, "agent", "always restart worker when the worker becomes entirely non-responsive to incoming prompts", { source: "manual", cycle: 1 })
+    const loaded = await loadBrainMemory()
+    const noteId = loaded.behavioralNotes!.agent![0]!.id
+    await recordBehavioralNoteFires("agent", [noteId], 2)
+    await recordBehavioralNoteFires("agent", [noteId], 3)
+    await recordBehavioralNoteFires("agent", [noteId], 4)
+
+    const calls: string[] = []
+    const clarifier = async (input: { noteText: string; agentName: string }) => {
+      calls.push(input.noteText)
+      return "WHEN worker non-responsive DO restart BECAUSE clears stuck state"
+    }
+    const result = await pruneAndPromoteBehavioralNotes("agent", 5, clarifier)
+    expect(calls.length).toBe(1)
+    expect(result.promoted.length).toBe(1)
+    expect(result.promoted[0]!.text).toBe("WHEN worker non-responsive DO restart BECAUSE clears stuck state")
+    expect(result.promoted[0]!.promotedAt?.originalText).toBe("always restart worker when the worker becomes entirely non-responsive to incoming prompts")
+    expect(result.promoted[0]!.promotedAt?.clarified).toBe(true)
+  })
+
+  test("clarifier failure (null) leaves original text intact, clarified=false", async () => {
+    const store = await loadBrainMemory()
+    await addBehavioralNote(store, "agent", "original phrasing stays", { source: "manual", cycle: 1 })
+    const loaded = await loadBrainMemory()
+    const noteId = loaded.behavioralNotes!.agent![0]!.id
+    await recordBehavioralNoteFires("agent", [noteId], 2)
+    await recordBehavioralNoteFires("agent", [noteId], 3)
+    await recordBehavioralNoteFires("agent", [noteId], 4)
+
+    const result = await pruneAndPromoteBehavioralNotes("agent", 5, async () => null)
+    expect(result.promoted[0]!.text).toBe("original phrasing stays")
+    expect(result.promoted[0]!.promotedAt?.clarified).toBe(false)
+  })
+
+  test("no-op when nothing crosses either threshold", async () => {
+    const store = await loadBrainMemory()
+    await addBehavioralNote(store, "agent", "recent note", { source: "manual", cycle: 5 })
+    const result = await pruneAndPromoteBehavioralNotes("agent", 6)
+    expect(result).toEqual({ promoted: [], archived: [] })
+  })
+
+  test("promoted notes survive the non-promoted -10 cap", async () => {
+    const store = await loadBrainMemory()
+    // Seed one note, promote it via fires + prune/promote
+    await addBehavioralNote(store, "agent", "lesson that matters", { source: "manual", cycle: 1 })
+    let loaded = await loadBrainMemory()
+    const targetId = loaded.behavioralNotes!.agent![0]!.id
+    await recordBehavioralNoteFires("agent", [targetId], 2)
+    await recordBehavioralNoteFires("agent", [targetId], 3)
+    await recordBehavioralNoteFires("agent", [targetId], 4)
+    await pruneAndPromoteBehavioralNotes("agent", 5)
+
+    // Flood 12 regular notes — promoted should never be evicted
+    for (let i = 0; i < 12; i++) {
+      await addBehavioralNote(await loadBrainMemory(), "agent", `filler note ${i}`, { source: "manual", cycle: 10 + i })
+    }
+    loaded = await loadBrainMemory()
+    const active = loaded.behavioralNotes!.agent ?? []
+    expect(active.find(n => n.id === targetId)).toBeDefined()
+    // Non-promoted cap = 10; plus the 1 promoted = 11 total
+    expect(active.length).toBeLessThanOrEqual(11)
   })
 })

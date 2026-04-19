@@ -374,7 +374,7 @@ The `EventBus` class (`event-bus.ts:38-76`) uses a `buffer` array capped at 200 
 | Supervisor messages | ~60 entries (trimmed each cycle) | In-memory, GC'd each cycle | Local variable |
 | DashboardLog history | Fixed 500 entries | ~500 entries shared | Ring buffer, server-side |
 | EventBus buffer | Fixed 200 entries | ~200 entries shared | Ring buffer, server-side |
-| Brain memory (per agent) | 20 entries + 20 notes + 10 behavioral | 150 entries total | Capped, written to disk |
+| Brain memory (per agent) | 20 entries + 20 notes + 10 behavioral (non-promoted) + 50 archived | 250 entries total | Capped, written to disk |
 | Performance log | Fixed 500 entries | ~500 entries active + archive files | Archived to disk |
 | Project state (per project) | ~1KB each | ~5KB total | Fixed per project |
 | **Total server-side memory** | | **~2MB** | Well within limits |
@@ -624,3 +624,15 @@ Dashboard mutating endpoints now require a `Content-Length` header (rejects chun
 **Tradeoff:** False positives (a note about "restart" fires on any text mentioning "restart", even out of context) and false negatives (a note about "non-responsive workers" may not fire on a review that uses different vocabulary). The fire count is therefore a coarse proxy for relevance, not a precise measurement.
 
 **Ruled out:** LLM-based match judging. Adds one aux call per review/response, inflates token spend, and introduces another failure mode (LLM timeouts) in a hot path. Phase 2 can re-evaluate if signal quality proves insufficient.
+
+---
+
+## 34. Prune/promote thresholds are static
+
+**What:** Every `metaReflection.everyNCycles` cycles (default 5), `pruneAndPromoteBehavioralNotes` archives any non-promoted note with zero fires whose age ≥ 20 cycles, and promotes any note with ≥3 fires across ≥2 distinct cycles to principle status. The thresholds are constants, not per-agent or adaptive. Archived notes never re-enter the active pool.
+
+**Why:** The thresholds come from the learning-orchestrator directive and are deliberately set by hand so behavior is predictable. A note with a single flaky keyword match can't gather 3 fires across 2 real cycles by accident, and a note that's genuinely useful will pass the bar within a reasonable number of cycles. Static numbers also make prune/promote decisions auditable — the `promotedAt.cycle` and `archivedAt.cycle` markers pin down exactly when a state change happened.
+
+**Tradeoff:** A note that fires heavily in a single cycle but never again (e.g., a one-off incident) will not promote. A note that accrues 3 fires across 2 cycles with weak signal (two heuristic false positives in the same review) will promote. The directive calls the tradeoff explicitly: fire evidence drives promotion; the LLM pass only rewrites text for clarity.
+
+**Ruled out:** Adaptive thresholds or per-agent tuning. Both add state to track and a feedback loop of their own. Before tuning, we need observations from a real long-run session — that's what Phase 3's observer is for.

@@ -29,12 +29,34 @@ export type BehavioralNoteFire = {
   at: number
 }
 
+/** Marker on notes archived by the prune pass (zero fires after 20 cycles). */
+export type BehavioralNoteArchiveMarker = {
+  at: number
+  cycle: number
+  reason: "no-fires"
+}
+
+/** Marker on notes promoted by the prune/promote pass when fire evidence
+ *  meets the threshold (≥3 fires across ≥2 distinct cycles). */
+export type BehavioralNotePromotionMarker = {
+  at: number
+  cycle: number
+  /** Original note text before any LLM clarity rewrite. */
+  originalText: string
+  /** True if a clarity-rewrite LLM call actually changed the text. */
+  clarified: boolean
+}
+
 /** Structured behavioral note. Replaces the legacy `string` shape. */
 export type BehavioralNote = {
   id: string
   text: string
   provenance: BehavioralNoteProvenance
   fires: BehavioralNoteFire[]
+  /** Set when prune moves this note to the archived pool (unused). */
+  archivedAt?: BehavioralNoteArchiveMarker
+  /** Set when the note has earned principle status via fire evidence. */
+  promotedAt?: BehavioralNotePromotionMarker
 }
 
 export type BrainMemoryStore = {
@@ -46,6 +68,9 @@ export type BrainMemoryStore = {
   projectNotes: Record<string, string[]>
   /** Behavioral notes about how agents work best (injected into supervisor system prompts) */
   behavioralNotes?: Record<string, BehavioralNote[]>
+  /** Archived behavioral notes — zero fires after 20 cycles. Never injected
+   *  into prompts; visible in the Memory tab under a collapsed section. */
+  archivedBehavioralNotes?: Record<string, BehavioralNote[]>
   /** Per-agent progress assessments from the progress assessor, cap 10 each */
   progressAssessments?: Record<string, ProgressAssessment[]>
 }
@@ -190,7 +215,8 @@ export async function loadBrainMemory(): Promise<BrainMemoryStore> {
   const raw = await readJsonFile<BrainMemoryStore>(getMemoryPath(), { ...DEFAULT_STORE, entries: [], projectNotes: {} })
   const migrated = migrateBrainMemory(raw)
   const behavioralNotes = migrateBehavioralNotes(raw.behavioralNotes as Record<string, unknown> | undefined)
-  return { ...migrated, behavioralNotes }
+  const archivedBehavioralNotes = migrateBehavioralNotes(raw.archivedBehavioralNotes as Record<string, unknown> | undefined)
+  return { ...migrated, behavioralNotes, archivedBehavioralNotes }
 }
 
 export async function saveBrainMemory(store: BrainMemoryStore): Promise<void> {
@@ -322,12 +348,23 @@ export async function addBehavioralNote(
       ...fresh,
       behavioralNotes: {
         ...(fresh.behavioralNotes ?? {}),
-        [agentName]: updated.slice(-10),
+        [agentName]: capBehavioralNotes(updated),
       },
     }
     await saveBrainMemory(result)
     return result
   })
+}
+
+/** Cap the active notes list: promoted notes are never dropped; non-promoted
+ *  notes keep the last 10 by insertion order. Preserves original ordering. */
+function capBehavioralNotes(notes: BehavioralNote[]): BehavioralNote[] {
+  const NONPROMOTED_CAP = 10
+  const promoted = notes.filter(n => n.promotedAt)
+  const regular = notes.filter(n => !n.promotedAt)
+  if (regular.length <= NONPROMOTED_CAP) return notes
+  const keptRegularIds = new Set(regular.slice(-NONPROMOTED_CAP).map(n => n.id))
+  return notes.filter(n => n.promotedAt || keptRegularIds.has(n.id))
 }
 
 /** Record that one or more behavioral notes fired in a given cycle. Updates
@@ -360,6 +397,153 @@ export async function recordBehavioralNoteFires(
     }
     await saveBrainMemory(result)
     return result
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Prune + promote
+//
+// Evidence-driven upgrade/downgrade of behavioral notes:
+//   - Promote: a note with ≥3 fires across ≥2 distinct cycles earns principle
+//     status. An optional `clarifier` may rewrite the text for concision;
+//     `promotedAt.originalText` preserves the pre-rewrite wording.
+//   - Archive: a note with 0 fires whose age ≥ ARCHIVE_THRESHOLD_CYCLES moves
+//     out of the active pool into `archivedBehavioralNotes`. Archived notes
+//     are never injected into prompts but remain visible in the Memory tab.
+// Legacy notes (provenance.cycle === null) use cycle 0 as their baseline.
+// ---------------------------------------------------------------------------
+
+export const PROMOTE_FIRE_COUNT_THRESHOLD = 3
+export const PROMOTE_DISTINCT_CYCLES_THRESHOLD = 2
+export const ARCHIVE_THRESHOLD_CYCLES = 20
+
+export type NoteClarifier = (input: {
+  noteText: string
+  agentName: string
+}) => Promise<string | null>
+
+export type PruneAndPromoteResult = {
+  promoted: BehavioralNote[]
+  archived: BehavioralNote[]
+}
+
+/** Should this note be promoted based on fire evidence? */
+export function shouldPromote(note: BehavioralNote): boolean {
+  if (note.promotedAt) return false
+  if (note.archivedAt) return false
+  if (note.fires.length < PROMOTE_FIRE_COUNT_THRESHOLD) return false
+  const distinctCycles = new Set(note.fires.map(f => f.cycle)).size
+  return distinctCycles >= PROMOTE_DISTINCT_CYCLES_THRESHOLD
+}
+
+/** Should this note be archived based on cycle age + lack of fires? */
+export function shouldArchive(note: BehavioralNote, currentCycle: number): boolean {
+  if (note.promotedAt) return false
+  if (note.archivedAt) return false
+  if (note.fires.length > 0) return false
+  const baseline = note.provenance.cycle ?? 0
+  return (currentCycle - baseline) >= ARCHIVE_THRESHOLD_CYCLES
+}
+
+/** Evaluate every active note for the agent; promote those with sufficient
+ *  fire evidence and archive those that have sat unused for too long. Safe to
+ *  call every cycle; no-op when there's nothing to change. */
+export async function pruneAndPromoteBehavioralNotes(
+  agentName: string,
+  currentCycle: number,
+  clarifier?: NoteClarifier,
+): Promise<PruneAndPromoteResult> {
+  const now = Date.now()
+  // Determine what will change under a snapshot of memory (LLM calls may run
+  // outside the write lock). We re-validate under the lock before persisting
+  // so a concurrent write can't lose our work.
+  const snapshot = await loadBrainMemory()
+  const snapshotNotes = snapshot.behavioralNotes?.[agentName] ?? []
+  const pendingPromotions: Array<{ id: string; clarified?: string }> = []
+  const pendingArchives = new Set<string>()
+  for (const note of snapshotNotes) {
+    if (shouldPromote(note)) pendingPromotions.push({ id: note.id })
+    else if (shouldArchive(note, currentCycle)) pendingArchives.add(note.id)
+  }
+  if (pendingPromotions.length === 0 && pendingArchives.size === 0) {
+    return { promoted: [], archived: [] }
+  }
+
+  // Run the optional LLM clarifier outside the write lock — one call per
+  // newly-promoted note. Failures are non-fatal (leave text unchanged).
+  if (clarifier && pendingPromotions.length > 0) {
+    for (const pending of pendingPromotions) {
+      const note = snapshotNotes.find(n => n.id === pending.id)
+      if (!note) continue
+      try {
+        const rewritten = await clarifier({ noteText: note.text, agentName })
+        if (rewritten && rewritten.trim() && rewritten.trim() !== note.text.trim()) {
+          pending.clarified = rewritten.trim()
+        }
+      } catch {
+        // Best-effort: leave text unchanged on any failure
+      }
+    }
+  }
+
+  return withWriteLock(async () => {
+    const fresh = await loadBrainMemory()
+    const activeNotes = fresh.behavioralNotes?.[agentName] ?? []
+    if (activeNotes.length === 0) return { promoted: [], archived: [] }
+
+    const promotionMap = new Map(pendingPromotions.map(p => [p.id, p.clarified]))
+    const promoted: BehavioralNote[] = []
+    const archived: BehavioralNote[] = []
+    const keptActive: BehavioralNote[] = []
+
+    for (const note of activeNotes) {
+      if (promotionMap.has(note.id) && shouldPromote(note)) {
+        const clarified = promotionMap.get(note.id)
+        const updated: BehavioralNote = {
+          ...note,
+          text: clarified ?? note.text,
+          promotedAt: {
+            at: now,
+            cycle: currentCycle,
+            originalText: note.text,
+            clarified: Boolean(clarified),
+          },
+        }
+        promoted.push(updated)
+        keptActive.push(updated)
+      } else if (pendingArchives.has(note.id) && shouldArchive(note, currentCycle)) {
+        const updated: BehavioralNote = {
+          ...note,
+          archivedAt: { at: now, cycle: currentCycle, reason: "no-fires" },
+        }
+        archived.push(updated)
+      } else {
+        keptActive.push(note)
+      }
+    }
+
+    if (promoted.length === 0 && archived.length === 0) {
+      // Everything we planned got cancelled by a concurrent write — exit clean.
+      return { promoted: [], archived: [] }
+    }
+
+    const existingArchived = fresh.archivedBehavioralNotes?.[agentName] ?? []
+    const ARCHIVED_CAP = 50
+    const nextArchived = [...existingArchived, ...archived].slice(-ARCHIVED_CAP)
+
+    const result: BrainMemoryStore = {
+      ...fresh,
+      behavioralNotes: {
+        ...(fresh.behavioralNotes ?? {}),
+        [agentName]: keptActive,
+      },
+      archivedBehavioralNotes: {
+        ...(fresh.archivedBehavioralNotes ?? {}),
+        [agentName]: nextArchived,
+      },
+    }
+    await saveBrainMemory(result)
+    return { promoted, archived }
   })
 }
 

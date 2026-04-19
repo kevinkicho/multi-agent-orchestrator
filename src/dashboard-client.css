@@ -433,6 +433,27 @@ body.light .role-item .role-desc { color: #666; }
   word-break: break-word;
 }
 .mem-table tr.mem-behavioral { border-left: 3px solid #f59e0b; }
+.mem-badge {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+.mem-badge-principle {
+  background: #22d3ee22;
+  color: #22d3ee;
+  border: 1px solid #22d3ee55;
+}
+.mem-archived summary {
+  cursor: pointer;
+  user-select: none;
+}
+.mem-archived summary:hover { color: #22d3ee; }
 .mem-session-header {
   display: flex;
   gap: 8px;

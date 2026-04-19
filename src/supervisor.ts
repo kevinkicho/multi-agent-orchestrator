@@ -9,6 +9,7 @@ import {
   addProjectNote,
   addBehavioralNote,
   recordBehavioralNoteFires,
+  pruneAndPromoteBehavioralNotes,
   formatMemoryForPrompt,
   saveProgressAssessment,
   getProgressAssessments,
@@ -30,7 +31,7 @@ import { isTruncated } from "./providers"
 import { assessProgress, parseGitDiffStat, addAssessmentRecord, type AssessmentRecord, type ValidationResult } from "./progress-assessor"
 import { loadSharedKnowledge, publishNote, publishProgress, formatRelevantKnowledge, clearAgentKnowledge } from "./shared-knowledge"
 import { extractLessonsFromReview } from "./lesson-extractor"
-import { reflectOnAgentHistory } from "./meta-reflection"
+import { clarifyPromotedPrinciple } from "./meta-reflection"
 import { compressTranscript, createCompressorState, type CompressorState } from "./transcript-compressor"
 import {
   type NudgeState, createNudgeState, resetNudge,
@@ -237,13 +238,29 @@ export type ParallelSupervisorsConfig = {
 // System prompt — Socratic dialogue mode
 // ---------------------------------------------------------------------------
 
+/** Pick which behavioral notes to inject into the supervisor's system prompt.
+ *  Promoted principles come first, then the most recent non-promoted notes
+ *  fill the remaining slots. Archived notes are never returned by this path
+ *  because `pruneAndPromoteBehavioralNotes` removes them from the active
+ *  list before this runs. */
+function pickNotesForPrompt(notes: BehavioralNote[], limit: number): BehavioralNote[] {
+  if (notes.length === 0 || limit <= 0) return []
+  const active = notes.filter(n => !n.archivedAt)
+  const promoted = active.filter(n => n.promotedAt)
+  const recent = active.filter(n => !n.promotedAt).slice(-limit)
+  return [...promoted, ...recent].slice(0, limit)
+}
+
 function buildSocraticPrompt(agentName: string, directory: string, reviewEnabled: boolean, hasReviewer: boolean, behavioralNotes: BehavioralNote[]): string {
   const reviewAction = reviewEnabled
     ? `- @review — ${hasReviewer ? "Send work to a dedicated reviewer" : "Ask the worker to self-review recent changes"}\n`
     : ""
 
   const behavioralSection = behavioralNotes.length > 0
-    ? `\n## Lessons from Previous Cycles\n${behavioralNotes.map(n => `- ${n.text}`).join("\n")}\n`
+    ? `\n## Lessons from Previous Cycles\n${behavioralNotes.map(n => {
+        const badge = n.promotedAt ? " [principle]" : ""
+        return `-${badge} ${n.text}`
+      }).join("\n")}\n`
     : ""
 
   return `You are a thinking partner and supervisor for an AI coding agent ("the worker") on a software project.
@@ -868,8 +885,10 @@ export async function runAgentSupervisor(
     }
     const memoryContext = formatMemoryForPrompt(memory, agentName)
 
-    // Extract behavioral notes for this agent to inject into system prompt
-    const behavioralNotes = (memory.behavioralNotes?.[agentName] ?? []).slice(-3)
+    // Extract behavioral notes for this agent to inject into system prompt.
+    // Prefer promoted principles first — they have earned their keep via fire
+    // evidence. Fill remaining slots with the most recent non-promoted notes.
+    const behavioralNotes = pickNotesForPrompt(memory.behavioralNotes?.[agentName] ?? [], 3)
 
     // Get agent status — and bail immediately if agent isn't registered
     const statuses = await orchestrator.status()
@@ -1639,37 +1658,53 @@ Be specific with file paths, line numbers, and code snippets.`
               config.onCycleSummary?.(cycleSummary)
               config.onCycleComplete?.(cycleCount)
 
-              // Periodic meta-reflection (inspired by Hermes Agent / Nous Research).
-              // Every N cycles, distill cross-cycle PRINCIPLEs from recent summaries
-              // and fold them into behavioral notes (topic-dedup handles overlap).
-              // Best-effort: failures must not block the supervisor loop.
+              // Evidence-driven prune + promote (Phase 2 of the learning loop).
+              // Every N cycles, archive notes with zero fires past the age
+              // threshold and promote notes with ≥3 fires across ≥2 cycles
+              // to principle status. Meta-reflection's LLM pass is now scoped
+              // to a per-note clarity rewrite — fire evidence drives promotion,
+              // the model only refines wording. The LLM call is gated behind
+              // config.metaReflection.enabled so operators with no LLM budget
+              // can still get prune/promote from the heuristic alone.
               const metaEnabled = config.metaReflection?.enabled !== false
               const everyN = config.metaReflection?.everyNCycles ?? 5
-              if (metaEnabled && cycleCount > 0 && cycleCount % everyN === 0) {
+              if (cycleCount > 0 && cycleCount % everyN === 0) {
                 try {
-                  const summaries = memory.agentEntries?.[agentName] ?? []
-                  const principles = await reflectOnAgentHistory({
+                  const clarifyModel = config.metaReflection?.auxModel ?? config.model
+                  const clarifier = metaEnabled
+                    ? (input: { noteText: string; agentName: string }) =>
+                        clarifyPromotedPrinciple({
+                          noteText: input.noteText,
+                          agentName: input.agentName,
+                          directory,
+                          model: clarifyModel,
+                          ollamaUrl: config.ollamaUrl,
+                        })
+                    : undefined
+                  const { promoted, archived } = await pruneAndPromoteBehavioralNotes(
                     agentName,
-                    directory,
-                    recentSummaries: summaries.slice(-everyN),
-                    behavioralNotes: (memory.behavioralNotes?.[agentName] ?? []).map(n => n.text),
-                    projectNotes: memory.projectNotes[agentName] ?? [],
-                    model: config.metaReflection?.auxModel ?? config.model,
-                    ollamaUrl: config.ollamaUrl,
-                  })
-                  for (const p of principles) {
-                    memory = await addBehavioralNote(memory, agentName, p, { source: "meta-reflection", cycle: cycleCount })
-                    emit(`Meta-reflection principle: ${p}`)
+                    cycleCount,
+                    clarifier,
+                  )
+                  if (promoted.length > 0 || archived.length > 0) {
+                    // Refresh the in-memory view so the next prompt reflects changes
+                    memory = await loadBrainMemory()
                   }
-                  if (principles.length > 0) {
+                  for (const p of promoted) {
+                    emit(`Promoted to principle (${p.fires.length} fires): ${p.text}`)
+                  }
+                  for (const a of archived) {
+                    emit(`Archived unused note (${cycleCount - (a.provenance.cycle ?? 0)} cycles idle): ${a.text}`)
+                  }
+                  if (promoted.length > 0 || archived.length > 0) {
                     config.dashboardLog?.push({
                       type: "supervisor-alert",
                       agent: agentName,
-                      text: `Meta-reflection after cycle ${cycleCount}: captured ${principles.length} principle(s).`,
+                      text: `Prune/promote after cycle ${cycleCount}: ${promoted.length} promoted, ${archived.length} archived.`,
                     })
                   }
                 } catch (err) {
-                  console.error(`[${agentName}] Meta-reflection failed:`, err)
+                  console.error(`[${agentName}] Prune/promote failed:`, err)
                 }
               }
             }

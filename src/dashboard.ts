@@ -424,7 +424,7 @@ export async function startDashboard(
               if (f.cycle > latestCycle) latestCycle = f.cycle
             }
           }
-          const behavioralNotes = rawNotes.map(n => {
+          const decorate = (n: typeof rawNotes[number]) => {
             const fireCount = n.fires.length
             const lastFireCycle = fireCount > 0 ? n.fires[fireCount - 1]!.cycle : null
             const cyclesSinceLastFire = lastFireCycle !== null && latestCycle > 0
@@ -437,11 +437,15 @@ export async function startDashboard(
               fires: n.fires,
               fireCount,
               cyclesSinceLastFire,
+              promotedAt: n.promotedAt,
+              archivedAt: n.archivedAt,
             }
-          })
-          return Response.json({ agentName, sessions, projectNotes, behavioralNotes }, { headers: corsHeaders })
+          }
+          const behavioralNotes = rawNotes.map(decorate)
+          const archivedBehavioralNotes = (store.archivedBehavioralNotes?.[agentName] ?? []).map(decorate)
+          return Response.json({ agentName, sessions, projectNotes, behavioralNotes, archivedBehavioralNotes }, { headers: corsHeaders })
         } catch (err) {
-          return Response.json({ agentName, sessions: [], projectNotes: [], behavioralNotes: [] }, { headers: corsHeaders })
+          return Response.json({ agentName, sessions: [], projectNotes: [], behavioralNotes: [], archivedBehavioralNotes: [] }, { headers: corsHeaders })
         }
       }
 

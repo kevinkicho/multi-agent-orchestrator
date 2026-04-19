@@ -2350,8 +2350,24 @@ async function loadNotes(agentName) {
 
     // Behavioral notes — supervisor writes these about worker interaction,
     // for the orchestrator agent to review and improve project execution.
-    // API now returns objects: { text, provenance, fireCount, cyclesSinceLastFire, ... }
-    // Also accepts legacy string entries for backward compatibility.
+    // API returns objects: { text, provenance, fireCount, cyclesSinceLastFire,
+    //                        promotedAt?, archivedAt? } — plus a separate
+    // archivedBehavioralNotes list. Legacy string entries accepted for bc.
+    function renderBehavioralRow(n) {
+      if (typeof n === 'string') {
+        return '<tr class="mem-behavioral"><td>' + escapeHtml(n) + '</td><td>—</td><td>0</td><td>—</td></tr>'
+      }
+      var src = n.provenance && n.provenance.source ? n.provenance.source : '—'
+      var fires = typeof n.fireCount === 'number' ? n.fireCount : (n.fires ? n.fires.length : 0)
+      var since = n.cyclesSinceLastFire === null || n.cyclesSinceLastFire === undefined ? '—' : String(n.cyclesSinceLastFire)
+      var badge = n.promotedAt ? '<span class="mem-badge mem-badge-principle" title="Promoted via fire evidence">★ principle</span> ' : ''
+      return '<tr class="mem-behavioral">'
+        + '<td>' + badge + escapeHtml(n.text || '') + '</td>'
+        + '<td>' + escapeHtml(src) + '</td>'
+        + '<td>' + fires + '</td>'
+        + '<td>' + since + '</td>'
+        + '</tr>'
+    }
     if (data.behavioralNotes && data.behavioralNotes.length > 0) {
       html += '<div class="mem-section">'
       html += '<div class="mem-section-title">Behavioral Notes</div>'
@@ -2359,22 +2375,22 @@ async function loadNotes(agentName) {
       html += '<th>Lesson</th><th>Source</th><th>Fires</th><th>Since last</th>'
       html += '</tr></thead><tbody>'
       for (var i = 0; i < data.behavioralNotes.length; i++) {
-        var n = data.behavioralNotes[i]
-        if (typeof n === 'string') {
-          html += '<tr class="mem-behavioral"><td>' + escapeHtml(n) + '</td><td>—</td><td>0</td><td>—</td></tr>'
-          continue
-        }
-        var src = n.provenance && n.provenance.source ? n.provenance.source : '—'
-        var fires = typeof n.fireCount === 'number' ? n.fireCount : (n.fires ? n.fires.length : 0)
-        var since = n.cyclesSinceLastFire === null || n.cyclesSinceLastFire === undefined ? '—' : String(n.cyclesSinceLastFire)
-        html += '<tr class="mem-behavioral">'
-          + '<td>' + escapeHtml(n.text || '') + '</td>'
-          + '<td>' + escapeHtml(src) + '</td>'
-          + '<td>' + fires + '</td>'
-          + '<td>' + since + '</td>'
-          + '</tr>'
+        html += renderBehavioralRow(data.behavioralNotes[i])
       }
       html += '</tbody></table></div>'
+    }
+    if (data.archivedBehavioralNotes && data.archivedBehavioralNotes.length > 0) {
+      html += '<div class="mem-section">'
+      html += '<details class="mem-archived"><summary class="mem-section-title">'
+        + 'Archived (' + data.archivedBehavioralNotes.length + ')'
+        + '</summary>'
+      html += '<table class="mem-table"><thead><tr>'
+      html += '<th>Lesson</th><th>Source</th><th>Fires</th><th>Since last</th>'
+      html += '</tr></thead><tbody>'
+      for (var j = 0; j < data.archivedBehavioralNotes.length; j++) {
+        html += renderBehavioralRow(data.archivedBehavioralNotes[j])
+      }
+      html += '</tbody></table></details></div>'
     }
 
     // Project notes

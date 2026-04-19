@@ -105,8 +105,15 @@ export type ProjectState = {
   directive: string
   workerPort: number
   agentName: string
-  /** Ollama model for this project's supervisor. Falls back to global config. */
+  /** Primary model for this project's worker (opencode session). Also used by the
+   *  supervisor when `supervisorModel` is unset. Falls back to the first enabled
+   *  provider's first model when both are absent. */
   model?: string
+  /** Optional override for the supervisor's planning LLM only. When set, the
+   *  worker keeps using `model` and the supervisor uses this instead. Typical
+   *  use: run a cheap/fast model for planning while keeping a more capable one
+   *  for code generation, or isolate a drained per-model quota to one side. */
+  supervisorModel?: string
   /** History of directive changes with source tracking and user comments */
   directiveHistory: DirectiveHistoryEntry[]
   /** Fast-access queue for unread comments (avoids iterating full history) */
@@ -188,9 +195,12 @@ export type AddProjectOptions = {
   baseBranch?: string
   /** Restore a persisted responsibilities list (used by restoreProjects). Reconciled against catalog. */
   responsibilities?: Responsibility[]
-  /** Pre-select a `provider:model` (or bare ollama model) for this project's supervisor.
-   *  When absent, the supervisor falls back to resolveDefaultModel(). */
+  /** Pre-select a `provider:model` (or bare ollama model) for this project's worker
+   *  (and, when `supervisorModel` is unset, its supervisor). When absent, the
+   *  supervisor falls back to resolveDefaultModel(). */
   model?: string
+  /** Optional supervisor-only override — see ProjectState.supervisorModel. */
+  supervisorModel?: string
   /** Restore the persisted PR-feedback cursor so we don't re-surface feedback the
    *  supervisor already saw in a previous process. */
   lastPrFeedbackCheckAt?: string
@@ -205,6 +215,7 @@ type SavedProjects = {
     directory: string
     directive: string
     model?: string
+    supervisorModel?: string
     directiveHistory?: DirectiveHistoryEntry[]
     baseBranch?: string
     responsibilities?: Responsibility[]
@@ -535,6 +546,7 @@ export class ProjectManager {
       workerPort: port,
       agentName,
       model: opts?.model || undefined,
+      supervisorModel: opts?.supervisorModel || undefined,
       directiveHistory: restoreHistory ?? [{ timestamp: Date.now(), text: directive, source: "user" as const }],
       pendingComments: [],
       status: "starting",
@@ -682,7 +694,11 @@ export class ProjectManager {
   private async resolveProjectModel(project: ProjectState): Promise<string> {
     const defaultModel = await resolveDefaultModel()
     try {
-      const resolved = selectProjectModel(project.model, defaultModel, this.brainConfig.model)
+      // Supervisor-only override wins when set; otherwise fall back to the
+      // primary model (which the worker also uses). Keeps old projects working
+      // without migration — supervisorModel defaults to undefined.
+      const effective = project.supervisorModel ?? project.model
+      const resolved = selectProjectModel(effective, defaultModel, this.brainConfig.model)
       if (resolved.source === "default") {
         this.dashLog.push({
           type: "brain-thinking",
@@ -1779,6 +1795,21 @@ export class ProjectManager {
     this.dashLog.push({ type: "brain-thinking", text: `${project.name} model changed to: ${model}` })
   }
 
+  /** Set or clear the supervisor-only model override. Pass an empty string (or
+   *  undefined) to clear the override and let the supervisor fall back to the
+   *  worker's model. Does NOT touch the worker's agent.config.model — that's
+   *  the whole point of the split. Caller should restartSupervisor() afterwards
+   *  because the supervisor reads its model once at startSupervisor time. */
+  updateSupervisorModel(projectId: string, model: string | undefined) {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    const trimmed = model?.trim() || undefined
+    project.supervisorModel = trimmed
+    this.saveProjects()
+    const label = trimmed ?? "(cleared — will use worker model)"
+    this.dashLog.push({ type: "brain-thinking", text: `${project.name} supervisor model changed to: ${label}` })
+  }
+
   /** Get the Ollama URL for fetching available models */
   getOllamaUrl(): string {
     return this.brainConfig.ollamaUrl
@@ -1809,6 +1840,7 @@ export class ProjectManager {
         .map(p => ({
           name: p.name, directory: p.directory, directive: p.directive,
           ...(p.model ? { model: p.model } : {}),
+          ...(p.supervisorModel ? { supervisorModel: p.supervisorModel } : {}),
           ...(p.directiveHistory && p.directiveHistory.length > 1 ? { directiveHistory: p.directiveHistory } : {}),
           ...(p.baseBranch ? { baseBranch: p.baseBranch } : {}),
           ...(p.responsibilities ? { responsibilities: p.responsibilities } : {}),
@@ -1831,14 +1863,25 @@ export class ProjectManager {
     if (saved.length === 0) return []
     const issues: Array<{ project: string; model: string; reason: string }> = []
     for (const p of saved) {
-      if (!p.model) continue
-      const check = await validateModelRoutable(p.model)
-      if (!check.ok) {
-        issues.push({ project: p.name, model: p.model, reason: check.reason })
-        this.dashLog.push({
-          type: "brain-thinking",
-          text: `Startup audit: ${p.name} is pinned to "${p.model}" but ${check.reason}. Pick a different model on the project row, or enable the target provider.`,
-        })
+      if (p.model) {
+        const check = await validateModelRoutable(p.model)
+        if (!check.ok) {
+          issues.push({ project: p.name, model: p.model, reason: check.reason })
+          this.dashLog.push({
+            type: "brain-thinking",
+            text: `Startup audit: ${p.name} worker is pinned to "${p.model}" but ${check.reason}. Pick a different model on the project row, or enable the target provider.`,
+          })
+        }
+      }
+      if (p.supervisorModel) {
+        const check = await validateModelRoutable(p.supervisorModel)
+        if (!check.ok) {
+          issues.push({ project: p.name, model: p.supervisorModel, reason: check.reason })
+          this.dashLog.push({
+            type: "brain-thinking",
+            text: `Startup audit: ${p.name} supervisor is pinned to "${p.supervisorModel}" but ${check.reason}. Pick a different supervisor model, or enable the target provider.`,
+          })
+        }
       }
     }
     return issues
@@ -1868,6 +1911,7 @@ export class ProjectManager {
           baseBranch: p.baseBranch,
           responsibilities: p.responsibilities,
           model: p.model,
+          supervisorModel: p.supervisorModel,
           lastPrFeedbackCheckAt: p.lastPrFeedbackCheckAt,
           timeline: p.timeline,
         })

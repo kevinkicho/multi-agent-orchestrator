@@ -60,9 +60,13 @@
       <div class="browse-panel" id="browse-panel"></div>
       <label>Project Name (optional)</label>
       <input type="text" id="proj-name" placeholder="Auto-detected from folder name">
-      <label>AI Model (optional)</label>
+      <label title="Model that drives the worker agent's opencode session — the one that edits code.">Worker Model (optional)</label>
       <select id="proj-model" style="background:#0f0f1a;border:1px solid #333;color:#ddd;padding:6px 8px;border-radius:3px;width:100%;margin-bottom:8px;">
         <option value="">(auto: first enabled provider)</option>
+      </select>
+      <label title="Model that drives the supervisor planning LLM. Leave blank to mirror the worker model — split them only when you want to route supervisor planning and worker editing to different quotas or providers.">Supervisor Model (optional)</label>
+      <select id="proj-supervisor-model" style="background:#0f0f1a;border:1px solid #333;color:#ddd;padding:6px 8px;border-radius:3px;width:100%;margin-bottom:8px;">
+        <option value="">(same as worker)</option>
       </select>
       <label title="The branch on GitHub that the agent's work should eventually merge into. Usually 'main' or 'master'. Used as the PR target when you click Push & PR.">Remote Default Branch (optional)</label>
       <input type="text" id="proj-base-branch" placeholder="main" title="Your GitHub repo's default branch (e.g. main, master, develop). Leave blank to use the branch you're currently on. The 'Push & PR' button on the project row will open PRs against this branch." style="margin-bottom:8px;">

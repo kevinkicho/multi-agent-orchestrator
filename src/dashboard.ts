@@ -588,6 +588,7 @@ export async function startDashboard(
           const body = await req.json() as {
             gitUrl?: string; parentDirectory?: string; targetName?: string
             directive?: string; name?: string; baseBranch?: string; model?: string
+            supervisorModel?: string
             createBaseBranchIfMissing?: boolean
           }
           if (!body.gitUrl?.trim()) {
@@ -632,6 +633,7 @@ export async function startDashboard(
             {
               baseBranch: body.baseBranch?.trim() || undefined,
               model: body.model?.trim() || undefined,
+              supervisorModel: body.supervisorModel?.trim() || undefined,
               // Seed the timeline with a clone event so the History drawer shows
               // "project began by cloning <url>" as the oldest entry.
               timeline: [{
@@ -659,6 +661,7 @@ export async function startDashboard(
             directiveHistory?: any[]
             baseBranch?: string
             model?: string
+            supervisorModel?: string
           }
           if (!body.directory?.trim()) {
             return Response.json({ error: "Directory is required" }, { status: 400, headers: corsHeaders })
@@ -671,6 +674,7 @@ export async function startDashboard(
             {
               baseBranch: body.baseBranch?.trim() || undefined,
               model: body.model?.trim() || undefined,
+              supervisorModel: body.supervisorModel?.trim() || undefined,
             },
           )
           return Response.json({ ok: true, project }, { headers: corsHeaders })
@@ -805,6 +809,24 @@ export async function startDashboard(
           }
           pm.updateModel(projectId, modelName)
           // Restart supervisor with new model
+          pm.restartSupervisor(projectId)
+          return Response.json({ ok: true }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ ok: false, error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // Update project supervisor-model override. Accepts empty string to clear
+      // the override (supervisor will then use the worker model). Restarts the
+      // supervisor because its model is read once at start time.
+      if (url.pathname.match(/^\/api\/projects\/[^/]+\/supervisor-model$/) && req.method === "PUT") {
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Project manager not available" }, { status: 500, headers: corsHeaders })
+        const projectId = sanitizeParam(url.pathname.split("/")[3] ?? "")
+        try {
+          const body = await req.json() as { model?: string }
+          const modelName = body.model?.trim()
+          pm.updateSupervisorModel(projectId, modelName || undefined)
           pm.restartSupervisor(projectId)
           return Response.json({ ok: true }, { headers: corsHeaders })
         } catch (err) {

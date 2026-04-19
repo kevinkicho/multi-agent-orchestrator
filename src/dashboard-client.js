@@ -317,11 +317,18 @@ function ensureAgent(name) {
         </div>
         <div class="drawer-panel active" id="dtab-settings-${sid}">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-            <span style="font-size:10px;color:#888;min-width:40px;">Model:</span>
+            <span style="font-size:10px;color:#888;min-width:70px;" title="Model that drives the worker agent's opencode session — the one that edits code.">Worker model:</span>
             <select class="directive-text" id="msel-${sid}" style="min-height:auto;height:26px;padding:2px 6px;flex:1;max-width:300px;">
               <option value="">(global default)</option>
             </select>
             <button class="directive-save" data-action="save-model">Change Model</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+            <span style="font-size:10px;color:#888;min-width:70px;" title="Model that drives the supervisor planning LLM. Leave blank to mirror the worker model.">Supervisor model:</span>
+            <select class="directive-text" id="spmsel-${sid}" style="min-height:auto;height:26px;padding:2px 6px;flex:1;max-width:300px;">
+              <option value="">(same as worker)</option>
+            </select>
+            <button class="directive-save" data-action="save-supervisor-model">Change Model</button>
           </div>
           <div style="margin-bottom:4px;font-size:10px;color:#888;">Directive:</div>
           <textarea class="directive-text" id="dtxt-${sid}" rows="3"></textarea>
@@ -436,6 +443,7 @@ function ensureAgent(name) {
         case 'remove': removeProject(name); break
         case 'drawer-tab': switchDrawerTab(name, btn.dataset.tab, btn); break
         case 'save-model': saveModel(name); break
+        case 'save-supervisor-model': saveSupervisorModel(name); break
         case 'save-directive': saveDirective(name, false); break
         case 'save-directive-restart': saveDirective(name, true); break
         case 'send-comment': sendComment(name); break
@@ -469,6 +477,7 @@ function ensureAgent(name) {
     branchBadge: row.querySelector('#branchbadge-' + sid),
     directiveText: row.querySelector('#dtxt-' + sid),
     modelSelect: row.querySelector('#msel-' + sid),
+    supervisorModelSelect: row.querySelector('#spmsel-' + sid),
     headerModelSelect: row.querySelector('#hmsel-' + sid),
     dirLabel: row.querySelector('#dir-' + sid),
     portLabel: row.querySelector('#port-' + sid),
@@ -1248,6 +1257,22 @@ function applyProjectData(projects) {
         }
         sel.value = proj.model
       })
+    }
+    // Supervisor model override — empty string means "mirror worker model".
+    if (agent.supervisorModelSelect) {
+      var spSel = agent.supervisorModelSelect
+      if (proj.supervisorModel) {
+        var hasSpOpt = Array.from(spSel.options).some(function(o) { return o.value === proj.supervisorModel })
+        if (!hasSpOpt) {
+          var spGhost = document.createElement('option')
+          spGhost.value = proj.supervisorModel
+          spGhost.textContent = proj.supervisorModel + ' (current)'
+          spSel.insertBefore(spGhost, spSel.firstChild.nextSibling)
+        }
+        spSel.value = proj.supervisorModel
+      } else {
+        spSel.value = ''
+      }
     }
     // Update project-level status badge
     if (agent.projStatusBadge && proj.status) {
@@ -2302,6 +2327,35 @@ async function saveModel(agentName) {
   }
 }
 
+// Supervisor-only model change — separate endpoint so the worker's opencode
+// session keeps running with the worker model. Empty value clears the override
+// and the supervisor falls back to the worker model.
+async function saveSupervisorModel(agentName) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) { alert('Project not found for ' + agentName); return }
+  const model = agent.supervisorModelSelect?.value || ''
+  const btn = agent.supervisorModelSelect?.closest('div')?.querySelector('.directive-save')
+  if (btn) { btn.disabled = true; btn.textContent = 'Changing...' }
+  try {
+    const res = await apiFetch('/api/projects/' + agent.projectId + '/supervisor-model', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model }),
+    })
+    const data = await res.json()
+    if (data.ok) {
+      const label = model ? model : '(same as worker)'
+      addLogEntry(agent.supervisorLog, 'status', 'Supervisor model changed to: ' + label + '. Supervisor restarting...')
+    } else {
+      alert('Failed to change supervisor model: ' + (data.error || 'Unknown error'))
+    }
+  } catch (err) {
+    alert('Error changing supervisor model: ' + err)
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Change Model' }
+  }
+}
+
 async function sendComment(agentName) {
   const agent = projectRows[agentName]
   if (!agent || !agent.projectId) { alert('Project not found'); return }
@@ -2751,10 +2805,12 @@ async function refreshAvailableModels() {
     // Per-project selects (settings drawer + header)
     for (const [, agent] of Object.entries(projectRows)) {
       populateModelSelect(agent.modelSelect, byProvider)
+      populateModelSelect(agent.supervisorModelSelect, byProvider)
       populateModelSelect(agent.headerModelSelect, byProvider)
     }
-    // Add-project modal picker
+    // Add-project modal pickers (worker + supervisor)
     populateModelSelect(document.getElementById('proj-model'), byProvider)
+    populateModelSelect(document.getElementById('proj-supervisor-model'), byProvider)
   } catch {}
 }
 refreshAvailableModels()
@@ -3082,6 +3138,8 @@ function closeAddProject() {
   if (hint) hint.textContent = ''
   const pm = document.getElementById('proj-model')
   if (pm) pm.value = ''
+  const sm = document.getElementById('proj-supervisor-model')
+  if (sm) sm.value = ''
 }
 
 // When a GitHub URL is filled, the "Project Folder" input switches meaning
@@ -3114,6 +3172,7 @@ async function submitProject() {
   const name = document.getElementById('proj-name').value.trim()
   const directive = document.getElementById('proj-directive').value.trim()
   const model = document.getElementById('proj-model')?.value?.trim() || ''
+  const supervisorModel = document.getElementById('proj-supervisor-model')?.value?.trim() || ''
   const baseBranch = document.getElementById('proj-base-branch')?.value?.trim() || ''
   const gitUrl = document.getElementById('proj-git-url')?.value?.trim() || ''
   if (!dir) {
@@ -3217,6 +3276,7 @@ async function submitProject() {
           name: name || undefined,
           directive: directive || undefined,
           model: model || undefined,
+          supervisorModel: supervisorModel || undefined,
           baseBranch: baseBranch || undefined,
           createBaseBranchIfMissing: createBaseBranchAfterClone,
         }
@@ -3225,6 +3285,7 @@ async function submitProject() {
           name: name || undefined,
           directive: directive || undefined,
           model: model || undefined,
+          supervisorModel: supervisorModel || undefined,
           baseBranch: baseBranch || undefined,
         }
     const res = await apiFetch(endpoint, {

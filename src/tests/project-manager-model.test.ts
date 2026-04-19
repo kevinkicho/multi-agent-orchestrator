@@ -38,11 +38,12 @@ function seedAgent(orch: Orchestrator, name: string, initialModel?: { providerID
   return agent
 }
 
-function seedProject(pm: ProjectManager, id: string, agentName: string, model?: string) {
+function seedProject(pm: ProjectManager, id: string, agentName: string, model?: string, supervisorModel?: string) {
   const map = (pm as unknown as { projects: Map<string, {
     id: string; name: string; directory: string; agentName: string; agentBranch: string; baseBranch: string;
     status: string; directive: string; directiveHistory: unknown[]; pendingComments: string[]; workerPort: number; addedAt: number;
     model?: string;
+    supervisorModel?: string;
   }> }).projects
   map.set(id, {
     id, name: "test", directory: "/tmp",
@@ -55,6 +56,7 @@ function seedProject(pm: ProjectManager, id: string, agentName: string, model?: 
     workerPort: 0,
     addedAt: Date.now(),
     model,
+    supervisorModel,
   })
 }
 
@@ -81,5 +83,36 @@ describe("updateModel propagates the new model to the worker", () => {
   test("throws when the project id is unknown — matches other accessors", () => {
     const pm = new ProjectManager(makeOrchestrator(), new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
     expect(() => pm.updateModel("nope", "opencode-go:glm-5.1")).toThrow(/Unknown project/)
+  })
+})
+
+describe("updateSupervisorModel — supervisor-only override", () => {
+  test("sets project.supervisorModel and does NOT touch the worker agent.config.model", () => {
+    const orch = makeOrchestrator()
+    const workerModel = { providerID: "opencode-go", modelID: "qwen3.6-plus" }
+    const agent = seedAgent(orch, "worker-1", workerModel)
+    const pm = new ProjectManager(orch, new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
+    seedProject(pm, "p1", "worker-1", "opencode-go:qwen3.6-plus")
+
+    pm.updateSupervisorModel("p1", "opencode-go:glm-5.1")
+
+    const project = (pm as unknown as { projects: Map<string, { supervisorModel?: string }> }).projects.get("p1")!
+    expect(project.supervisorModel).toBe("opencode-go:glm-5.1")
+    expect(agent.config.model).toEqual(workerModel)
+  })
+
+  test("empty or undefined clears the override", () => {
+    const pm = new ProjectManager(makeOrchestrator(), new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
+    seedProject(pm, "p1", "worker-1", "opencode-go:qwen3.6-plus", "opencode-go:glm-5.1")
+
+    pm.updateSupervisorModel("p1", "")
+
+    const project = (pm as unknown as { projects: Map<string, { supervisorModel?: string }> }).projects.get("p1")!
+    expect(project.supervisorModel).toBeUndefined()
+  })
+
+  test("throws when the project id is unknown", () => {
+    const pm = new ProjectManager(makeOrchestrator(), new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
+    expect(() => pm.updateSupervisorModel("nope", "opencode-go:glm-5.1")).toThrow(/Unknown project/)
   })
 })

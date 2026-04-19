@@ -9,7 +9,9 @@
     "dev": "bun run src/cli.ts",
     "start": "bun run src/launcher.ts",
     "test": "bun test src/tests/",
-    "typecheck": "bun x tsc --noEmit"
+    "typecheck": "bun x tsc --noEmit",
+    "smoke": "bun run scripts/smoke-e2e.ts",
+    "check-secrets": "bun run scripts/check-secrets.ts"
   },
   "exports": {
     ".": "./src/index.ts"

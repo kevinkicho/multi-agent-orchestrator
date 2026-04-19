@@ -7,10 +7,18 @@ nul/
 .orchestrator-memory.json
 .orchestrator-session.json
 .orchestrator/
+.orchestrator-ledger.json
+.orchestrator-chat-log/
 orchestrator-projects.json
 orchestrator-tasks.json
 orchestrator-performance.json
 orchestrator-performance-archive/
+orchestrator-analytics.json
+orchestrator-providers.json
+
+# Atomic-write temp files — if the process crashes between write and rename,
+# these orphans get left behind. They are never meant to be committed.
+*.json.tmp.*
 
 # Test temp directories
 src/tests/.test-tmp-*/

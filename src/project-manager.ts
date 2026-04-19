@@ -15,17 +15,22 @@ import {
   gitCreateBranch,
   gitCheckout,
   gitMerge,
+  gitIsClean,
   gitDeleteBranch,
   gitForceDeleteBranch,
   gitRemoteUrl,
   gitBranchExists,
   gitRemoteBranchExists,
   gitCommitsAhead,
+  gitCommitsBehind,
+  parseGithubRemote,
 } from "./git-utils"
+import { openOrReusePullRequest, findOpenPullRequest, listPullRequestFeedback, getAuthenticatedUserLogin, updatePullRequestBase, type PullRequestRef, type PullRequestFeedback } from "./github-api"
 import { isOrchestratorRepo, canonicalAgentName } from "./repo-identity"
 import type { EventBus } from "./event-bus"
 import type { ResourceManager } from "./resource-manager"
 import { archiveAgentMemory, hasAgentArchive, restoreAgentMemory } from "./brain-memory"
+import { resolveDefaultModel, validateModelRoutable, parseModelRef, selectProjectModel } from "./providers"
 import {
   type Responsibility,
   buildDefaultResponsibilities,
@@ -56,6 +61,25 @@ async function killProcessTree(pid: number): Promise<void> {
   } catch {
     // Process may already be dead — that's fine
   }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function defaultPullRequestBody(project: { name: string; directive: string; agentBranch?: string; baseBranch?: string }): string {
+  const directive = project.directive?.trim() || "(no directive)"
+  return [
+    `Automated PR opened by the multi-agent-orchestrator.`,
+    ``,
+    `- **Project:** ${project.name}`,
+    `- **Source branch:** \`${project.agentBranch ?? "(unknown)"}\``,
+    `- **Target branch:** \`${project.baseBranch ?? "main"}\``,
+    ``,
+    `**Current directive:**`,
+    ``,
+    `> ${directive.split("\n").join("\n> ")}`,
+  ].join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -97,10 +121,64 @@ export type ProjectState = {
   agentBranch?: string
   /** Base branch the agent branch was cut from — used as merge target and for unmerged-work detection. */
   baseBranch?: string
+  /** ISO-8601 timestamp of the last time the supervisor was shown PR feedback.
+   *  Drives the `since` filter for listPullRequestFeedback — comments/reviews
+   *  newer than this are what the supervisor reads on the next cycle. Absent
+   *  means "never checked" → the supervisor sees everything the first time. */
+  lastPrFeedbackCheckAt?: string
   /** Post-cycle validation config (legacy; responsibility "supervisor.run-validation" takes precedence) */
   postCycleValidation?: { command?: string; preset?: ValidationPreset; timeoutMs?: number; failAction?: "warn" | "inject" | "pause" }
   /** Per-project responsibilities (toggleable capabilities). Reconciled against the catalog on load. */
   responsibilities?: Responsibility[]
+  /** Chronological log of significant git/PR transactions on this project —
+   *  clone, push, PR open/merge, base-branch change, local merge, remote delete.
+   *  Rendered alongside directive history in the dashboard's History drawer so
+   *  the user can see the project's lifecycle as a single timeline. Capped at
+   *  200 entries to keep orchestrator.json compact; oldest are dropped first. */
+  timeline?: TimelineEvent[]
+}
+
+export type TimelineEventKind =
+  | "cloned"
+  | "branch-pushed"
+  | "pull-request-opened"
+  | "pull-request-reused"
+  | "pull-request-retargeted"
+  | "base-branch-changed"
+  | "branch-merged"
+  | "remote-branch-deleted"
+
+export type TimelineEvent = {
+  timestamp: number
+  kind: TimelineEventKind
+  /** One-line human-readable summary — what shows in the drawer row */
+  summary: string
+  /** Optional structured payload for kind-specific details (branch names,
+   *  PR number/url, etc.). Not surfaced in the UI directly — future UIs
+   *  or exports can consume it. */
+  details?: Record<string, unknown>
+}
+
+/** Snapshot of git/github state for a project — returned by getGitInfo() and
+ *  rendered in the "Git/GitHub" drawer tab. */
+export type GitInfo = {
+  originUrl: string | null
+  githubOwner: string | null
+  githubRepo: string | null
+  agentBranch: string | null
+  baseBranch: string | null
+  tokenDetected: boolean
+  commitsAhead: number
+  commitsBehind: number
+  openPullRequest: { url: string; number: number } | null
+  branchExistsOnRemote: boolean
+  /** Unread reviewer feedback on the open PR (comments + reviews + review-comments
+   *  newer than lastPrFeedbackCheckAt). The supervisor ingests these at the top
+   *  of each cycle; the UI surfaces the count so the user knows the loop is alive. */
+  pendingPrFeedbackCount: number
+  /** ISO-8601 of the newest feedback item already ingested — tells the user
+   *  when the supervisor last caught up. null = never. */
+  lastPrFeedbackCheckAt: string | null
 }
 
 /** Optional knobs passed to addProject. Any callers that don't set these get
@@ -113,6 +191,15 @@ export type AddProjectOptions = {
   allowSelfIngest?: boolean
   /** Restore a persisted responsibilities list (used by restoreProjects). Reconciled against catalog. */
   responsibilities?: Responsibility[]
+  /** Pre-select a `provider:model` (or bare ollama model) for this project's supervisor.
+   *  When absent, the supervisor falls back to resolveDefaultModel(). */
+  model?: string
+  /** Restore the persisted PR-feedback cursor so we don't re-surface feedback the
+   *  supervisor already saw in a previous process. */
+  lastPrFeedbackCheckAt?: string
+  /** Restore a persisted git/PR transaction timeline from disk (used by
+   *  restoreProjects so history survives orchestrator restarts). */
+  timeline?: TimelineEvent[]
 }
 
 type SavedProjects = {
@@ -124,6 +211,8 @@ type SavedProjects = {
     directiveHistory?: DirectiveHistoryEntry[]
     baseBranch?: string
     responsibilities?: Responsibility[]
+    lastPrFeedbackCheckAt?: string
+    timeline?: TimelineEvent[]
   }>
 }
 
@@ -206,6 +295,35 @@ export function listDirectories(dirPath: string): Array<{ name: string; path: st
   }
 }
 
+/**
+ * Build the environment variables a worker subprocess should run under, given
+ * the parent's env and the security policy. Pure function — exported so it
+ * can be tested without spawning a real process. The behavior matters for
+ * blast-radius reduction: default is "none" (strip GITHUB_TOKEN and GH_TOKEN)
+ * so a prompt-injected worker cannot push to arbitrary repos. Operators who
+ * want the worker to have GitHub write access must opt in via "full".
+ */
+export function computeWorkerSpawnEnv(
+  parentEnv: Record<string, string | undefined>,
+  resolvedDir: string,
+  policy: { workerGithubAccess?: "none" | "full" },
+): Record<string, string | undefined> {
+  const access = policy.workerGithubAccess ?? "none"
+  const base: Record<string, string | undefined> = { ...parentEnv }
+  if (access === "none") {
+    delete base.GITHUB_TOKEN
+    delete base.GH_TOKEN
+  }
+  const env: Record<string, string | undefined> = {
+    ...base,
+    OPENCODE_PROJECT_DIR: resolvedDir,
+  }
+  if (access === "full" && parentEnv.GITHUB_TOKEN && !parentEnv.GH_TOKEN) {
+    env.GH_TOKEN = parentEnv.GITHUB_TOKEN
+  }
+  return env
+}
+
 // ---------------------------------------------------------------------------
 // ProjectManager
 // ---------------------------------------------------------------------------
@@ -237,14 +355,38 @@ export class ProjectManager {
   /** Lock that serializes all project mutations (add/remove/restart) to prevent races */
   private projectLock: Promise<void> = Promise.resolve()
   private idCounter = 0
+  /** Cached login of the user that owns GITHUB_TOKEN. Resolved lazily on the
+   *  first PR-feedback fetch and cached for the process lifetime. Used to
+   *  filter the orchestrator's own PR comments out of reviewer-feedback so
+   *  the supervisor doesn't react to its own posts as though they were human
+   *  review. `undefined` = not yet resolved; `null` = resolved and absent
+   *  (/user call failed — we fall back to no-filter). */
+  private githubSelfLogin: string | null | undefined = undefined
+  /** Per-project TTL cache for getGitInfo snapshots. Dashboard polls this
+   *  endpoint on every drawer open; each call fires `GET /pulls` + `GET /user`
+   *  + (when an open PR exists) the feedback-merge triad, so repeated polls
+   *  burn GitHub REST rate-limit unnecessarily. 30s TTL collapses idle polling
+   *  to one upstream round-trip per project per window while remaining short
+   *  enough that post-mutation freshness feels immediate — any write path
+   *  (push/PR/delete/merge/setBase) invalidates its project's entry directly. */
+  private gitInfoCache = new Map<string, { expiresAt: number; value: GitInfo }>()
+  private readonly gitInfoCacheTtlMs = 30_000
 
   constructor(
     private orchestrator: Orchestrator,
     private dashLog: DashboardLog,
-    private brainConfig: { model: string; ollamaUrl: string },
+    /** Legacy brain config. `model` is optional — per-project models take precedence,
+     *  with resolveDefaultModel() as the primary fallback and brainConfig.model as a
+     *  last-resort legacy fallback for configs that still set it in orchestrator.json. */
+    private brainConfig: { model?: string; ollamaUrl: string },
     private supervisorLimits?: import("./supervisor").SupervisorLimits,
     private eventBus?: EventBus,
     private resourceManager?: ResourceManager,
+    /** Spawn-env security policy. Default is "none" — workers do NOT inherit
+     *  GITHUB_TOKEN / GH_TOKEN; all GitHub ops route through the ProjectManager.
+     *  Opt into "full" in orchestrator.json if the worker needs direct GitHub
+     *  write access (e.g. pushing from within a tool call). */
+    private securityConfig: { workerGithubAccess?: "none" | "full" } = {},
   ) {
     // Mirror validation outcomes into the owning project's responsibility so
     // lastStatus/lastRunAt survive restarts and are visible in the checklist UI.
@@ -262,6 +404,51 @@ export class ProjectManager {
         detail,
       )
     })
+  }
+
+  /** Clone a GitHub repo into `<parentDirectory>/<repoName>` and return the
+   *  resulting absolute path. Uses GITHUB_TOKEN auth (GIT_CONFIG_COUNT pattern)
+   *  when set — required for private repos, transparently skipped for public ones.
+   *
+   *  Refuses to overwrite an existing non-empty target; the caller should pick a
+   *  different parent or delete the existing directory first. The clone itself
+   *  goes through git's own fetch, so partial failures leave a `.git/` shell that
+   *  `existsSync` would see as populated — we detect this by checking for HEAD. */
+  async cloneGithubRepo(gitUrl: string, parentDirectory: string, opts?: { targetName?: string }): Promise<string> {
+    const url = gitUrl.trim()
+    if (!url) throw new Error("GitHub URL is required")
+    const parsed = parseGithubRemote(url)
+    if (!parsed) {
+      throw new Error(`Not a GitHub URL: ${url} — only github.com URLs are supported (HTTPS or SSH).`)
+    }
+    const parentResolved = resolve(parentDirectory.trim())
+    if (!existsSync(parentResolved)) {
+      throw new Error(`Parent directory does not exist: ${parentResolved}`)
+    }
+    const targetName = opts?.targetName?.trim() || parsed.repo
+    const targetDir = resolve(parentResolved, targetName)
+    if (existsSync(targetDir)) {
+      const entries = readdirSync(targetDir)
+      if (entries.length > 0) {
+        throw new Error(`Target already exists and is not empty: ${targetDir}`)
+      }
+    }
+
+    const token = process.env.GITHUB_TOKEN
+    const args = ["clone", url, targetDir]
+    const { success, output } = token
+      ? await this.runGithubAuthenticatedGit(parentResolved, args, token)
+      : await (async () => {
+          const proc = spawn({ cmd: ["git", ...args], cwd: parentResolved, stdout: "pipe", stderr: "pipe" })
+          const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()])
+          const code = await proc.exited
+          return { success: code === 0, output: [out, err].filter(s => s.trim()).join("\n").trim() }
+        })()
+    if (!success) {
+      throw new Error(`git clone failed: ${output}`)
+    }
+    this.dashLog.push({ type: "brain-thinking", text: `Cloned ${url} → ${targetDir}` })
+    return targetDir
   }
 
   /** Add a project: spawns a worker agent and starts its supervisor.
@@ -350,6 +537,7 @@ export class ProjectManager {
       directive,
       workerPort: port,
       agentName,
+      model: opts?.model || undefined,
       directiveHistory: restoreHistory ?? [{ timestamp: Date.now(), text: directive, source: "user" as const }],
       pendingComments: [],
       status: "starting",
@@ -357,6 +545,8 @@ export class ProjectManager {
       responsibilities: opts?.responsibilities
         ? reconcileResponsibilities(opts.responsibilities)
         : buildDefaultResponsibilities(),
+      ...(opts?.lastPrFeedbackCheckAt ? { lastPrFeedbackCheckAt: opts.lastPrFeedbackCheckAt } : {}),
+      ...(opts?.timeline && opts.timeline.length > 0 ? { timeline: opts.timeline } : {}),
     }
 
     this.projects.set(id, project)
@@ -369,11 +559,7 @@ export class ProjectManager {
         cmd: buildOpencodeSpawnCmd(launch, port),
         stdout: "pipe",
         stderr: "pipe",
-        env: {
-          ...process.env,
-          // Set the working directory for this agent
-          OPENCODE_PROJECT_DIR: resolvedDir,
-        },
+        env: computeWorkerSpawnEnv(process.env, resolvedDir, this.securityConfig),
       })
       this.processes.set(id, proc)
 
@@ -488,6 +674,32 @@ export class ProjectManager {
     }
   }
 
+  /** Resolve the model a project should use. Delegates the tiered fallback to
+   *  `selectProjectModel` (pure decision) and layers on contextual dashboard
+   *  logging when a non-explicit tier is used. Throws when no route exists. */
+  private async resolveProjectModel(project: ProjectState): Promise<string> {
+    const defaultModel = await resolveDefaultModel()
+    try {
+      const resolved = selectProjectModel(project.model, defaultModel, this.brainConfig.model)
+      if (resolved.source === "default") {
+        this.dashLog.push({
+          type: "brain-thinking",
+          text: `${project.name}: no per-project model set — falling back to "${resolved.model}" (first enabled provider). Set a model on the project to pin this.`,
+        })
+      } else if (resolved.source === "legacy") {
+        this.dashLog.push({
+          type: "brain-thinking",
+          text: `${project.name}: no enabled provider has a model configured — using legacy brain.model "${resolved.model}" from orchestrator.json.`,
+        })
+      }
+      return resolved.model
+    } catch {
+      throw new Error(
+        `Cannot start supervisor for "${project.name}": no model configured on the project and no enabled provider has a model available. Enable a provider with at least one model in the LLM Providers tab.`,
+      )
+    }
+  }
+
   /** Start the supervisor brain for a project */
   private startSupervisor(projectId: string) {
     const project = this.projects.get(projectId)
@@ -506,9 +718,21 @@ export class ProjectManager {
 
     ;(async () => {
       try {
+        const resolvedModel = await this.resolveProjectModel(project)
+        const routable = await validateModelRoutable(resolvedModel)
+        if (!routable.ok) {
+          this.dashLog.push({
+            type: "supervisor-alert",
+            agent: project.agentName,
+            text: `Model routing check failed for ${project.name}: ${routable.reason}. Enable the target provider or pick a different model.`,
+          })
+          project.status = "error"
+          project.error = routable.reason
+          return
+        }
         await runAgentSupervisor(this.orchestrator, {
           ollamaUrl: this.brainConfig.ollamaUrl,
-          model: project.model || this.brainConfig.model,
+          model: resolvedModel,
           agentName: project.agentName,
           directory: project.directory,
           directive: project.directive,
@@ -555,6 +779,19 @@ export class ProjectManager {
           },
           getUnreadComments: () => {
             return this.getUnreadComments(project.agentName)
+          },
+          getPendingPrFeedback: async () => {
+            const items = await this.fetchPendingPullRequestFeedback(project.id)
+            return items.map(f => ({
+              kind: f.kind, author: f.author, createdAt: f.createdAt,
+              body: f.body, url: f.url,
+              ...(f.path ? { path: f.path } : {}),
+              ...(f.line !== undefined ? { line: f.line } : {}),
+              ...(f.state ? { state: f.state } : {}),
+            }))
+          },
+          onPrFeedbackConsumed: (latestIso) => {
+            this.markPullRequestFeedbackRead(project.id, latestIso)
           },
           onCycleComplete: (cycleNumber) => {
             // Successful cycle — reset auto-restart count and LLM breaker count (failure was transient)
@@ -844,24 +1081,469 @@ export class ProjectManager {
       throw new Error(`Cannot merge while supervisor is actively running. Pause the project first.`)
     }
 
-    const target = targetBranch ?? "main"
-    await gitCheckout(project.directory, target)
-    const result = await gitMerge(project.directory, project.agentBranch)
+    // Dirty-tree guard: if the working tree has uncommitted changes, `git
+    // checkout <target>` will either fail noisily or silently clobber those
+    // changes (depending on what they touch). Either outcome is unacceptable —
+    // the user asked to merge, not to throw away in-progress worker edits.
+    const clean = await gitIsClean(project.directory)
+    if (!clean) {
+      throw new Error(
+        `Working tree has uncommitted changes in ${project.directory}. ` +
+        `Commit or stash them before merging — proceeding would risk losing the worker's in-progress edits.`,
+      )
+    }
 
-    if (result.success) {
+    // Default merge target to the base branch the project was cloned from, not
+    // a hardcoded "main" — otherwise repos whose default is master/develop/trunk
+    // get silently merged into the wrong place.
+    const target = targetBranch ?? project.baseBranch ?? "main"
+    await gitCheckout(project.directory, target)
+    // Crash-resilience: once we've checked out `target`, the working tree is on
+    // the wrong branch until we switch back. If `gitMerge` throws (conflict,
+    // process signal, etc.) the worker's next tool-call would commit to
+    // `target` instead of its agent branch. A try/finally keeps the switch-back
+    // on the happy AND failure paths.
+    let result: { success: boolean; output: string }
+    try {
+      result = await gitMerge(project.directory, project.agentBranch)
+      if (result.success) {
+        this.eventBus?.emit({
+          type: "branch-merged",
+          source: "project-manager",
+          agentName: project.agentName,
+          projectId,
+          data: { branch: project.agentBranch, into: target },
+        })
+        this.dashLog.push({ type: "brain-thinking", text: `Merged ${project.agentBranch} into ${target}` })
+        this.recordTimelineEvent(projectId, "branch-merged", `Merged ${project.agentBranch} → ${target} locally`, {
+          branch: project.agentBranch, into: target,
+        })
+      }
+    } finally {
+      await gitCheckout(project.directory, project.agentBranch).catch(err => {
+        // Loudest signal available: the worker's directory is now parked on
+        // `target`. Surface this so the user sees it before the worker makes
+        // a commit on the wrong branch.
+        this.dashLog.push({
+          type: "brain-thinking",
+          text: `WARNING: Failed to switch ${project.directory} back to ${project.agentBranch} after merge — ` +
+                `working tree is still on ${target}. Manual checkout required before the worker resumes: ${err}`,
+        })
+      })
+    }
+    this.invalidateGitInfoCache(projectId)
+    return result
+  }
+
+  /** Push the project's agent branch to origin on GitHub using GITHUB_TOKEN.
+   *
+   *  Auth is injected via GIT_CONFIG env vars (not argv), so the token never
+   *  appears in process listings or on-disk config. This is the same pattern
+   *  GitHub Actions uses for its checkout step. Works without `gh` installed.
+   *
+   *  Throws if GITHUB_TOKEN is unset, origin is missing, or origin isn't github.com. */
+  async pushAgentBranch(
+    projectId: string,
+    opts?: { setUpstream?: boolean },
+  ): Promise<{ success: boolean; output: string }> {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    if (!project.agentBranch) throw new Error(`No agent branch for project: ${projectId}`)
+    const token = process.env.GITHUB_TOKEN
+    if (!token) {
+      throw new Error("GITHUB_TOKEN is not set — paste a classic PAT into .env to enable pushing.")
+    }
+    const remoteUrl = await gitRemoteUrl(project.directory)
+    if (!remoteUrl) throw new Error(`No 'origin' remote configured in ${project.directory}`)
+    if (!/github\.com/i.test(remoteUrl)) {
+      throw new Error(`'origin' is not a GitHub URL (${remoteUrl}) — GITHUB_TOKEN auth only covers github.com`)
+    }
+
+    const args = ["push"]
+    if (opts?.setUpstream) args.push("--set-upstream")
+    args.push("origin", project.agentBranch)
+
+    const { success, output } = await this.runGithubAuthenticatedGit(project.directory, args, token)
+
+    if (success) {
       this.eventBus?.emit({
-        type: "branch-merged",
+        type: "branch-pushed",
         source: "project-manager",
         agentName: project.agentName,
         projectId,
-        data: { branch: project.agentBranch, into: target },
+        data: { branch: project.agentBranch, remote: "origin" },
       })
-      this.dashLog.push({ type: "brain-thinking", text: `Merged ${project.agentBranch} into ${target}` })
+      this.dashLog.push({ type: "brain-thinking", text: `Pushed ${project.agentBranch} to origin` })
+      this.invalidateGitInfoCache(projectId)
+      this.recordTimelineEvent(projectId, "branch-pushed", `Pushed ${project.agentBranch} → origin`, {
+        branch: project.agentBranch, remote: "origin",
+      })
+    } else {
+      this.dashLog.push({ type: "brain-thinking", text: `Push failed for ${project.agentBranch}: ${output.split("\n")[0] ?? ""}` })
+    }
+    return { success, output }
+  }
+
+  /** Run a git command with a GitHub PAT injected via GIT_CONFIG_* env vars — the
+   *  token stays out of argv, reflog, and on-disk config. Same pattern GitHub
+   *  Actions uses for its checkout step. Shared by push / delete-remote. */
+  private async runGithubAuthenticatedGit(
+    cwd: string,
+    args: string[],
+    token: string,
+  ): Promise<{ success: boolean; output: string }> {
+    const proc = spawn({
+      cmd: ["git", ...args],
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
+        GIT_CONFIG_VALUE_0: `AUTHORIZATION: token ${token}`,
+      },
+    })
+    const [out, err] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ])
+    const code = await proc.exited
+    const output = [out, err].filter(s => s.trim()).join("\n").trim()
+    return { success: code === 0, output }
+  }
+
+  /** Push the agent branch and open (or reuse) a PR into the project's base branch.
+   *
+   *  Idempotent: clicking repeatedly keeps updating the same remote branch and
+   *  either surfaces the existing open PR or creates one if none exists. The
+   *  result object's `pr.isNew` distinguishes the two so the UI can phrase the
+   *  toast appropriately. */
+  async pushAndOpenPullRequest(
+    projectId: string,
+    opts?: { title?: string; body?: string },
+  ): Promise<{ pushed: boolean; pushOutput: string; pr: PullRequestRef }> {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    if (!project.agentBranch) throw new Error(`No agent branch for project: ${projectId}`)
+    const token = process.env.GITHUB_TOKEN
+    if (!token) {
+      throw new Error("GITHUB_TOKEN is not set — paste a classic PAT into .env to enable Push & PR.")
     }
 
-    // Checkout back to agent branch so work continues
-    await gitCheckout(project.directory, project.agentBranch)
-    return result
+    // Push first so the branch exists on the remote before we ask GitHub to open a PR.
+    // --set-upstream is harmless if upstream already exists (git just re-sets it).
+    const push = await this.pushAgentBranch(projectId, { setUpstream: true })
+    if (!push.success) {
+      throw new Error(`Push failed: ${push.output}`)
+    }
+
+    const remoteUrl = await gitRemoteUrl(project.directory)
+    if (!remoteUrl) throw new Error(`No 'origin' remote configured in ${project.directory}`)
+    const parsed = parseGithubRemote(remoteUrl)
+    if (!parsed) {
+      throw new Error(`Could not parse GitHub owner/repo from origin URL: ${remoteUrl}`)
+    }
+
+    // Resolve base: explicit project.baseBranch, else best-effort fallback. If
+    // the user added the project before we persisted baseBranch (or without
+    // supplying one), default to "main" — a noisy wrong answer is more useful
+    // than silently picking a branch that might not exist on the remote.
+    const base = project.baseBranch?.trim() || "main"
+    const title = opts?.title?.trim() || `[agent] ${project.name}: ${project.agentBranch}`
+    const body = opts?.body ?? defaultPullRequestBody(project)
+
+    const pr = await openOrReusePullRequest({
+      owner: parsed.owner,
+      repo: parsed.repo,
+      head: project.agentBranch,
+      base,
+      title,
+      body,
+      token,
+    })
+
+    this.eventBus?.emit({
+      type: pr.isNew ? "pull-request-opened" : "pull-request-reused",
+      source: "project-manager",
+      agentName: project.agentName,
+      projectId,
+      data: { url: pr.url, number: pr.number, head: project.agentBranch, base },
+    })
+    this.dashLog.push({
+      type: "brain-thinking",
+      text: `${pr.isNew ? "Opened" : "Updated"} PR #${pr.number} (${project.agentBranch} → ${base}) — ${pr.url}`,
+    })
+    this.invalidateGitInfoCache(projectId)
+    this.recordTimelineEvent(
+      projectId,
+      pr.isNew ? "pull-request-opened" : "pull-request-reused",
+      `${pr.isNew ? "Opened" : "Reused"} PR #${pr.number} (${project.agentBranch} → ${base})`,
+      { number: pr.number, url: pr.url, head: project.agentBranch, base, isNew: pr.isNew },
+    )
+
+    return { pushed: true, pushOutput: push.output, pr }
+  }
+
+  /** Read-only snapshot of the project's git/github state — powers the
+   *  "Git/GitHub" drawer tab. Swallows PR-lookup errors so a transient GitHub
+   *  outage doesn't blank the whole tab; everything else is load-bearing. */
+  async getGitInfo(projectId: string): Promise<GitInfo> {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    const cached = this.gitInfoCache.get(projectId)
+    if (cached && cached.expiresAt > Date.now()) return cached.value
+    const originUrl = await gitRemoteUrl(project.directory)
+    const parsed = originUrl ? parseGithubRemote(originUrl) : null
+    const token = process.env.GITHUB_TOKEN
+    const tokenDetected = !!token
+    const base = project.baseBranch ?? null
+    const agent = project.agentBranch ?? null
+
+    let commitsAhead = 0
+    let commitsBehind = 0
+    if (base && agent) {
+      commitsAhead = await gitCommitsAhead(project.directory, base, agent).catch(() => 0)
+      commitsBehind = await gitCommitsBehind(project.directory, base, agent).catch(() => 0)
+    }
+
+    let openPullRequest: { url: string; number: number } | null = null
+    let branchExistsOnRemote = false
+    let pendingPrFeedbackCount = 0
+    if (parsed && agent && base) {
+      branchExistsOnRemote = await gitRemoteBranchExists(project.directory, agent).catch(() => false)
+      if (token) {
+        try {
+          const pr = await findOpenPullRequest({
+            owner: parsed.owner, repo: parsed.repo, head: agent, base, token,
+          })
+          if (pr) {
+            openPullRequest = { url: pr.url, number: pr.number }
+            try {
+              const selfLogin = await this.resolveGithubSelfLogin(token)
+              const feedback = await listPullRequestFeedback({
+                owner: parsed.owner, repo: parsed.repo, number: pr.number,
+                token, sinceIso: project.lastPrFeedbackCheckAt,
+                excludeAuthors: selfLogin ? [selfLogin] : undefined,
+              })
+              pendingPrFeedbackCount = feedback.length
+            } catch {
+              // Feedback is a nice-to-have in the tab — a flake shouldn't blank the panel.
+            }
+          }
+        } catch {
+          // A 404/403/5xx from GitHub shouldn't blank the tab — the user can still
+          // see their local facts and retry. The absent-PR state is the same shape.
+        }
+      }
+    }
+
+    const snapshot: GitInfo = {
+      originUrl,
+      githubOwner: parsed?.owner ?? null,
+      githubRepo: parsed?.repo ?? null,
+      agentBranch: agent,
+      baseBranch: base,
+      tokenDetected,
+      commitsAhead,
+      commitsBehind,
+      openPullRequest,
+      branchExistsOnRemote,
+      pendingPrFeedbackCount,
+      lastPrFeedbackCheckAt: project.lastPrFeedbackCheckAt ?? null,
+    }
+    this.gitInfoCache.set(projectId, { expiresAt: Date.now() + this.gitInfoCacheTtlMs, value: snapshot })
+    return snapshot
+  }
+
+  /** Drop the cached getGitInfo snapshot for a project so the next read
+   *  recomputes from disk + GitHub. Called by every write path — push, PR,
+   *  merge, delete-remote, setBaseBranch, markPullRequestFeedbackRead. */
+  private invalidateGitInfoCache(projectId: string): void {
+    this.gitInfoCache.delete(projectId)
+  }
+
+  /** Mutate the project's base branch (the PR/merge target). If an open PR
+   *  exists on the agent branch targeting the OLD base, retarget it to the
+   *  NEW base via the GitHub API — otherwise the next "Push & PR" click
+   *  creates a duplicate PR and orphans the first. Retarget is best-effort:
+   *  local state change stands even if the API call fails, and the failure
+   *  is surfaced in the dashboard log so the user can resolve it manually. */
+  async setBaseBranch(projectId: string, baseBranch: string): Promise<GitInfo> {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    const trimmed = baseBranch.trim()
+    if (!trimmed) throw new Error("Base branch cannot be empty")
+    const previous = project.baseBranch
+    if (previous === trimmed) return this.getGitInfo(projectId)
+
+    // Retarget any open PR BEFORE flipping local state — if retarget fails,
+    // we still update state (the user asked for it) but we log clearly that
+    // the old PR is now orphaned on its old base.
+    let retargetMessage = ""
+    if (previous) {
+      const token = process.env.GITHUB_TOKEN
+      const remoteUrl = await gitRemoteUrl(project.directory).catch(() => null)
+      const parsed = remoteUrl ? parseGithubRemote(remoteUrl) : null
+      const agent = project.agentBranch
+      if (token && parsed && agent) {
+        try {
+          const pr = await findOpenPullRequest({
+            owner: parsed.owner, repo: parsed.repo, head: agent, base: previous, token,
+          })
+          if (pr) {
+            await updatePullRequestBase({
+              owner: parsed.owner, repo: parsed.repo, number: pr.number, base: trimmed, token,
+            })
+            retargetMessage = ` (retargeted PR #${pr.number} from ${previous} to ${trimmed})`
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          retargetMessage = ` (WARNING: could not retarget existing PR — ${msg})`
+        }
+      }
+    }
+
+    project.baseBranch = trimmed
+    this.saveProjects()
+    this.invalidateGitInfoCache(projectId)
+    this.recordTimelineEvent(projectId, "base-branch-changed", `Base branch: ${previous ?? "(unset)"} → ${trimmed}`, {
+      previous, next: trimmed, retargetMessage: retargetMessage.trim() || undefined,
+    })
+    this.dashLog.push({
+      type: "brain-thinking",
+      text: `Base branch for ${project.name} changed: ${previous ?? "(unset)"} → ${trimmed}${retargetMessage}`,
+    })
+    return this.getGitInfo(projectId)
+  }
+
+  /** Delete the agent branch on origin. Local branch is left intact — the
+   *  agent may still be using it. Typical use: cleanup after a PR was merged. */
+  async deleteRemoteBranch(projectId: string): Promise<{ success: boolean; output: string }> {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    if (!project.agentBranch) throw new Error(`No agent branch for project: ${projectId}`)
+    const token = process.env.GITHUB_TOKEN
+    if (!token) throw new Error("GITHUB_TOKEN is not set — cannot delete remote branch.")
+    const remoteUrl = await gitRemoteUrl(project.directory)
+    if (!remoteUrl) throw new Error(`No 'origin' remote configured in ${project.directory}`)
+    if (!/github\.com/i.test(remoteUrl)) {
+      throw new Error(`'origin' is not a GitHub URL (${remoteUrl}) — token auth only covers github.com`)
+    }
+
+    const { success, output } = await this.runGithubAuthenticatedGit(
+      project.directory,
+      ["push", "origin", "--delete", project.agentBranch],
+      token,
+    )
+    if (success) {
+      this.dashLog.push({ type: "brain-thinking", text: `Deleted origin/${project.agentBranch}` })
+      this.invalidateGitInfoCache(projectId)
+      this.recordTimelineEvent(projectId, "remote-branch-deleted", `Deleted origin/${project.agentBranch}`, {
+        branch: project.agentBranch,
+      })
+    } else {
+      this.dashLog.push({ type: "brain-thinking", text: `Delete remote branch failed: ${output.split("\n")[0] ?? ""}` })
+    }
+    return { success, output }
+  }
+
+  /** Fetch any unread PR feedback (issue comments / review comments / reviews)
+   *  newer than `project.lastPrFeedbackCheckAt`. Returns [] when:
+   *   - no GITHUB_TOKEN
+   *   - no github origin
+   *   - no open PR for the agent branch
+   *   - the REST call fails (failure is logged, not thrown, so a flaky network
+   *     doesn't crash a supervisor cycle)
+   *
+   *  NOTE: the cursor is NOT advanced here — callers must call
+   *  `markPullRequestFeedbackRead(projectId, latestIso)` once the feedback has
+   *  been handed to the supervisor. Splitting fetch/mark keeps the operation
+   *  exactly-once-visible even if the caller crashes between the two steps. */
+  async fetchPendingPullRequestFeedback(projectId: string): Promise<PullRequestFeedback[]> {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    const token = process.env.GITHUB_TOKEN
+    if (!token) return []
+    const remoteUrl = await gitRemoteUrl(project.directory).catch(() => null)
+    const parsed = remoteUrl ? parseGithubRemote(remoteUrl) : null
+    if (!parsed) return []
+    const agent = project.agentBranch
+    const base = project.baseBranch
+    if (!agent || !base) return []
+    try {
+      const pr = await findOpenPullRequest({
+        owner: parsed.owner, repo: parsed.repo, head: agent, base, token,
+      })
+      if (!pr) return []
+      const selfLogin = await this.resolveGithubSelfLogin(token)
+      return await listPullRequestFeedback({
+        owner: parsed.owner, repo: parsed.repo, number: pr.number,
+        token, sinceIso: project.lastPrFeedbackCheckAt,
+        excludeAuthors: selfLogin ? [selfLogin] : undefined,
+      })
+    } catch (err) {
+      this.dashLog.push({
+        type: "brain-thinking",
+        text: `PR feedback fetch failed for ${project.name}: ${err instanceof Error ? err.message : String(err)}`,
+      })
+      return []
+    }
+  }
+
+  /** Lazily resolve the login attached to GITHUB_TOKEN. Cached for the process
+   *  lifetime — tokens don't change identity. If the /user call fails, cache
+   *  null so we don't hammer GitHub on every cycle. */
+  private async resolveGithubSelfLogin(token: string): Promise<string | null> {
+    if (this.githubSelfLogin !== undefined) return this.githubSelfLogin
+    const login = await getAuthenticatedUserLogin({ token })
+    this.githubSelfLogin = login
+    if (login) {
+      this.dashLog.push({
+        type: "brain-thinking",
+        text: `GitHub token identity: @${login} (this account's comments will be excluded from reviewer-feedback injection)`,
+      })
+    }
+    return login
+  }
+
+  /** Advance the project's PR-feedback cursor so the next fetch only returns
+   *  items newer than `latestIso`. Pass the createdAt of the newest item the
+   *  supervisor just consumed. No-op if the new timestamp is older than the
+   *  existing cursor (guards against clock skew or out-of-order delivery). */
+  markPullRequestFeedbackRead(projectId: string, latestIso: string): void {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    if (!latestIso) return
+    const newMs = Date.parse(latestIso)
+    if (!Number.isFinite(newMs)) return
+    const prevMs = project.lastPrFeedbackCheckAt ? Date.parse(project.lastPrFeedbackCheckAt) : 0
+    if (newMs <= prevMs) return
+    project.lastPrFeedbackCheckAt = latestIso
+    this.invalidateGitInfoCache(projectId)
+    this.saveProjects()
+  }
+
+  /** Append a git/PR transaction to the project's timeline and persist.
+   *  Capped at 200 entries (oldest dropped first) — the History drawer shows
+   *  the recent tail, and orchestrator.json stays compact across long sessions. */
+  private recordTimelineEvent(projectId: string, kind: TimelineEventKind, summary: string, details?: Record<string, unknown>): void {
+    const project = this.projects.get(projectId)
+    if (!project) return
+    if (!project.timeline) project.timeline = []
+    project.timeline.push({ timestamp: Date.now(), kind, summary, ...(details ? { details } : {}) })
+    if (project.timeline.length > 200) {
+      project.timeline = project.timeline.slice(-200)
+    }
+    this.saveProjects()
+  }
+
+  /** Read-only accessor for the project's git/PR transaction timeline.
+   *  Returns a defensive copy so callers can't mutate our persisted state. */
+  getTimeline(projectId: string): TimelineEvent[] {
+    const project = this.projects.get(projectId)
+    if (!project) throw new Error(`Unknown project: ${projectId}`)
+    return (project.timeline ?? []).slice()
   }
 
   /** Set post-cycle validation config for a project */
@@ -1091,15 +1773,39 @@ export class ProjectManager {
         .map(p => ({
           name: p.name, directory: p.directory, directive: p.directive,
           ...(p.model ? { model: p.model } : {}),
-          ...(p.directiveHistory.length > 1 ? { directiveHistory: p.directiveHistory } : {}),
+          ...(p.directiveHistory && p.directiveHistory.length > 1 ? { directiveHistory: p.directiveHistory } : {}),
           ...(p.baseBranch ? { baseBranch: p.baseBranch } : {}),
           ...(p.responsibilities ? { responsibilities: p.responsibilities } : {}),
+          ...(p.lastPrFeedbackCheckAt ? { lastPrFeedbackCheckAt: p.lastPrFeedbackCheckAt } : {}),
+          ...(p.timeline && p.timeline.length > 0 ? { timeline: p.timeline } : {}),
         })),
     }
     writeJsonFile(resolve(process.cwd(), PROJECTS_FILE), data).catch(err => {
       console.error(`[project-manager] Failed to save projects file: ${err}`)
       this.dashLog.push({ type: "brain-thinking", text: `WARNING: Failed to persist project state to disk. In-memory state may diverge from saved state on restart: ${err}` })
     })
+  }
+
+  /** Audit saved project configs against the provider registry. Warns for any
+   *  persisted `model` that targets a missing or disabled provider — surfaced to
+   *  the dashboard log so the user sees the problem at startup instead of the
+   *  first time a supervisor tries to spin up. */
+  async auditSavedProjectModels(): Promise<Array<{ project: string; model: string; reason: string }>> {
+    const saved = await this.getSavedProjects()
+    if (saved.length === 0) return []
+    const issues: Array<{ project: string; model: string; reason: string }> = []
+    for (const p of saved) {
+      if (!p.model) continue
+      const check = await validateModelRoutable(p.model)
+      if (!check.ok) {
+        issues.push({ project: p.name, model: p.model, reason: check.reason })
+        this.dashLog.push({
+          type: "brain-thinking",
+          text: `Startup audit: ${p.name} is pinned to "${p.model}" but ${check.reason}. Pick a different model on the project row, or enable the target provider.`,
+        })
+      }
+    }
+    return issues
   }
 
   /** Load previously saved projects list (does not restore them — caller decides) */
@@ -1125,6 +1831,9 @@ export class ProjectManager {
         await this.addProject(p.directory, p.directive, p.name, p.directiveHistory, {
           baseBranch: p.baseBranch,
           responsibilities: p.responsibilities,
+          model: p.model,
+          lastPrFeedbackCheckAt: p.lastPrFeedbackCheckAt,
+          timeline: p.timeline,
         })
         restored.push(p.name)
       } catch (err) {

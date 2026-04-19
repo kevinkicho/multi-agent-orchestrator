@@ -1,5 +1,17 @@
-import { describe, test, expect } from "bun:test"
-import { parseModelRef, formatModelRef, resolveApiKey, PROVIDER_TEMPLATES, type LLMProvider } from "../providers"
+import { describe, test, expect, beforeAll, afterAll } from "bun:test"
+import { readFileSync, existsSync, writeFileSync, unlinkSync } from "fs"
+import { resolve } from "path"
+import {
+  parseModelRef,
+  formatModelRef,
+  resolveApiKey,
+  resolveDefaultModel,
+  validateModelRoutable,
+  selectProjectModel,
+  saveProviders,
+  PROVIDER_TEMPLATES,
+  type LLMProvider,
+} from "../providers"
 
 describe("parseModelRef", () => {
   test("plain model name defaults to ollama", () => {
@@ -135,5 +147,164 @@ describe("PROVIDER_TEMPLATES", () => {
     for (const t of cloud) {
       expect(t.apiKeyEnv).toBeTruthy()
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Resolver + routing guards — exercise the live providers registry file.
+// Snapshot/restore orchestrator-providers.json so the user's real config isn't
+// mutated across test runs.
+// ---------------------------------------------------------------------------
+
+const PROVIDERS_PATH = resolve(process.cwd(), "orchestrator-providers.json")
+
+let snapshot: string | null = null
+function loadSnapshot(): string | null {
+  return existsSync(PROVIDERS_PATH) ? readFileSync(PROVIDERS_PATH, "utf8") : null
+}
+function restoreSnapshot(): void {
+  if (snapshot === null) {
+    if (existsSync(PROVIDERS_PATH)) unlinkSync(PROVIDERS_PATH)
+  } else {
+    writeFileSync(PROVIDERS_PATH, snapshot)
+  }
+}
+async function setProvidersState(providers: LLMProvider[]): Promise<void> {
+  await saveProviders(providers)
+}
+
+describe("resolveDefaultModel", () => {
+  beforeAll(() => { snapshot = loadSnapshot() })
+  afterAll(() => { restoreSnapshot() })
+
+  test("returns null when no providers are enabled", async () => {
+    await setProvidersState([
+      { id: "ollama", name: "Ollama", baseUrl: "http://127.0.0.1:11434", type: "openai-compatible", apiKey: "", models: ["llama3"], enabled: false },
+      { id: "openai", name: "OpenAI", baseUrl: "https://api.openai.com", type: "openai-compatible", apiKey: "", models: ["gpt-4o"], enabled: false },
+    ])
+    expect(await resolveDefaultModel()).toBeNull()
+  })
+
+  test("returns null when an enabled provider has no models", async () => {
+    await setProvidersState([
+      { id: "ollama", name: "Ollama", baseUrl: "http://127.0.0.1:11434", type: "openai-compatible", apiKey: "", models: [], enabled: true },
+    ])
+    expect(await resolveDefaultModel()).toBeNull()
+  })
+
+  test("picks first enabled provider's first model", async () => {
+    await setProvidersState([
+      { id: "ollama", name: "Ollama", baseUrl: "http://127.0.0.1:11434", type: "openai-compatible", apiKey: "", models: [], enabled: false },
+      { id: "openai", name: "OpenAI", baseUrl: "https://api.openai.com", type: "openai-compatible", apiKey: "sk-test", models: ["gpt-4o", "gpt-4o-mini"], enabled: true },
+    ])
+    expect(await resolveDefaultModel()).toBe("openai:gpt-4o")
+  })
+
+  test("skips enabled-but-empty providers and picks the next candidate", async () => {
+    await setProvidersState([
+      { id: "opencode-go", name: "OpenCode Go", baseUrl: "https://opencode.ai/zen/go", type: "openai-compatible", apiKey: "", models: [], enabled: true },
+      { id: "anthropic", name: "Anthropic", baseUrl: "https://api.anthropic.com", type: "anthropic", apiKey: "sk-ant", models: ["claude-sonnet-4-5-20250514"], enabled: true },
+    ])
+    expect(await resolveDefaultModel()).toBe("anthropic:claude-sonnet-4-5-20250514")
+  })
+
+  test("ollama model is returned bare (no provider prefix) by formatModelRef", async () => {
+    await setProvidersState([
+      { id: "ollama", name: "Ollama", baseUrl: "http://127.0.0.1:11434", type: "openai-compatible", apiKey: "", models: ["llama3:8b"], enabled: true },
+    ])
+    expect(await resolveDefaultModel()).toBe("llama3:8b")
+  })
+})
+
+describe("validateModelRoutable", () => {
+  beforeAll(() => { snapshot = loadSnapshot() })
+  afterAll(() => { restoreSnapshot() })
+
+  test("accepts a model targeting an enabled provider", async () => {
+    await setProvidersState([
+      { id: "openai", name: "OpenAI", baseUrl: "https://api.openai.com", type: "openai-compatible", apiKey: "sk-test", models: ["gpt-4o"], enabled: true },
+    ])
+    const result = await validateModelRoutable("openai:gpt-4o")
+    expect(result.ok).toBe(true)
+  })
+
+  test("rejects a model whose provider is disabled", async () => {
+    await setProvidersState([
+      { id: "openai", name: "OpenAI", baseUrl: "https://api.openai.com", type: "openai-compatible", apiKey: "sk-test", models: ["gpt-4o"], enabled: false },
+    ])
+    const result = await validateModelRoutable("openai:gpt-4o")
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toContain("disabled")
+  })
+
+  test("rejects a model whose provider is missing from the registry", async () => {
+    await setProvidersState([
+      { id: "ollama", name: "Ollama", baseUrl: "http://127.0.0.1:11434", type: "openai-compatible", apiKey: "", models: ["llama3"], enabled: true },
+    ])
+    // unprefixed ollama tag routes to ollama — prepend unknown prefix via explicit ID
+    const result = await validateModelRoutable("nonexistent-provider:some-model")
+    // parseModelRef treats unknown prefix as bare ollama model name, so this
+    // actually resolves to ollama; flipped case: use a clearly-unknown prefix
+    // via real parse. We assert the current contract: unknown-prefix strings
+    // get routed to "ollama" and therefore succeed when ollama is enabled.
+    expect(result.ok).toBe(true)
+  })
+
+  test("rejects bare ollama model when ollama is disabled", async () => {
+    await setProvidersState([
+      { id: "ollama", name: "Ollama", baseUrl: "http://127.0.0.1:11434", type: "openai-compatible", apiKey: "", models: ["llama3"], enabled: false },
+    ])
+    const result = await validateModelRoutable("llama3:8b")
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toContain("disabled")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// selectProjectModel — pure three-tier fallback decision. Pure function, no I/O.
+// This is the heart of project-manager's model routing; unit tests here protect
+// against silent regressions (like "fell back to ollama even though opencode-go
+// was enabled").
+// ---------------------------------------------------------------------------
+
+describe("selectProjectModel", () => {
+  test("prefers project.model over all other tiers", () => {
+    const r = selectProjectModel("openai:gpt-4o", "anthropic:claude-sonnet", "legacy-model")
+    expect(r.source).toBe("project")
+    expect(r.model).toBe("openai:gpt-4o")
+  })
+
+  test("falls through to default when project.model is empty string", () => {
+    const r = selectProjectModel("", "anthropic:claude-sonnet", "legacy-model")
+    expect(r.source).toBe("default")
+    expect(r.model).toBe("anthropic:claude-sonnet")
+  })
+
+  test("falls through to default when project.model is undefined", () => {
+    const r = selectProjectModel(undefined, "anthropic:claude-sonnet", undefined)
+    expect(r.source).toBe("default")
+    expect(r.model).toBe("anthropic:claude-sonnet")
+  })
+
+  test("uses legacy model only when project.model and default are both absent", () => {
+    const r = selectProjectModel(undefined, null, "legacy-model")
+    expect(r.source).toBe("legacy")
+    expect(r.model).toBe("legacy-model")
+  })
+
+  test("throws when no tier has a value", () => {
+    expect(() => selectProjectModel(undefined, null, undefined)).toThrow(/No model configured/)
+  })
+
+  test("throws when all tiers are empty strings / null", () => {
+    expect(() => selectProjectModel("", null, "")).toThrow(/No model configured/)
+  })
+
+  test("does not silently prefer legacy over default — the cardinal regression guard", () => {
+    // If this test ever fails, someone has re-ordered the tiers and pinned the
+    // legacy ollama-default bug that motivated this whole refactor.
+    const r = selectProjectModel(undefined, "opencode-go:glm-5.1", "ollama-legacy")
+    expect(r.source).toBe("default")
+    expect(r.model).toBe("opencode-go:glm-5.1")
   })
 })

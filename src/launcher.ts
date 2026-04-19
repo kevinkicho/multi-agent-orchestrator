@@ -10,12 +10,14 @@ import { existsSync, readFileSync } from "fs"
 import { resolve } from "path"
 import type { AgentConfig } from "./agent"
 import { resolveOpencode, buildOpencodeSpawnCmd, type OpencodeLaunch } from "./opencode-runtime"
+import { computeWorkerSpawnEnv } from "./project-manager"
 
 type LauncherConfig = {
   agents: (AgentConfig & { model?: string })[]
   autoApprove?: boolean
   dashboardPort?: number
   brain?: { model?: string; ollamaUrl?: string }
+  security?: { workerGithubAccess?: "none" | "full" }
 }
 
 function loadConfig(): LauncherConfig {
@@ -82,14 +84,19 @@ async function main() {
     }
 
     console.log(`[launcher] Starting ${agent.name} on port ${port}...`)
+    // Respect the same workerGithubAccess policy as the ProjectManager. Default
+    // is "none" — the serve instance is exactly the same worker subprocess that
+    // project-manager spawns, so the token must be stripped here too. Leaving
+    // this path unscoped re-opens the blast-radius hole the default flip closes.
     const proc = spawn({
       cmd: buildOpencodeSpawnCmd(launch, port),
       stdout: "pipe",
       stderr: "pipe",
-      env: {
-        ...process.env,
-        OPENCODE_PROJECT_DIR: agent.directory,
-      },
+      env: computeWorkerSpawnEnv(
+        process.env as Record<string, string | undefined>,
+        agent.directory,
+        config.security ?? {},
+      ),
     })
     procs.push(proc)
   }

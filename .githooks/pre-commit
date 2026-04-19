@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Blocks commits containing known secret patterns (GitHub PATs, API keys, etc).
+# Belt-and-braces guard on top of .gitignore — catches `git add -f .env` and
+# hardcoded tokens in new source files before they reach the remote.
+#
+# Install (once per clone):
+#   git config core.hooksPath .githooks
+#
+# Bypass (use only for false positives): git commit --no-verify
+set -e
+exec bun run scripts/check-secrets.ts --staged

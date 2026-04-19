@@ -320,6 +320,73 @@ export function resolveApiKey(provider: LLMProvider): string {
 // List all available models across enabled providers
 // ---------------------------------------------------------------------------
 
+/**
+ * Resolve a default model string for contexts without an explicit choice
+ * (e.g. a project whose `model` hasn't been set, or the legacy brain-level
+ * fallback). Picks the first enabled provider with at least one model and
+ * returns a prefixed `provider:model` string that `parseModelRef` can route.
+ *
+ * Ollama is treated like any other provider here — if the user has enabled
+ * Ollama and configured models, its first model wins. Returns null when no
+ * enabled provider has a model available.
+ */
+export async function resolveDefaultModel(): Promise<string | null> {
+  const providers = await getEnabledProviders()
+  for (const p of providers) {
+    const first = p.models[0]
+    if (!first) continue
+    return formatModelRef({ provider: p.id, model: first })
+  }
+  return null
+}
+
+/**
+ * Validate that a `provider:model` string targets an enabled provider. Returns
+ * { ok: true } when routable, or { ok: false, reason } when the target
+ * provider is missing or disabled. Used for startup/toggle guardrails.
+ */
+export async function validateModelRoutable(modelStr: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const ref = parseModelRef(modelStr)
+  const providers = await loadProviders()
+  const provider = providers.find(p => p.id === ref.provider)
+  if (!provider) {
+    return { ok: false, reason: `unknown provider "${ref.provider}" (model "${modelStr}")` }
+  }
+  if (!provider.enabled) {
+    return { ok: false, reason: `provider "${ref.provider}" is disabled (model "${modelStr}")` }
+  }
+  return { ok: true }
+}
+
+/**
+ * Pure decision function for project model resolution — exported so the tiered
+ * fallback logic is testable without instantiating ProjectManager. Priority:
+ *   1. Explicit `projectModel` (set by the user per project)
+ *   2. `defaultModel` (output of resolveDefaultModel — first enabled provider)
+ *   3. `legacyModel` (`brain.model` from orchestrator.json — deprecated fallback)
+ *
+ * Returns { model, source } when a route exists, or throws when nothing is
+ * configured. Callers layer side effects (logging, metrics) on top using the
+ * `source` tier.
+ */
+export type ResolvedModel =
+  | { model: string; source: "project" }
+  | { model: string; source: "default" }
+  | { model: string; source: "legacy" }
+
+export function selectProjectModel(
+  projectModel: string | undefined | null,
+  defaultModel: string | null,
+  legacyModel: string | undefined | null,
+): ResolvedModel {
+  if (projectModel) return { model: projectModel, source: "project" }
+  if (defaultModel) return { model: defaultModel, source: "default" }
+  if (legacyModel) return { model: legacyModel, source: "legacy" }
+  throw new Error(
+    "No model configured: set a per-project model, enable a provider with at least one model, or set brain.model in orchestrator.json.",
+  )
+}
+
 export async function listAllModels(): Promise<Array<{ provider: string; providerName: string; model: string }>> {
   const providers = await getEnabledProviders()
   const result: Array<{ provider: string; providerName: string; model: string }> = []

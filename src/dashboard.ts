@@ -420,6 +420,48 @@ export async function startDashboard(
         }
       }
 
+      if (url.pathname === "/api/projects/clone" && req.method === "POST") {
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Project manager not available" }, { status: 500, headers: corsHeaders })
+        try {
+          const body = await req.json() as {
+            gitUrl?: string; parentDirectory?: string; targetName?: string
+            directive?: string; name?: string; baseBranch?: string; model?: string
+          }
+          if (!body.gitUrl?.trim()) {
+            return Response.json({ error: "gitUrl is required" }, { status: 400, headers: corsHeaders })
+          }
+          if (!body.parentDirectory?.trim()) {
+            return Response.json({ error: "parentDirectory is required" }, { status: 400, headers: corsHeaders })
+          }
+          const cloned = await pm.cloneGithubRepo(body.gitUrl.trim(), body.parentDirectory.trim(), {
+            targetName: body.targetName?.trim() || undefined,
+          })
+          const project = await pm.addProject(
+            cloned,
+            body.directive?.trim() || "Work on this project. Review the codebase, fix bugs, add features, and improve code quality.",
+            body.name?.trim() || undefined,
+            undefined,
+            {
+              baseBranch: body.baseBranch?.trim() || undefined,
+              allowSelfIngest: false,
+              model: body.model?.trim() || undefined,
+              // Seed the timeline with a clone event so the History drawer shows
+              // "project began by cloning <url>" as the oldest entry.
+              timeline: [{
+                timestamp: Date.now(),
+                kind: "cloned",
+                summary: `Cloned ${body.gitUrl.trim()} → ${cloned}`,
+                details: { url: body.gitUrl.trim(), directory: cloned },
+              }],
+            },
+          )
+          return Response.json({ ok: true, project, directory: cloned }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ ok: false, error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
       if (url.pathname === "/api/projects" && req.method === "POST") {
         const pm = opts?.projectManager
         if (!pm) return Response.json({ error: "Project manager not available" }, { status: 500, headers: corsHeaders })
@@ -431,6 +473,7 @@ export async function startDashboard(
             directiveHistory?: any[]
             baseBranch?: string
             allowSelfIngest?: boolean
+            model?: string
           }
           if (!body.directory?.trim()) {
             return Response.json({ error: "Directory is required" }, { status: 400, headers: corsHeaders })
@@ -443,6 +486,7 @@ export async function startDashboard(
             {
               baseBranch: body.baseBranch?.trim() || undefined,
               allowSelfIngest: body.allowSelfIngest === true,
+              model: body.model?.trim() || undefined,
             },
           )
           return Response.json({ ok: true, project }, { headers: corsHeaders })
@@ -512,6 +556,17 @@ export async function startDashboard(
         if (!pm) return Response.json([], { headers: corsHeaders })
         const projectId = sanitizeParam(url.pathname.split("/")[3] ?? "")
         return Response.json(pm.getDirectiveHistory(projectId), { headers: corsHeaders })
+      }
+
+      if (url.pathname.match(/^\/api\/projects\/[^/]+\/timeline$/) && req.method === "GET") {
+        const pm = opts?.projectManager
+        if (!pm) return Response.json([], { headers: corsHeaders })
+        const projectId = sanitizeParam(url.pathname.split("/")[3] ?? "")
+        try {
+          return Response.json(pm.getTimeline(projectId), { headers: corsHeaders })
+        } catch {
+          return Response.json([], { headers: corsHeaders })
+        }
       }
 
       // Add a user comment on the directive (optionally on a specific history entry)
@@ -643,6 +698,23 @@ export async function startDashboard(
           return Response.json({ ok }, { headers: corsHeaders })
         } catch (err) {
           return Response.json({ error: `Failed to enable provider: ${err instanceof Error ? err.message : String(err)}` }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // Report which active projects reference a given provider. The client uses this
+      // before flipping a provider OFF so the user sees whose supervisors will break.
+      if (url.pathname.match(/^\/api\/providers\/[^/]+\/usage$/) && req.method === "GET") {
+        try {
+          const { parseModelRef } = await import("./providers")
+          const providerId = sanitizeParam(url.pathname.split("/")[3]!)
+          const pm = opts?.projectManager
+          const projects = pm?.listProjects() ?? []
+          const using = projects
+            .filter(p => p.model && parseModelRef(p.model).provider === providerId)
+            .map(p => ({ id: p.id, name: p.name, model: p.model, status: p.status }))
+          return Response.json({ providerId, projects: using }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: `Failed to compute usage: ${err instanceof Error ? err.message : String(err)}` }, { status: 500, headers: corsHeaders })
         }
       }
 
@@ -1055,6 +1127,67 @@ export async function startDashboard(
         try {
           const body = (await req.json()) as { targetBranch?: string }
           const result = await pm.mergeAgentBranch(projectId, body.targetBranch)
+          return Response.json(result, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 400, headers: corsHeaders })
+        }
+      }
+
+      if (req.method === "POST" && url.pathname.match(/^\/api\/projects\/[^/]+\/push-and-pr$/)) {
+        const projectId = sanitizeParam(url.pathname.split("/")[3]!)
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Not available" }, { status: 500, headers: corsHeaders })
+        const project = pm.getProject(projectId)
+        if (!project) return Response.json({ error: "Unknown project" }, { status: 404, headers: corsHeaders })
+        try {
+          const body = (await req.json().catch(() => ({}))) as { title?: string; body?: string }
+          const result = await pm.pushAndOpenPullRequest(projectId, { title: body.title, body: body.body })
+          return Response.json(result, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 400, headers: corsHeaders })
+        }
+      }
+
+      if (req.method === "GET" && url.pathname.match(/^\/api\/projects\/[^/]+\/git-info$/)) {
+        const projectId = sanitizeParam(url.pathname.split("/")[3]!)
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Not available" }, { status: 500, headers: corsHeaders })
+        const project = pm.getProject(projectId)
+        if (!project) return Response.json({ error: "Unknown project" }, { status: 404, headers: corsHeaders })
+        try {
+          const info = await pm.getGitInfo(projectId)
+          return Response.json(info, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      if (req.method === "PUT" && url.pathname.match(/^\/api\/projects\/[^/]+\/base-branch$/)) {
+        const projectId = sanitizeParam(url.pathname.split("/")[3]!)
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Not available" }, { status: 500, headers: corsHeaders })
+        const project = pm.getProject(projectId)
+        if (!project) return Response.json({ error: "Unknown project" }, { status: 404, headers: corsHeaders })
+        try {
+          const body = (await req.json()) as { baseBranch?: string }
+          if (!body.baseBranch || !body.baseBranch.trim()) {
+            return Response.json({ error: "baseBranch is required" }, { status: 400, headers: corsHeaders })
+          }
+          const info = await pm.setBaseBranch(projectId, body.baseBranch)
+          return Response.json({ ok: true, gitInfo: info }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 400, headers: corsHeaders })
+        }
+      }
+
+      if (req.method === "DELETE" && url.pathname.match(/^\/api\/projects\/[^/]+\/remote-branch$/)) {
+        const projectId = sanitizeParam(url.pathname.split("/")[3]!)
+        const pm = opts?.projectManager
+        if (!pm) return Response.json({ error: "Not available" }, { status: 500, headers: corsHeaders })
+        const project = pm.getProject(projectId)
+        if (!project) return Response.json({ error: "Unknown project" }, { status: 404, headers: corsHeaders })
+        try {
+          const result = await pm.deleteRemoteBranch(projectId)
           return Response.json(result, { headers: corsHeaders })
         } catch (err) {
           return Response.json({ error: String(err) }, { status: 400, headers: corsHeaders })

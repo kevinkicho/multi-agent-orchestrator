@@ -215,6 +215,18 @@ function setNotesOpen(rowEl, open) {
   if (open) loadNotes(rowEl.dataset.agent)
 }
 
+function setGitOpen(rowEl, open) {
+  const content = rowEl.querySelector('.git-content')
+  if (content) content.classList.toggle('open', open)
+  const btn = rowEl.querySelector('[data-action="toggle-git"]')
+  if (btn) {
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false')
+    const arrow = btn.querySelector('.row-toggle-arrow')
+    if (arrow) arrow.innerHTML = open ? '&#9660;' : '&#9654;'
+  }
+  if (open) loadGitInfo(rowEl.dataset.agent)
+}
+
 // Master toggle: clicking the project header collapses every open view and
 // remembers which were open, so a second click restores the prior layout.
 function masterToggleRow(rowEl) {
@@ -222,24 +234,28 @@ function masterToggleRow(rowEl) {
   const settingsOpen = !!rowEl.querySelector('.directive-content.open')
   const historyOpen = !!rowEl.querySelector('.history-content.open')
   const notesOpen = !!rowEl.querySelector('.notes-content.open')
-  const anyOpen = chatsOpen || settingsOpen || historyOpen || notesOpen
+  const gitOpen = !!rowEl.querySelector('.git-content.open')
+  const anyOpen = chatsOpen || settingsOpen || historyOpen || notesOpen || gitOpen
   if (anyOpen) {
     rowEl.dataset.prevOpen = [
       chatsOpen ? 'chats' : '',
       settingsOpen ? 'settings' : '',
       historyOpen ? 'history' : '',
       notesOpen ? 'notes' : '',
+      gitOpen ? 'git' : '',
     ].filter(Boolean).join(',')
     if (chatsOpen) setChatsOpen(rowEl, false)
     if (settingsOpen) setSettingsOpen(rowEl, false)
     if (historyOpen) setHistoryOpen(rowEl, false)
     if (notesOpen) setNotesOpen(rowEl, false)
+    if (gitOpen) setGitOpen(rowEl, false)
   } else {
     const prev = (rowEl.dataset.prevOpen || 'chats').split(',')
     if (prev.includes('chats')) setChatsOpen(rowEl, true)
     if (prev.includes('settings')) setSettingsOpen(rowEl, true)
     if (prev.includes('history')) setHistoryOpen(rowEl, true)
     if (prev.includes('notes')) setNotesOpen(rowEl, true)
+    if (prev.includes('git')) setGitOpen(rowEl, true)
   }
 }
 
@@ -265,11 +281,15 @@ function ensureAgent(name) {
       <span class="project-row-name">${escapeHtml(projectLabel(name))}</span>
       <span class="project-row-dir" id="dir-${sid}" data-action="show-project-info" role="button" tabindex="0" title="Click to show tracking IDs"></span>
       <span class="project-row-port" id="port-${sid}"></span>
+      <select id="hmsel-${sid}" data-action="header-model" title="AI model — switching restarts the supervisor for this project" style="background:#0f0f1a;border:1px solid #333;color:#aaa;font-size:10px;padding:1px 4px;border-radius:3px;max-width:160px;margin-left:6px;">
+        <option value="">(default)</option>
+      </select>
       <div class="project-row-badges">
-        <button class="project-row-iconbtn iconbtn-pause" data-action="pause" aria-label="Pause supervisor" title="Pause supervisor after current cycle completes (click again to resume)">&#9208;</button>
+        <button class="project-row-iconbtn iconbtn-pause" data-action="pause" aria-label="Pause supervisor" title="Pause / resume supervisor. When paused, the supervisor finishes its current cycle and then stops running new ones until you click again. The worker agent stays alive; your chat messages still reach it.">&#9208;</button>
         <span class="agent-badge" id="branchbadge-${sid}" style="display:none;background:#1e293b;color:#10b981;font-size:9px;margin-right:4px;"></span>
-        <button class="project-row-iconbtn iconbtn-merge" data-action="merge" aria-label="Merge branch into main" title="Merge the agent's isolated git branch back into the main branch">&#8631;</button>
-        <button class="project-row-iconbtn iconbtn-remove" data-action="remove" aria-label="Remove project" title="Stop supervisor, kill agent process, and remove this project">&#10005;</button>
+        <button class="project-row-iconbtn iconbtn-pushpr" data-action="push-and-pr" aria-label="Push agent branch and open pull request" title="Push the agent's branch to GitHub and open a pull request against your repo's default branch. Safe to click repeatedly — the same PR is reused until it's merged or closed. Requires GITHUB_TOKEN in .env.">&#8599;</button>
+        <button class="project-row-iconbtn iconbtn-merge" data-action="merge" aria-label="Merge agent branch locally" title="Merge the agent's branch into your local default branch — no push to GitHub, no PR. Use this when you're working locally and just want the agent's commits on your main/master. Pause the supervisor first.">&#8631;</button>
+        <button class="project-row-iconbtn iconbtn-remove" data-action="remove" aria-label="Remove project" title="Stop the supervisor, kill the worker agent process, and remove this project from the orchestrator. The project's files and git history on disk are not touched.">&#10005;</button>
       </div>
     </div>
     <div class="directive-section">
@@ -283,8 +303,11 @@ function ensureAgent(name) {
         <button class="row-toggle" data-action="toggle-history" aria-expanded="false" title="Show/hide directive revision history">
           <span class="row-toggle-arrow">&#9654;</span>History
         </button>
-        <button class="row-toggle" data-action="toggle-notes" aria-expanded="false" title="Show/hide behavioral notes, project notes, and session memory">
-          <span class="row-toggle-arrow">&#9654;</span>Notes
+        <button class="row-toggle" data-action="toggle-notes" aria-expanded="false" title="Show/hide worker–supervisor behavioral notes captured for orchestrator analysis, plus project notes and session memory. Distinct from ordinary progress notes — these are a durable record of how the pair behaves so the orchestrator can learn and self-upgrade.">
+          <span class="row-toggle-arrow">&#9654;</span>Behavioral Notes
+        </button>
+        <button class="row-toggle" data-action="toggle-git" aria-expanded="false" title="Show/hide git and GitHub settings: origin URL, agent branch, base branch, ahead/behind counts, open PR, and actions (Push & PR, merge, delete remote branch)">
+          <span class="row-toggle-arrow">&#9654;</span>Git/GitHub
         </button>
       </div>
       <div class="directive-content" id="dcontent-${sid}">
@@ -317,6 +340,9 @@ function ensureAgent(name) {
       </div>
       <div class="notes-content" id="dnotesc-${sid}">
         <div id="dnotes-${sid}" style="max-height:280px;overflow-y:auto;"><em style="color:#555;">Loading notes...</em></div>
+      </div>
+      <div class="git-content" id="dgitc-${sid}">
+        <div id="dgit-${sid}" style="max-height:420px;overflow-y:auto;padding:4px 2px;"><em style="color:#555;">Loading git info...</em></div>
       </div>
     </div>
     <div class="project-row-body">
@@ -374,6 +400,14 @@ function ensureAgent(name) {
   const commentInput = row.querySelector('#dcmt-' + sid)
   if (commentInput) commentInput.addEventListener('keydown', function(e) { if (e.key === 'Enter') sendComment(name) })
 
+  // Header model picker: native change event (click delegation ignores it via data-action).
+  // Changing a model restarts the supervisor for that project via the /model endpoint.
+  const headerSel = row.querySelector('#hmsel-' + sid)
+  if (headerSel) {
+    headerSel.addEventListener('click', function(e) { e.stopPropagation() })
+    headerSel.addEventListener('change', function() { saveHeaderModel(name) })
+  }
+
   // Event delegation for all data-action buttons (no inline onclick).
   // Buttons inside .directive-section (row-toggles, drawer-tabs, save-directive,
   // save-model) bubble up here. masterToggleRow is attached to
@@ -390,8 +424,15 @@ function ensureAgent(name) {
         case 'toggle-chats': setChatsOpen(row, !row.classList.contains('open')); break
         case 'toggle-history': setHistoryOpen(row, !row.querySelector('.history-content.open')); break
         case 'toggle-notes': setNotesOpen(row, !row.querySelector('.notes-content.open')); break
+        case 'toggle-git': setGitOpen(row, !row.querySelector('.git-content.open')); break
+        case 'git-refresh': loadGitInfo(name); break
+        case 'git-save-base': saveBaseBranch(name); break
+        case 'git-push-pr': gitTabPushAndPR(name); break
+        case 'git-merge-local': gitTabMerge(name); break
+        case 'git-delete-remote': gitTabDeleteRemote(name); break
         case 'pause': togglePause(name); break
         case 'merge': mergeBranch(projectRows[name]?.projectId); break
+        case 'push-and-pr': pushAndOpenPR(projectRows[name]?.projectId, name); break
         case 'remove': removeProject(name); break
         case 'drawer-tab': switchDrawerTab(name, btn.dataset.tab, btn); break
         case 'save-model': saveModel(name); break
@@ -428,6 +469,7 @@ function ensureAgent(name) {
     branchBadge: row.querySelector('#branchbadge-' + sid),
     directiveText: row.querySelector('#dtxt-' + sid),
     modelSelect: row.querySelector('#msel-' + sid),
+    headerModelSelect: row.querySelector('#hmsel-' + sid),
     dirLabel: row.querySelector('#dir-' + sid),
     portLabel: row.querySelector('#port-' + sid),
     link: row.querySelector('#link-' + sid),
@@ -1179,8 +1221,21 @@ function applyProjectData(projects) {
     if (agent.directiveText && !agent.directiveText._userEdited) {
       agent.directiveText.value = proj.directive || ''
     }
-    if (agent.modelSelect && proj.model) {
-      agent.modelSelect.value = proj.model
+    if (proj.model) {
+      // If the persisted model isn't in the rebuilt provider-grouped list yet
+      // (e.g. legacy bare model names, provider not enabled, or models still
+      // loading), keep the value visible by injecting a transient option.
+      ;[agent.modelSelect, agent.headerModelSelect].forEach(function(sel) {
+        if (!sel) return
+        var hasOpt = Array.from(sel.options).some(function(o) { return o.value === proj.model })
+        if (!hasOpt) {
+          var ghost = document.createElement('option')
+          ghost.value = proj.model
+          ghost.textContent = proj.model + ' (current)'
+          sel.insertBefore(ghost, sel.firstChild.nextSibling)
+        }
+        sel.value = proj.model
+      })
     }
     // Update project-level status badge
     if (agent.projStatusBadge && proj.status) {
@@ -2071,6 +2126,31 @@ async function saveDirective(agentName, restart) {
   }
 }
 
+// Header-level model change — fires from the compact <select> in the row header.
+// Sends the same /model PUT and syncs the settings-drawer select so both views agree.
+async function saveHeaderModel(agentName) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) return
+  const model = agent.headerModelSelect?.value
+  if (!model) return // user picked the "(default)" placeholder — no-op
+  try {
+    const res = await apiFetch('/api/projects/' + agent.projectId + '/model', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model }),
+    })
+    const data = await res.json()
+    if (data.ok) {
+      if (agent.modelSelect) agent.modelSelect.value = model
+      addLogEntry(agent.supervisorLog, 'status', 'Model changed to: ' + model + '. Supervisor restarting...')
+    } else {
+      alert('Failed to change model: ' + (data.error || 'Unknown error'))
+    }
+  } catch (err) {
+    alert('Error changing model: ' + err)
+  }
+}
+
 async function saveModel(agentName) {
   const agent = projectRows[agentName]
   if (!agent || !agent.projectId) { alert('Project not found for ' + agentName); return }
@@ -2337,15 +2417,52 @@ async function loadHistory(agentName) {
   if (!histEl) return
   histEl.innerHTML = '<div style="color:#666;font-size:10px;">Loading...</div>'
   try {
-    const res = await fetch('/api/projects/' + agent.projectId + '/directive-history')
-    if (!res.ok) throw new Error('HTTP ' + res.status)
-    const history = await res.json()
-    if (!history || history.length === 0) {
+    // Fetch directive edits + git timeline events in parallel — rendered as
+    // two separate sections inside the History drawer so the user can see
+    // the project's full evolution (what they asked for, what git did).
+    const [histRes, tlRes] = await Promise.all([
+      fetch('/api/projects/' + agent.projectId + '/directive-history'),
+      fetch('/api/projects/' + agent.projectId + '/timeline'),
+    ])
+    if (!histRes.ok) throw new Error('HTTP ' + histRes.status)
+    const history = await histRes.json()
+    const timeline = tlRes.ok ? await tlRes.json() : []
+    if ((!history || history.length === 0) && (!timeline || timeline.length === 0)) {
       histEl.innerHTML = '<div style="color:#666;font-size:10px;">No history yet.</div>'
       return
     }
-    const reversed = [...history].reverse()
     let html = ''
+    if (timeline && timeline.length > 0) {
+      html += '<div style="color:#888;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin:2px 0 4px 6px;">Git transactions</div>'
+      const tlReversed = [...timeline].reverse()
+      for (const ev of tlReversed) {
+        const d = new Date(ev.timestamp)
+        const t = d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        const kindColor = ev.kind === 'cloned' ? '#60a5fa'
+          : ev.kind === 'branch-pushed' ? '#4ade80'
+          : ev.kind.startsWith('pull-request') ? '#a78bfa'
+          : ev.kind === 'branch-merged' ? '#4ade80'
+          : ev.kind === 'base-branch-changed' ? '#facc15'
+          : ev.kind === 'remote-branch-deleted' ? '#ef4444'
+          : '#888'
+        html += '<div style="border-left:2px solid #2a2a3a;padding:3px 0 4px 10px;margin-left:6px;font-size:10px;">'
+        html += '<div style="display:flex;align-items:center;gap:6px;">'
+        html += '<span style="color:' + kindColor + ';font-weight:600;font-size:9px;text-transform:uppercase;letter-spacing:0.04em;">' + escapeHtml(ev.kind) + '</span>'
+        html += '<span style="color:#555;">' + t + '</span>'
+        html += '</div>'
+        html += '<div style="color:#c0c0c0;line-height:1.4;">' + escapeHtml(ev.summary) + '</div>'
+        if (ev.details && ev.details.url) {
+          html += '<div style="font-size:9px;"><a href="' + escapeHtml(ev.details.url) + '" target="_blank" style="color:#6366f1;">' + escapeHtml(ev.details.url) + '</a></div>'
+        }
+        html += '</div>'
+      }
+      html += '<div style="color:#888;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.04em;margin:10px 0 4px 6px;">Directive edits</div>'
+    }
+    if (!history || history.length === 0) {
+      histEl.innerHTML = html || '<div style="color:#666;font-size:10px;">No history yet.</div>'
+      return
+    }
+    const reversed = [...history].reverse()
     for (let i = 0; i < reversed.length; i++) {
       const entry = reversed[i]
       const isLatest = i === 0
@@ -2435,32 +2552,52 @@ async function sendHistoryComment(agentName, historyIndex) {
   }
 }
 
-// Fetch available Ollama models and populate selects
-let ollamaModels = []
-async function refreshOllamaModels() {
-  try {
-    const res = await fetch('/api/ollama-models')
-    const data = await res.json()
-    ollamaModels = data.models || []
-    for (const [name, agent] of Object.entries(projectRows)) {
-      if (!agent.modelSelect) continue
-      const current = agent.modelSelect.value
-      while (agent.modelSelect.options.length > 1) agent.modelSelect.remove(1)
-      for (const m of ollamaModels) {
-        const opt = document.createElement('option')
-        opt.value = m.name
-        const params = m.parameterSize || ''
-        const quant = m.quantization || ''
-        const detail = [params, quant].filter(Boolean).join(', ')
-        opt.textContent = m.name + (detail ? ' (' + detail + ')' : '')
-        agent.modelSelect.appendChild(opt)
-      }
-      if (current) agent.modelSelect.value = current
+// Fetch available models from all enabled providers and populate per-project selects
+// and the add-project modal picker. Values are "provider:model" (e.g. "opencode-go:glm-5.1")
+// so parseModelRef routes correctly without falling back to Ollama; bare ollama models
+// stay bare because formatModelRef already strips the prefix for ollama.
+let availableModels = []
+function populateModelSelect(select, byProvider, { keepFirstOption = true } = {}) {
+  if (!select) return
+  const current = select.value
+  const keep = keepFirstOption ? 1 : 0
+  while (select.options.length > keep) select.remove(keep)
+  for (const [providerId, group] of byProvider) {
+    const og = document.createElement('optgroup')
+    og.label = group.providerName
+    for (const model of group.models) {
+      const opt = document.createElement('option')
+      // Ollama models go in bare (matching formatModelRef); others get provider prefix.
+      opt.value = providerId === 'ollama' ? model : providerId + ':' + model
+      opt.textContent = model
+      og.appendChild(opt)
     }
+    select.appendChild(og)
+  }
+  if (current) select.value = current
+}
+async function refreshAvailableModels() {
+  try {
+    const res = await fetch('/api/models')
+    const data = await res.json()
+    availableModels = data.models || []
+    // Group by provider for <optgroup> rendering
+    const byProvider = new Map()
+    for (const m of availableModels) {
+      if (!byProvider.has(m.provider)) byProvider.set(m.provider, { providerName: m.providerName, models: [] })
+      byProvider.get(m.provider).models.push(m.model)
+    }
+    // Per-project selects (settings drawer + header)
+    for (const [, agent] of Object.entries(projectRows)) {
+      populateModelSelect(agent.modelSelect, byProvider)
+      populateModelSelect(agent.headerModelSelect, byProvider)
+    }
+    // Add-project modal picker
+    populateModelSelect(document.getElementById('proj-model'), byProvider)
   } catch {}
 }
-refreshOllamaModels()
-setInterval(refreshOllamaModels, 60000)
+refreshAvailableModels()
+setInterval(refreshAvailableModels, 60000)
 
 // Remove project
 async function removeProject(agentName) {
@@ -2778,6 +2915,29 @@ function closeAddProject() {
   document.getElementById('proj-dir').value = ''
   document.getElementById('proj-name').value = ''
   document.getElementById('proj-directive').value = ''
+  const gitUrl = document.getElementById('proj-git-url')
+  if (gitUrl) gitUrl.value = ''
+  const hint = document.getElementById('proj-dir-mode-hint')
+  if (hint) hint.textContent = ''
+  const pm = document.getElementById('proj-model')
+  if (pm) pm.value = ''
+}
+
+// When a GitHub URL is filled, the "Project Folder" input switches meaning
+// from "path to existing repo" to "parent folder to clone into". The hint
+// text + placeholder swap so the user is never guessing which mode they're in.
+function updateAddProjectMode() {
+  const gitUrl = (document.getElementById('proj-git-url')?.value || '').trim()
+  const dirInput = document.getElementById('proj-dir')
+  const hint = document.getElementById('proj-dir-mode-hint')
+  if (!dirInput || !hint) return
+  if (gitUrl) {
+    hint.textContent = '(parent folder — the repo will be cloned as a subfolder here)'
+    dirInput.placeholder = 'C:\\Users\\you\\Workspace  (will create a new subfolder inside)'
+  } else {
+    hint.textContent = ''
+    dirInput.placeholder = 'C:\\Users\\you\\my-project'
+  }
 }
 
 function checkEmptyState() {
@@ -2792,17 +2952,42 @@ async function submitProject() {
   const dir = document.getElementById('proj-dir').value.trim()
   const name = document.getElementById('proj-name').value.trim()
   const directive = document.getElementById('proj-directive').value.trim()
-  if (!dir) { alert('Please enter a project folder path.'); return }
+  const model = document.getElementById('proj-model')?.value?.trim() || ''
+  const baseBranch = document.getElementById('proj-base-branch')?.value?.trim() || ''
+  const gitUrl = document.getElementById('proj-git-url')?.value?.trim() || ''
+  if (!dir) {
+    alert(gitUrl
+      ? 'Please enter a parent folder to clone the repo into.'
+      : 'Please enter a project folder path.')
+    return
+  }
 
   const btn = document.getElementById('proj-submit')
   btn.disabled = true
-  btn.textContent = 'Starting...'
+  btn.textContent = gitUrl ? 'Cloning...' : 'Starting...'
 
   try {
-    const res = await apiFetch('/api/projects', {
+    const endpoint = gitUrl ? '/api/projects/clone' : '/api/projects'
+    const payload = gitUrl
+      ? {
+          gitUrl,
+          parentDirectory: dir,
+          name: name || undefined,
+          directive: directive || undefined,
+          model: model || undefined,
+          baseBranch: baseBranch || undefined,
+        }
+      : {
+          directory: dir,
+          name: name || undefined,
+          directive: directive || undefined,
+          model: model || undefined,
+          baseBranch: baseBranch || undefined,
+        }
+    const res = await apiFetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ directory: dir, name: name || undefined, directive: directive || undefined }),
+      body: JSON.stringify(payload),
     })
     if (!res.ok) {
       alert('Failed to add project: server returned ' + res.status)
@@ -2816,6 +3001,8 @@ async function submitProject() {
       document.getElementById('proj-dir').value = ''
       document.getElementById('proj-name').value = ''
       document.getElementById('proj-directive').value = ''
+      const baseInput = document.getElementById('proj-base-branch')
+      if (baseInput) baseInput.value = ''
       // Clear removed-agents guard so new/re-added projects can appear
       removedAgents.clear()
       checkEmptyState()
@@ -2920,6 +3107,13 @@ document.getElementById('proj-dir').addEventListener('keydown', (e) => {
 document.getElementById('proj-name').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); submitProject() }
 })
+const projGitUrlEl = document.getElementById('proj-git-url')
+if (projGitUrlEl) {
+  projGitUrlEl.addEventListener('input', updateAddProjectMode)
+  projGitUrlEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); submitProject() }
+  })
+}
 
 // Close modal on Escape or overlay click
 addProjectModal.addEventListener('click', (e) => {
@@ -3175,6 +3369,25 @@ async function addOllamaModel(selectEl) {
 }
 
 async function toggleProvider(id, enabled) {
+  // Guardrail: when disabling, warn if any project currently routes to this provider.
+  // Without this, one click can silently break every supervisor pinned to e.g. opencode-go.
+  if (!enabled) {
+    try {
+      const usageRes = await fetch('/api/providers/' + id + '/usage')
+      if (usageRes.ok) {
+        const usage = await usageRes.json()
+        const users = usage.projects || []
+        if (users.length > 0) {
+          const list = users.map(function(p) { return '- ' + p.name + ' (' + p.model + ', ' + p.status + ')' }).join('\n')
+          const proceed = confirm(
+            'Disabling "' + id + '" will break these projects:\n\n' + list +
+            '\n\nTheir supervisors will fail to start until you pick a different model. Continue?'
+          )
+          if (!proceed) return
+        }
+      }
+    } catch { /* fall through — don't block on a usage-check failure */ }
+  }
   try {
     await apiFetch('/api/providers/' + id + '/enable', {
       method: 'POST',
@@ -3626,25 +3839,16 @@ setInterval(() => {
 
 // ---- Per-project branch & validation UI helpers ----
 async function mergeBranch(projectId) {
-  if (!confirm('Merge agent branch into main?')) return
-  // Find the merge button by looking for rows matching this projectId
-  let mergeBtn = null
-  for (const [name, agent] of Object.entries(projectRows)) {
-    if (agent.projectId === projectId) {
-      const row = document.getElementById('row-' + sanitizeId(name))
-      if (row) {
-        const btns = row.querySelectorAll('.project-row-remove')
-        for (const btn of btns) { if (btn.textContent.trim() === 'Merge') { mergeBtn = btn; break } }
-      }
-      break
-    }
-  }
-  if (mergeBtn) { mergeBtn.disabled = true; mergeBtn.textContent = 'Merging...' }
+  // Omit targetBranch so the server uses the project's configured baseBranch
+  // (set from the "Remote Default Branch" field in the Add Project modal) —
+  // hardcoding 'main' here would silently merge into the wrong place on
+  // repos whose default is master/develop/trunk.
+  if (!confirm('Merge agent branch into the project\'s base branch?')) return
   try {
     const res = await apiFetch('/api/projects/' + projectId + '/merge', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ targetBranch: 'main' }),
+      body: JSON.stringify({}),
     })
     const result = await res.json()
     if (result.success) {
@@ -3653,7 +3857,278 @@ async function mergeBranch(projectId) {
       showNotification('Merge failed: ' + (result.output || 'Unknown error'), 'error')
     }
   } catch (err) { showNotification('Merge error: ' + err, 'error') }
-  finally { if (mergeBtn) { mergeBtn.disabled = false; mergeBtn.textContent = 'Merge' } }
+}
+
+async function pushAndOpenPR(projectId, agentName) {
+  if (!projectId) { showNotification('Project not ready yet', 'error'); return }
+  const row = document.getElementById('row-' + sanitizeId(agentName))
+  const btn = row?.querySelector('[data-action="push-and-pr"]')
+  const prevTitle = btn?.getAttribute('title') || ''
+  if (btn) { btn.disabled = true; btn.setAttribute('title', 'Pushing and opening PR…') }
+  try {
+    const res = await apiFetch('/api/projects/' + projectId + '/push-and-pr', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    })
+    const data = await res.json()
+    if (!res.ok || data.error) {
+      showNotification('Push & PR failed: ' + (data.error || ('HTTP ' + res.status)), 'error')
+      return
+    }
+    if (data.pr && data.pr.url) {
+      const verb = data.pr.isNew ? 'Opened' : 'Updated'
+      showNotification(verb + ' PR #' + data.pr.number + ' — opening on GitHub', 'success')
+      window.open(data.pr.url, '_blank', 'noopener,noreferrer')
+    } else {
+      showNotification('Push & PR completed, but response missing PR URL', 'error')
+    }
+  } catch (err) {
+    showNotification('Push & PR error: ' + err, 'error')
+  } finally {
+    if (btn) { btn.disabled = false; btn.setAttribute('title', prevTitle) }
+  }
+}
+
+// -----------------------------------------------------------------------
+// Git/GitHub tab — renders read-only facts + editable base branch + actions.
+// Data flows: loadGitInfo() → GET /git-info → renderGitInfo() → DOM.
+// All mutations (save base, push+pr, merge, delete remote) re-call loadGitInfo.
+// -----------------------------------------------------------------------
+
+async function loadGitInfo(agentName) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) return
+  const sid = sanitizeId(agentName)
+  const host = document.getElementById('dgit-' + sid)
+  if (!host) return
+  host.innerHTML = '<em style="color:#555;">Loading git info…</em>'
+  try {
+    const res = await apiFetch('/api/projects/' + agent.projectId + '/git-info')
+    if (!res.ok) {
+      host.innerHTML = '<div style="color:#f66;">Failed to load git info (HTTP ' + res.status + ')</div>'
+      return
+    }
+    const info = await res.json()
+    gitInfoCache[agentName] = info
+    renderGitInfo(host, agentName, agent.projectId, info)
+  } catch (err) {
+    host.innerHTML = '<div style="color:#f66;">Git info error: ' + escapeHtml(String(err)) + '</div>'
+  }
+}
+
+// Client-side cache of the last GitInfo rendered per agent. Used by action
+// handlers (e.g. delete-remote) to make confirmation dialogs aware of current
+// state (like an open PR number) without re-fetching just for the dialog.
+const gitInfoCache = {}
+
+function renderGitInfo(host, agentName, projectId, info) {
+  const labelStyle = 'color:#888;font-size:10px;min-width:120px;display:inline-block;'
+  const valStyle = 'color:#ddd;font-family:monospace;font-size:11px;'
+  const rowStyle = 'display:flex;align-items:center;gap:6px;margin-bottom:4px;flex-wrap:wrap;'
+  const sectionStyle = 'border-top:1px solid #222;padding-top:8px;margin-top:8px;'
+
+  const originHtml = info.originUrl
+    ? '<span style="' + valStyle + '">' + escapeHtml(info.originUrl) + '</span>'
+    : '<span style="color:#f66;font-size:11px;">(no origin — not a git repo or no remote configured)</span>'
+
+  const repoHtml = (info.githubOwner && info.githubRepo)
+    ? '<span style="' + valStyle + '">' + escapeHtml(info.githubOwner) + '/' + escapeHtml(info.githubRepo) + '</span>'
+    : '<span style="color:#f90;font-size:11px;">(origin is not a GitHub URL — Push & PR will fail)</span>'
+
+  const agentBranchHtml = info.agentBranch
+    ? '<span style="' + valStyle + '">' + escapeHtml(info.agentBranch) + '</span>'
+      + (info.branchExistsOnRemote
+        ? ' <span style="color:#10b981;font-size:10px;">(exists on remote)</span>'
+        : ' <span style="color:#888;font-size:10px;">(not pushed yet)</span>')
+    : '<span style="color:#888;">(none)</span>'
+
+  const tokenHtml = info.tokenDetected
+    ? '<span style="color:#10b981;font-size:11px;">&#10003; GITHUB_TOKEN detected</span>'
+    : '<span style="color:#f90;font-size:11px;">&#9888; GITHUB_TOKEN not set — add it to .env to enable Push, PR, and remote-branch delete</span>'
+
+  // Ahead/behind visualization — colored to match severity.
+  const aheadColor = info.commitsAhead > 0 ? '#10b981' : '#666'
+  const behindColor = info.commitsBehind > 5 ? '#f66' : (info.commitsBehind > 0 ? '#f90' : '#666')
+  const aheadBehindHtml = (info.agentBranch && info.baseBranch)
+    ? '<span style="color:' + aheadColor + ';font-size:11px;">&#8593; ' + info.commitsAhead + ' ahead</span>'
+      + ' <span style="color:#666;font-size:11px;">·</span> '
+      + '<span style="color:' + behindColor + ';font-size:11px;">&#8595; ' + info.commitsBehind + ' behind</span>'
+      + ' <span style="color:#666;font-size:11px;">(vs ' + escapeHtml(info.baseBranch) + ')</span>'
+    : '<span style="color:#888;">—</span>'
+
+  const prHtml = info.openPullRequest
+    ? '<a href="' + escapeHtml(info.openPullRequest.url) + '" target="_blank" rel="noopener noreferrer" style="color:#8b8bff;font-size:11px;text-decoration:underline;">#'
+      + info.openPullRequest.number + ' (open on GitHub ↗)</a>'
+    : (info.tokenDetected && info.githubOwner
+        ? '<span style="color:#888;font-size:11px;">(no open PR for this branch)</span>'
+        : '<span style="color:#888;font-size:11px;">—</span>')
+
+  const feedbackCount = info.pendingPrFeedbackCount || 0
+  const lastCheckedHtml = info.lastPrFeedbackCheckAt
+    ? ' <span style="color:#666;font-size:10px;">(last ingested ' + escapeHtml(info.lastPrFeedbackCheckAt) + ')</span>'
+    : ' <span style="color:#666;font-size:10px;">(never ingested)</span>'
+  const feedbackHtml = info.openPullRequest
+    ? (feedbackCount > 0
+        ? '<span style="color:#f90;font-size:11px;" title="Unread reviewer comments/reviews. The supervisor will read these at the top of its next cycle.">&#128172; ' + feedbackCount + ' unread reviewer ' + (feedbackCount === 1 ? 'comment' : 'comments') + '</span>' + lastCheckedHtml
+        : '<span style="color:#10b981;font-size:11px;">&#10003; No unread reviewer feedback</span>' + lastCheckedHtml)
+    : '<span style="color:#888;font-size:11px;">—</span>'
+
+  // Stale-base warning: agent branch lags the base significantly.
+  const staleWarning = info.commitsBehind > 10
+    ? '<div style="margin-top:6px;padding:6px 8px;background:#2a1a1a;border-left:3px solid #f66;color:#fcc;font-size:11px;">'
+      + '&#9888; Agent branch is ' + info.commitsBehind + ' commits behind <code>' + escapeHtml(info.baseBranch || '') + '</code>. '
+      + 'Merging or opening a PR may surface many conflicts. Consider rebasing the agent branch from a terminal before proceeding.'
+      + '</div>'
+    : ''
+
+  // Build action buttons, disabling what's not possible in the current state.
+  const canPush = info.tokenDetected && info.githubOwner && info.agentBranch
+  const canMerge = info.agentBranch && info.baseBranch
+  const canDeleteRemote = info.tokenDetected && info.githubOwner && info.branchExistsOnRemote
+  const btnBase = 'background:#1a1a2e;border:1px solid #333;color:#ddd;padding:5px 10px;border-radius:3px;cursor:pointer;font-size:11px;'
+  const btnDisabled = 'background:#0f0f17;border:1px solid #222;color:#555;padding:5px 10px;border-radius:3px;cursor:not-allowed;font-size:11px;'
+
+  host.innerHTML = ''
+    + '<div style="' + rowStyle + '"><span style="' + labelStyle + '">Origin URL:</span>' + originHtml + '</div>'
+    + '<div style="' + rowStyle + '"><span style="' + labelStyle + '">GitHub repo:</span>' + repoHtml + '</div>'
+    + '<div style="' + rowStyle + '"><span style="' + labelStyle + '">Agent branch:</span>' + agentBranchHtml + '</div>'
+    + '<div style="' + rowStyle + '"><span style="' + labelStyle + '">Ahead / Behind:</span>' + aheadBehindHtml + '</div>'
+    + '<div style="' + rowStyle + '"><span style="' + labelStyle + '">Open PR:</span>' + prHtml + '</div>'
+    + '<div style="' + rowStyle + '"><span style="' + labelStyle + '">Reviewer feedback:</span>' + feedbackHtml + '</div>'
+    + '<div style="' + rowStyle + '"><span style="' + labelStyle + '">Token:</span>' + tokenHtml + '</div>'
+    + staleWarning
+    + '<div style="' + sectionStyle + '">'
+      + '<div style="' + rowStyle + '">'
+        + '<span style="' + labelStyle + '" title="The branch on GitHub that the agent\'s work merges into. Usually main or master.">Base branch:</span>'
+        + '<input type="text" id="gbase-' + sanitizeId(agentName) + '" value="' + escapeHtml(info.baseBranch || '') + '" placeholder="main" '
+          + 'title="The branch on GitHub that the agent\'s work should merge into. Change carefully — the agent branch was cut from the old value and may be stale relative to the new one." '
+          + 'style="background:#0f0f1a;border:1px solid #333;color:#ddd;padding:4px 6px;border-radius:3px;font-family:monospace;font-size:11px;width:180px;">'
+        + '<button data-action="git-save-base" style="' + btnBase + '" title="Save the base branch. This becomes the target for Push & PR and local Merge. Does not touch any git state — only updates the orchestrator\'s setting.">Save</button>'
+        + '<button data-action="git-refresh" style="' + btnBase + 'margin-left:auto;" title="Re-fetch this tab\'s data. Use after you\'ve pushed or merged from a terminal.">&#8635; Refresh</button>'
+      + '</div>'
+    + '</div>'
+    + '<div style="' + sectionStyle + '">'
+      + '<div style="color:#888;font-size:10px;margin-bottom:6px;">Actions</div>'
+      + '<div style="display:flex;gap:6px;flex-wrap:wrap;">'
+        + '<button data-action="git-push-pr" ' + (canPush ? '' : 'disabled ')
+          + 'style="' + (canPush ? btnBase : btnDisabled) + '" '
+          + 'title="Push the agent branch to origin and open (or reuse) a pull request into the base branch. Idempotent — safe to click repeatedly.">'
+          + '&#8599; Push &amp; PR</button>'
+        + '<button data-action="git-merge-local" ' + (canMerge ? '' : 'disabled ')
+          + 'style="' + (canMerge ? btnBase : btnDisabled) + '" '
+          + 'title="Merge the agent branch into the base branch LOCALLY (no push to GitHub, no PR). Pause the supervisor first — merging while it\'s running can corrupt the working tree.">'
+          + '&#8631; Merge locally</button>'
+        + '<button data-action="git-delete-remote" ' + (canDeleteRemote ? '' : 'disabled ')
+          + 'style="' + (canDeleteRemote ? btnBase : btnDisabled) + '" '
+          + 'title="Delete the agent branch on GitHub (origin/' + escapeHtml(info.agentBranch || '') + '). Local branch is left intact. Typical use: cleanup after the PR was merged.">'
+          + '&#10005; Delete remote branch</button>'
+      + '</div>'
+    + '</div>'
+}
+
+async function saveBaseBranch(agentName) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) return
+  const input = document.getElementById('gbase-' + sanitizeId(agentName))
+  if (!input) return
+  const value = input.value.trim()
+  if (!value) { showNotification('Base branch cannot be empty', 'error'); return }
+  try {
+    const res = await apiFetch('/api/projects/' + agent.projectId + '/base-branch', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baseBranch: value }),
+    })
+    const data = await res.json()
+    if (!res.ok || data.error) {
+      showNotification('Save failed: ' + (data.error || ('HTTP ' + res.status)), 'error')
+      return
+    }
+    showNotification('Base branch saved: ' + value, 'success')
+    const host = document.getElementById('dgit-' + sanitizeId(agentName))
+    if (host && data.gitInfo) renderGitInfo(host, agentName, agent.projectId, data.gitInfo)
+  } catch (err) {
+    showNotification('Save error: ' + err, 'error')
+  }
+}
+
+// Disables every action button inside a project's Git/GitHub tab while a
+// request is in flight, so a double-click or a second action fired before the
+// first finishes can't submit a duplicate mutation. Returns a restore fn.
+function disableGitTabActions(agentName, pendingLabel) {
+  const sid = sanitizeId(agentName)
+  const host = document.getElementById('dgit-' + sid)
+  if (!host) return () => {}
+  const buttons = host.querySelectorAll('button[data-action]')
+  const prev = []
+  buttons.forEach((b) => {
+    prev.push({ btn: b, disabled: b.disabled, title: b.getAttribute('title') || '' })
+    b.disabled = true
+    if (pendingLabel) b.setAttribute('title', pendingLabel)
+  })
+  return () => {
+    prev.forEach(({ btn, disabled, title }) => {
+      btn.disabled = disabled
+      if (title) btn.setAttribute('title', title)
+    })
+  }
+}
+
+async function gitTabPushAndPR(agentName) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) return
+  // Confirmation with explicit target — safer than the header button's quick-tap.
+  const originEl = document.querySelector('#dgit-' + sanitizeId(agentName))
+  const originText = originEl?.querySelector('span[style*="font-family:monospace"]')?.textContent || 'origin'
+  const baseInput = document.getElementById('gbase-' + sanitizeId(agentName))
+  const base = baseInput?.value.trim() || 'main'
+  if (!confirm('Push the agent branch to ' + originText + ' and open a PR into ' + base + '?\n\nSafe to click repeatedly — the same PR is reused until merged or closed.')) return
+  const restore = disableGitTabActions(agentName, 'Pushing and opening PR…')
+  try {
+    await pushAndOpenPR(agent.projectId, agentName)
+    loadGitInfo(agentName)  // refresh to surface the new PR link
+  } finally { restore() }
+}
+
+async function gitTabMerge(agentName) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) return
+  const baseInput = document.getElementById('gbase-' + sanitizeId(agentName))
+  const base = baseInput?.value.trim() || 'main'
+  if (!confirm('Merge the agent branch into ' + base + ' LOCALLY (no push to GitHub)?\n\nMake sure the supervisor is paused — merging while it\'s running can corrupt the working tree.')) return
+  const restore = disableGitTabActions(agentName, 'Merging…')
+  try {
+    await mergeBranch(agent.projectId)
+    loadGitInfo(agentName)
+  } finally { restore() }
+}
+
+async function gitTabDeleteRemote(agentName) {
+  const agent = projectRows[agentName]
+  if (!agent || !agent.projectId) return
+  const info = document.getElementById('dgit-' + sanitizeId(agentName))
+  const branch = info?.querySelector('span[style*="font-family:monospace"]')?.textContent || 'agent branch'
+  // Surface the PR number in the confirmation if one is open — deleting the
+  // branch on GitHub auto-closes the PR, which is destructive and easy to miss.
+  const cached = gitInfoCache[agentName]
+  const prWarning = (cached && cached.openPullRequest)
+    ? '\n\n⚠ PR #' + cached.openPullRequest.number + ' is currently OPEN on this branch. Deleting the remote branch will auto-close the PR. If you still want to keep the PR open for review, cancel this action.'
+    : ''
+  if (!confirm('Delete origin/' + branch + ' on GitHub?\n\nLocal branch stays. Typical use: cleanup after the PR was merged. This cannot be undone from the dashboard.' + prWarning)) return
+  const restore = disableGitTabActions(agentName, 'Deleting remote branch…')
+  try {
+    const res = await apiFetch('/api/projects/' + agent.projectId + '/remote-branch', { method: 'DELETE' })
+    const data = await res.json()
+    if (!res.ok || data.error || data.success === false) {
+      showNotification('Delete failed: ' + (data.error || data.output || ('HTTP ' + res.status)), 'error')
+      return
+    }
+    showNotification('Remote branch deleted', 'success')
+    loadGitInfo(agentName)
+  } catch (err) {
+    showNotification('Delete error: ' + err, 'error')
+  } finally { restore() }
 }
 
 // -----------------------------------------------------------------------

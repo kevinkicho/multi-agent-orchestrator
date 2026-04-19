@@ -307,13 +307,15 @@ body.light .row-toggle:hover { background: #e8e8f0; border-color: #bbb; }
 body.light .row-toggle-arrow { color: #999; }
 .directive-content,
 .history-content,
-.notes-content {
+.notes-content,
+.git-content {
   display: none;
   margin-top: 4px;
 }
 .directive-content.open,
 .history-content.open,
-.notes-content.open { display: block; }
+.notes-content.open,
+.git-content.open { display: block; }
 
 /* Drawer tabs */
 .drawer-tabs {

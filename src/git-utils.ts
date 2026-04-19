@@ -171,6 +171,23 @@ export async function gitListBranches(cwd: string, pattern?: string): Promise<st
   }
 }
 
+/** Extract `{ owner, repo }` from a GitHub remote URL. Returns `null` for
+ *  non-GitHub URLs or unparseable input. Accepts both HTTPS and SSH forms:
+ *    - https://github.com/owner/repo(.git)?
+ *    - http(s)://github.com/owner/repo(.git)?
+ *    - git@github.com:owner/repo(.git)?
+ *    - ssh://git@github.com/owner/repo(.git)? */
+export function parseGithubRemote(url: string): { owner: string; repo: string } | null {
+  // Matches both `github.com/owner/repo` (https/ssh-URL forms) and
+  // `github.com:owner/repo` (scp-style git@github.com:owner/repo).
+  const match = url.match(/github\.com[/:]([^/:\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i)
+  if (!match) return null
+  const owner = match[1]!.trim()
+  const repo = match[2]!.trim()
+  if (!owner || !repo) return null
+  return { owner, repo }
+}
+
 /** Count commits on `head` that are not on `base` (i.e. how far `head` is ahead of `base`).
  *  Returns 0 if either ref is missing or the comparison fails. */
 export async function gitCommitsAhead(cwd: string, base: string, head: string): Promise<number> {
@@ -181,4 +198,10 @@ export async function gitCommitsAhead(cwd: string, base: string, head: string): 
   } catch {
     return 0
   }
+}
+
+/** Count commits on `base` that aren't on `head` — i.e. how far `head` is behind `base`.
+ *  Mirror of gitCommitsAhead; useful when asking "is the agent branch stale vs base?" */
+export async function gitCommitsBehind(cwd: string, base: string, head: string): Promise<number> {
+  return gitCommitsAhead(cwd, head, base)
 }

@@ -412,3 +412,140 @@ describe("Dashboard API endpoints", () => {
     expect(events.length).toBe(500)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Project + provider routing endpoints. These don't spin up a real
+// ProjectManager (heavy — spawns opencode per project); they use a narrow mock
+// that captures addProject calls and returns canned listProjects() data. That
+// keeps the tests fast while still exercising the HTTP layer end-to-end.
+// ---------------------------------------------------------------------------
+
+describe("Project + provider routing endpoints", () => {
+  let server: { stop: () => void }
+  let apiToken: string
+  let addProjectCalls: Array<{ directory: string; directive: string; name?: string; opts?: any }>
+  let mockProjects: Array<{ id: string; name: string; model?: string; status: string }>
+  const port = 14568
+
+  beforeAll(async () => {
+    const log = new DashboardLog()
+    const orchestrator = createMockOrchestrator()
+    addProjectCalls = []
+    mockProjects = []
+
+    const fakeProjectManager: any = {
+      listProjects: () => mockProjects,
+      getProject: (id: string) => mockProjects.find(p => p.id === id),
+      async addProject(directory: string, directive: string, name?: string, _restore?: any, opts?: any) {
+        addProjectCalls.push({ directory, directive, name, opts })
+        const project = { id: "test-proj-1", name: name ?? "test", model: opts?.model, status: "starting" }
+        mockProjects.push(project)
+        return project
+      },
+      async removeProject() {},
+      async restoreProjects() { return { restored: [], failed: [] } },
+      async getSavedProjects() { return [] },
+    }
+
+    server = await startDashboard(orchestrator, log, port, {
+      projectManager: fakeProjectManager,
+      eventBus: new EventBus(),
+      resourceManager: new ResourceManager(2),
+    })
+    const html = await (await fetch(`http://127.0.0.1:${port}/`)).text()
+    apiToken = html.match(/window\.__API_TOKEN__="([^"]+)"/)?.[1] ?? ""
+  })
+
+  afterAll(() => { server?.stop() })
+
+  const base = `http://127.0.0.1:${port}`
+
+  // --- addProject model pinning (task #6) ---
+  test("POST /api/projects forwards model to addProject opts", async () => {
+    addProjectCalls.length = 0
+    const res = await fetch(`${base}/api/projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-API-Token": apiToken },
+      body: JSON.stringify({
+        directory: "/tmp/test-dir",
+        directive: "do the thing",
+        name: "test-proj",
+        model: "openai:gpt-4o",
+      }),
+    })
+    expect(res.status).toBe(200)
+    expect(addProjectCalls).toHaveLength(1)
+    expect(addProjectCalls[0]!.opts?.model).toBe("openai:gpt-4o")
+    expect(addProjectCalls[0]!.directory).toBe("/tmp/test-dir")
+  })
+
+  test("POST /api/projects omits model when client sends empty string", async () => {
+    addProjectCalls.length = 0
+    await fetch(`${base}/api/projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-API-Token": apiToken },
+      body: JSON.stringify({ directory: "/tmp/other", model: "" }),
+    })
+    expect(addProjectCalls).toHaveLength(1)
+    // Empty string → undefined so resolveDefaultModel kicks in at supervisor start
+    expect(addProjectCalls[0]!.opts?.model).toBeUndefined()
+  })
+
+  test("POST /api/projects omits model when client omits the field", async () => {
+    addProjectCalls.length = 0
+    await fetch(`${base}/api/projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-API-Token": apiToken },
+      body: JSON.stringify({ directory: "/tmp/no-model" }),
+    })
+    expect(addProjectCalls).toHaveLength(1)
+    expect(addProjectCalls[0]!.opts?.model).toBeUndefined()
+  })
+
+  // --- /api/providers/:id/usage (task #7) ---
+  test("GET /api/providers/:id/usage lists projects pinned to the provider", async () => {
+    mockProjects.length = 0
+    mockProjects.push(
+      { id: "p1", name: "alpha", model: "openai:gpt-4o", status: "supervising" },
+      { id: "p2", name: "beta", model: "anthropic:claude-sonnet", status: "running" },
+      { id: "p3", name: "gamma", model: "openai:gpt-4o-mini", status: "stopped" },
+    )
+    const res = await fetch(`${base}/api/providers/openai/usage`)
+    expect(res.status).toBe(200)
+    const data = await res.json() as { providerId: string; projects: Array<{ id: string; name: string; model: string }> }
+    expect(data.providerId).toBe("openai")
+    expect(data.projects).toHaveLength(2)
+    expect(data.projects.map(p => p.name).sort()).toEqual(["alpha", "gamma"])
+  })
+
+  test("GET /api/providers/:id/usage returns empty list when no project uses it", async () => {
+    mockProjects.length = 0
+    mockProjects.push({ id: "p1", name: "alpha", model: "openai:gpt-4o", status: "supervising" })
+    const res = await fetch(`${base}/api/providers/groq/usage`)
+    expect(res.status).toBe(200)
+    const data = await res.json() as { projects: any[] }
+    expect(data.projects).toEqual([])
+  })
+
+  test("GET /api/providers/:id/usage skips projects with no model pinned", async () => {
+    mockProjects.length = 0
+    mockProjects.push(
+      { id: "p1", name: "unpinned", status: "supervising" }, // no model field
+      { id: "p2", name: "pinned", model: "openai:gpt-4o", status: "supervising" },
+    )
+    const res = await fetch(`${base}/api/providers/openai/usage`)
+    const data = await res.json() as { projects: Array<{ name: string }> }
+    expect(data.projects.map(p => p.name)).toEqual(["pinned"])
+  })
+
+  test("GET /api/providers/:id/usage parses bare ollama model names correctly", async () => {
+    mockProjects.length = 0
+    mockProjects.push(
+      { id: "p1", name: "ollama-project", model: "llama3:8b", status: "supervising" },
+    )
+    const res = await fetch(`${base}/api/providers/ollama/usage`)
+    const data = await res.json() as { projects: Array<{ name: string }> }
+    // Bare model strings (no provider prefix) route to ollama via parseModelRef
+    expect(data.projects.map(p => p.name)).toEqual(["ollama-project"])
+  })
+})

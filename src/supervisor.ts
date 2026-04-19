@@ -41,6 +41,35 @@ import {
 
 type Message = { role: "system" | "user" | "assistant"; content: string }
 
+/** Narrow shape of a PR feedback item the supervisor injects into the prompt.
+ *  Kept local so supervisor.ts doesn't depend on github-api.ts — the adapter
+ *  in project-manager maps the full type down to this. */
+export type PullRequestFeedbackForPrompt = {
+  kind: "issue-comment" | "review" | "review-comment"
+  author: string
+  createdAt: string
+  body: string
+  url: string
+  path?: string
+  line?: number
+  state?: string
+}
+
+/** Render one PR feedback item as a compact bullet for the cycle prompt.
+ *  Truncates long bodies so a single reviewer essay can't blow the context
+ *  budget — the URL is included so the supervisor can ask the worker to
+ *  fetch the full thread if needed. */
+function formatPrFeedbackForPrompt(f: PullRequestFeedbackForPrompt): string {
+  const MAX_BODY = 600
+  const body = f.body.length > MAX_BODY ? `${f.body.slice(0, MAX_BODY)}… (truncated)` : f.body
+  const label = f.kind === "review"
+    ? `@${f.author} submitted a review${f.state ? ` (${f.state})` : ""}`
+    : f.kind === "review-comment"
+      ? `@${f.author} commented on ${f.path ?? "?"}${f.line ? `:${f.line}` : ""}`
+      : `@${f.author} commented on the PR`
+  return `- ${label} — ${f.url}\n  > ${body.replace(/\n/g, "\n  > ")}`
+}
+
 export type ProjectRole = {
   /** The primary coding agent for this project */
   coder: string
@@ -92,6 +121,14 @@ export type AgentSupervisorConfig = {
   onSupervisorStop?: (agentName: string, summary: string, isFailure: boolean, reason?: string) => void
   /** Callback to get unread user comments on the directive */
   getUnreadComments?: () => string[]
+  /** Callback to fetch any unread PR review feedback (comments, reviews,
+   *  review-comments) since the last cycle. Returns a pre-sorted list; caller
+   *  (project-manager) handles cursor persistence via onPrFeedbackConsumed. */
+  getPendingPrFeedback?: () => Promise<PullRequestFeedbackForPrompt[]>
+  /** Called with the ISO timestamp of the newest PR feedback item the
+   *  supervisor was shown, so the project can advance its cursor. Fires once
+   *  per cycle, immediately after getPendingPrFeedback returns non-empty. */
+  onPrFeedbackConsumed?: (latestIso: string) => void
   /** Max cycles before this supervisor exits (for sequential rotation). 0 = unlimited. */
   maxCycles?: number
   /** Callback fired after each CYCLE_DONE with the supervisor's summary (used by TeamManager) */
@@ -859,6 +896,20 @@ export async function runAgentSupervisor(
       ? `\n## User feedback\nThe human user left you a message:\n${unreadComments.map(c => `> "${c}"`).join("\n")}\nThink about what they're telling you and how it should shape your approach.`
       : ""
 
+    // Check for unread PR review feedback on the agent's open pull request
+    const prFeedback = (await config.getPendingPrFeedback?.()) ?? []
+    const prFeedbackBlock = prFeedback.length > 0
+      ? `\n## Reviewer feedback on your pull request\nHumans have left ${prFeedback.length} new comment${prFeedback.length === 1 ? "" : "s"} on the open PR for this branch. Read them carefully — these are the reviewers telling you what to change before this can merge.\n${prFeedback.map(f => formatPrFeedbackForPrompt(f)).join("\n")}\nThink about what the reviewers are asking for and decide how to respond: fix the code, push back with reasoning, or ask a clarifying question.`
+      : ""
+    if (prFeedback.length > 0) {
+      const newest = prFeedback[prFeedback.length - 1]!.createdAt
+      config.onPrFeedbackConsumed?.(newest)
+      config.dashboardLog?.push({
+        type: "brain-thinking",
+        text: `[${agentName}] Injected ${prFeedback.length} PR feedback item${prFeedback.length === 1 ? "" : "s"} into cycle ${cycleCount}`,
+      })
+    }
+
     // Inject other agents' declared work intents so this supervisor can avoid overlap
     const intentSummary = config.resourceManager?.formatIntentSummary(agentName) ?? ""
     const intentBlock = intentSummary && !intentSummary.includes("(no other agents")
@@ -903,6 +954,7 @@ export async function runAgentSupervisor(
       memoryContext ? `\n## Memory from previous cycles\n${memoryContext}` : "",
       resumeBlock,
       commentBlock,
+      prFeedbackBlock,
       intentBlock,
       capabilityBlock,
       `\nDirective: ${directive}`,

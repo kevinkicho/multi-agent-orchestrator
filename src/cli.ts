@@ -11,6 +11,22 @@ import { extractLastAssistantText, formatRecentMessages } from "./message-utils"
 import { formatThought, C } from "./tui-format"
 import { detectCrash, initSessionState, markCleanShutdown, formatCrashReport, tryLiberatePort } from "./session-state"
 import { recordPrompt } from "./prompt-ledger"
+import { resolveDefaultModel } from "./providers"
+
+/**
+ * Resolves the brain/team/supervisor model when there is no per-project
+ * preference: explicit `brain.model` from orchestrator.json wins, then the
+ * first enabled provider's first model. Throws when nothing is routable so
+ * callers fail loudly instead of silently defaulting to Ollama.
+ */
+async function resolveBrainModel(brainConfig: { model?: string }): Promise<string> {
+  if (brainConfig.model) return brainConfig.model
+  const fallback = await resolveDefaultModel()
+  if (fallback) return fallback
+  throw new Error(
+    "No model configured. Set brain.model in orchestrator.json or enable a provider with at least one model in the LLM Providers tab.",
+  )
+}
 
 /** Tunable supervisor limits — all optional with sensible defaults */
 type SupervisorLimits = {
@@ -69,6 +85,18 @@ type ConfigFile = {
   cyclesPerRotation?: number
   /** Teams mode configuration (only used when mode = "teams") */
   team?: TeamConfigFile
+  /** Security scoping for worker processes. */
+  security?: {
+    /** Controls whether GITHUB_TOKEN / GH_TOKEN are forwarded to worker shells.
+     *  - "full" (default for backwards compatibility): token is passed in spawn env,
+     *    so the worker can run `gh`, authenticated `git push`, etc. directly.
+     *  - "none": token is stripped from spawn env. All GitHub operations flow
+     *    through the ProjectManager (Push & PR button, PR feedback loop). Strongly
+     *    recommended — reduces blast radius if a worker is compromised or prompt-
+     *    injected, since the token can no longer be used to push to arbitrary
+     *    repos, force-push, or open issues across your account. */
+    workerGithubAccess?: "none" | "full"
+  }
 }
 
 function loadConfigFile(): ConfigFile | null {
@@ -96,7 +124,10 @@ function parseArgs(): {
   verbose: boolean
   dashboardPort: number
   mode: "projects" | "teams"
-  brain: { model: string; ollamaUrl: string }
+  /** Legacy brain config: `model` may be undefined when orchestrator.json omits it —
+   *  per-project models + resolveDefaultModel() provide the fallback. `ollamaUrl` is
+   *  still required for Ollama-specific warmup and local model listing. */
+  brain: { model?: string; ollamaUrl: string }
   supervisor: SupervisorLimits
   projects?: Record<string, { coder: string; reviewer?: string }>
   scheduling: "parallel" | "sequential"
@@ -104,6 +135,7 @@ function parseArgs(): {
   cyclesPerRotation: number
   team?: TeamConfigFile
   tui: boolean
+  security: { workerGithubAccess: "none" | "full" }
 } {
   const args = process.argv.slice(2)
   let autoApprove = false
@@ -164,7 +196,21 @@ function parseArgs(): {
     dashboardPort: dashboardPortExplicit ? dashboardPort : (fileConfig?.dashboardPort ?? dashboardPort),
     mode: fileConfig?.mode ?? "projects",
     brain: {
-      model: fileConfig?.brain?.model ?? "glm-5.1:cloud",
+      // `model` is optional now: project-manager resolves per-project models first, then
+      // falls back to resolveDefaultModel() (first enabled provider's first model).
+      // Older orchestrator.json files that still set brain.model are honored as a
+      // last-resort fallback inside project-manager; emit a one-time deprecation
+      // notice so users know to remove it and migrate to per-project pins.
+      model: (() => {
+        if (fileConfig?.brain?.model) {
+          console.warn(
+            `${C.brightYellow}[config] orchestrator.json sets a legacy "brain.model" (${fileConfig.brain.model}). ` +
+            `This field is deprecated — set per-project models from the dashboard and remove brain.model to let ` +
+            `resolveDefaultModel() pick the first enabled provider.${C.reset}`,
+          )
+        }
+        return fileConfig?.brain?.model
+      })(),
       ollamaUrl: fileConfig?.brain?.ollamaUrl ?? "http://127.0.0.1:11434",
     },
     supervisor: fileConfig?.supervisor ?? {},
@@ -174,6 +220,9 @@ function parseArgs(): {
     cyclesPerRotation: fileConfig?.cyclesPerRotation ?? 2,
     team: fileConfig?.team,
     tui,
+    security: {
+      workerGithubAccess: fileConfig?.security?.workerGithubAccess ?? "none",
+    },
   }
 }
 
@@ -201,7 +250,7 @@ function statusIcon(status: string): string {
 }
 
 async function main() {
-  const { agents, autoApprove, verbose, dashboardPort, mode, brain: brainConfig, supervisor: supervisorLimits, projects, scheduling, concurrency, cyclesPerRotation, team: teamConfig, tui } = parseArgs()
+  const { agents, autoApprove, verbose, dashboardPort, mode, brain: brainConfig, supervisor: supervisorLimits, projects, scheduling, concurrency, cyclesPerRotation, team: teamConfig, tui, security } = parseArgs()
 
   // Dashboard event log — shared between orchestrator callbacks and the web UI
   const dashLog = new DashboardLog()
@@ -411,7 +460,7 @@ async function main() {
   const resourceManager = new ResourceManager(20) // max 20 concurrent LLM calls (supports up to 10 projects)
 
   // ProjectManager — handles dynamic agent provisioning from the dashboard
-  const projectManager = new ProjectManager(orchestrator, dashLog, brainConfig, supervisorLimits, eventBus, resourceManager)
+  const projectManager = new ProjectManager(orchestrator, dashLog, brainConfig, supervisorLimits, eventBus, resourceManager, security)
 
   // REPL reader — declared early so handleCommand can re-prompt after background brain tasks
   let reader: any = null
@@ -518,6 +567,18 @@ async function main() {
       try {
         const result = await projectManager.mergeAgentBranch(project.id, target)
         return { ok: result.success, output: result.success ? `Merged into ${target}` : `Merge failed: ${result.output}` }
+      } catch (err) { return { ok: false, error: String(err) } }
+    }
+
+    if (trimmed.startsWith("push ")) {
+      const parts = trimmed.slice(5).trim().split(/\s+/)
+      const idOrName = parts[0]!
+      const setUpstream = parts.includes("-u") || parts.includes("--set-upstream")
+      const project = findProject(idOrName)
+      if (!project) return { ok: false, error: `Unknown project: ${idOrName}` }
+      try {
+        const result = await projectManager.pushAgentBranch(project.id, { setUpstream })
+        return { ok: result.success, output: result.success ? `Pushed ${projectManager.getAgentBranch(project.id)} to origin` : `Push failed: ${result.output}` }
       } catch (err) { return { ok: false, error: String(err) } }
     }
 
@@ -718,9 +779,10 @@ async function main() {
 
         const { runParallelSupervisors } = await import("./supervisor")
         try {
+          const resolvedModel = await resolveBrainModel(brainConfig)
           await runParallelSupervisors(orchestrator, {
             ollamaUrl: brainConfig.ollamaUrl,
-            model: brainConfig.model,
+            model: resolvedModel,
             directive: activeDirective,
             cyclePauseSeconds: supervisorLimits.cyclePauseSeconds ?? 30,
             maxRoundsPerCycle: supervisorLimits.maxRoundsPerCycle ?? 12,
@@ -791,9 +853,21 @@ async function main() {
         console.log(`${C.dim}Type "stop" for soft stop, Ctrl+C for hard stop.${C.reset}\n`)
 
         const { TeamManager } = await import("./team-manager")
+        let resolvedModel: string
+        try {
+          resolvedModel = await resolveBrainModel(brainConfig)
+        } catch (err) {
+          console.error(`${C.brightRed}Team manager error:${C.reset} ${err}`)
+          dashLog.push({ type: "brain-status", status: "idle" })
+          activeSoftStop = null
+          brainRunning = false
+          process.removeListener("SIGINT", stopLoop)
+          try { reader?.prompt() } catch {}
+          return
+        }
         const tm = new TeamManager(orchestrator, {
           ollamaUrl: brainConfig.ollamaUrl,
-          model: brainConfig.model,
+          model: resolvedModel,
           goal: goalOverride || teamConfig!.goal,
           members: teamConfig!.members,
           managerIntervalSeconds: teamConfig!.managerIntervalSeconds,
@@ -894,9 +968,10 @@ async function main() {
         const queueSummary = formatQueueForPrompt(queue)
         let queueError: unknown = null
         try {
+          const resolvedModel = await resolveBrainModel(brainConfig)
           await runBrain(orchestrator, {
             ollamaUrl: brainConfig.ollamaUrl,
-            model: brainConfig.model,
+            model: resolvedModel,
             objective: `Work through the following task queue in order. Mark each task as done when completed.\n\n${queueSummary}`,
             maxRounds: 50,
             dashboardLog: dashLog,
@@ -932,9 +1007,10 @@ async function main() {
         const { runBrain } = await import("./brain")
         let brainError: unknown = null
         try {
+          const resolvedModel = await resolveBrainModel(brainConfig)
           await runBrain(orchestrator, {
             ollamaUrl: brainConfig.ollamaUrl,
-            model: brainConfig.model,
+            model: resolvedModel,
             objective,
             maxRounds: 50,
             dashboardLog: dashLog,
@@ -1019,6 +1095,26 @@ async function main() {
     process.exit(1)
   }
 
+  // Startup guardrail: audit saved project model pins against the current provider
+  // registry so misrouted projects surface in the dashboard log immediately, not
+  // on first supervisor spin-up.
+  projectManager.auditSavedProjectModels().then(issues => {
+    if (issues.length > 0) {
+      console.warn(`${C.brightYellow}[startup] ${issues.length} project(s) pinned to unavailable models — see dashboard for details.${C.reset}`)
+    }
+  }).catch(() => {})
+
+  // Confirm to the user whether a GitHub token is in scope — makes it obvious
+  // when .env is missing/stale without needing to test a push to find out.
+  if (process.env.GITHUB_TOKEN) {
+    if (security.workerGithubAccess === "full") {
+      console.log(`${C.dim}[startup] GITHUB_TOKEN detected — workers inherit it (workerGithubAccess="full"). A prompt-injected worker could push to any repo this token can reach.${C.reset}`)
+      console.log(`${C.dim}[startup] Tip: remove the "full" override from orchestrator.json to scope the token to the orchestrator only.${C.reset}`)
+    } else {
+      console.log(`${C.dim}[startup] GITHUB_TOKEN detected — scoped to orchestrator only (workers will NOT see the token; GitHub ops flow through the Push & PR button).${C.reset}`)
+    }
+  }
+
   // --- Session heartbeat — updates PID file every 30s so crash detection has fresh timestamps ---
   const { updateSessionHeartbeat } = await import("./session-state")
   const heartbeatTimer = setInterval(() => {
@@ -1089,6 +1185,8 @@ async function main() {
   helpCmd("projects", "List active projects")
   helpCmd("project add <dir> [name]", "Add a project (spawns agent + supervisor)")
   helpCmd("project remove <id>", "Remove a project")
+  helpCmd("merge <project> [target]", "Merge the project's agent branch into target (default: main)")
+  helpCmd("push <project> [-u]", "Push the project's agent branch to origin (requires GITHUB_TOKEN)")
   helpCmd("tasks", "Show task queue")
   helpCmd("task add <title>", "Add a task to the queue")
   helpCmd("status", "Show agent status")

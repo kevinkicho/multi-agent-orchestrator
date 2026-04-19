@@ -1184,32 +1184,60 @@ export class ProjectManager {
     return { success, output }
   }
 
-  /** Run a git command with a GitHub PAT injected via GIT_CONFIG_* env vars — the
-   *  token stays out of argv, reflog, and on-disk config. Same pattern GitHub
-   *  Actions uses for its checkout step. Shared by push / delete-remote. */
+  /** Run a git command with a GitHub PAT injected as an HTTP Basic auth
+   *  extraheader. Same pattern GitHub Actions uses for its checkout step.
+   *  Shared by clone / push / delete-remote.
+   *
+   *  Design notes:
+   *   - Uses `-c` command-line form rather than GIT_CONFIG_* env vars. The
+   *     env-var mechanism fails on git 2.53.0.windows.1 + Bun spawn — the
+   *     extraheader never gets applied, git falls through to credential
+   *     helpers, and we hang on a hidden prompt. The -c form is what GitHub
+   *     Actions uses and works reliably across platforms.
+   *   - Uses `Basic base64(x-access-token:PAT)` rather than `token PAT`.
+   *     GitHub has effectively deprecated the `token` scheme for extraheader
+   *     auth — only `Basic` is accepted now.
+   *   - Passes `credential.helper=` (empty) to suppress Git Credential Manager
+   *     on Windows, which otherwise runs in parallel with our extraheader and
+   *     opens a hidden browser OAuth flow that blocks forever.
+   *   - Sets `GIT_TERMINAL_PROMPT=0` so any remaining auth failure surfaces as
+   *     an error rather than blocking on stdin.
+   *   - Redacts the token from stdout/stderr before returning `output`, so
+   *     it can't leak into dashboard logs or timeline entries.
+   *
+   *  Tradeoff: the token appears in argv for the lifetime of the git process
+   *  (seconds). On a single-user dev box this is fine — same blast radius as
+   *  `actions/checkout` on GitHub-hosted runners. If multi-user isolation
+   *  becomes a requirement, revisit via a short-lived credential helper. */
   private async runGithubAuthenticatedGit(
     cwd: string,
     args: string[],
     token: string,
   ): Promise<{ success: boolean; output: string }> {
+    const basic = Buffer.from(`x-access-token:${token}`).toString("base64")
     const proc = spawn({
-      cmd: ["git", ...args],
+      cmd: [
+        "git",
+        "-c", "credential.helper=",
+        "-c", `http.https://github.com/.extraheader=AUTHORIZATION: basic ${basic}`,
+        ...args,
+      ],
       cwd,
       stdout: "pipe",
       stderr: "pipe",
-      env: {
-        ...process.env,
-        GIT_CONFIG_COUNT: "1",
-        GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
-        GIT_CONFIG_VALUE_0: `AUTHORIZATION: token ${token}`,
-      },
+      stdin: "ignore",
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
     })
     const [out, err] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
     ])
     const code = await proc.exited
-    const output = [out, err].filter(s => s.trim()).join("\n").trim()
+    const raw = [out, err].filter(s => s.trim()).join("\n").trim()
+    // Belt-and-braces redaction: the token SHOULDN'T appear in git's output,
+    // but if a malformed URL or config error echoes the argv, we scrub it so
+    // dashboard logs and timeline entries never carry a live credential.
+    const output = raw.replaceAll(token, "[REDACTED-GITHUB-TOKEN]").replaceAll(basic, "[REDACTED]")
     return { success: code === 0, output }
   }
 

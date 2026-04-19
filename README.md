@@ -159,6 +159,9 @@ Each project gets:
 - **URL parameter sanitization** -- Path-extracted parameters are decoded and stripped of path traversal sequences
 - **Restricted directory browsing** -- `/api/browse` blocks access to sensitive system paths
 - **CORS restrictions** -- Only `127.0.0.1` and `localhost` origins are accepted
+- **Worker token scoping** -- Workers run with `workerGithubAccess: "none"` by default, which strips `GITHUB_TOKEN` from the worker environment. Supervisor-initiated git operations (clone/push/merge) use the token via an injected HTTP extraheader — the token never lands in the worker shell or on disk. Set `workerGithubAccess: "full"` only if you need the worker itself to perform authenticated git.
+- **Pre-commit secret scanner** -- `scripts/check-secrets.ts` blocks commits containing GitHub PATs, API keys, and bearer tokens. Activate in a fresh clone with `git config core.hooksPath .githooks` (the tracked hook at `.githooks/pre-commit` then runs on every commit).
+- **Credential-helper isolation** -- On Windows, Git Credential Manager can shadow the injected auth header and hang the clone path on a hidden prompt. The orchestrator suppresses this via `-c credential.helper=` and `GIT_TERMINAL_PROMPT=0`, so cloning works identically regardless of the host's git credential config.
 
 ---
 
@@ -535,6 +538,25 @@ Performance events logged to `orchestrator-performance.json`: `supervisor_start`
 | `orchestrator-providers.json` | LLM provider configurations and API keys. |
 | `.orchestrator/checkpoints/` | Conversation checkpoint files per agent. |
 
+### Scripts and Hooks
+
+| Path | Description |
+|------|-------------|
+| `scripts/smoke-e2e.ts` | End-to-end smoke exercising clone → commit → push → merge → delete-remote against a local bare repo. Runs via `bun run smoke`. |
+| `scripts/check-secrets.ts` | Pattern-based secret scanner (GitHub PATs, Anthropic/OpenAI/Google/AWS keys, long bearer tokens). Runs on staged files via `bun run check-secrets -- --staged` or full-tree for audit. |
+| `.githooks/pre-commit` | Tracked pre-commit hook that invokes the secret scanner. Activate with `git config core.hooksPath .githooks`. |
+
+### Environment File
+
+`.env` (git-ignored) is the only place the orchestrator looks for sensitive values:
+
+| Variable | Purpose |
+|----------|---------|
+| `GITHUB_TOKEN` | Classic or fine-grained PAT for clone/push/merge against GitHub remotes. Used only by the supervisor via an injected extraheader; workers never see it unless `workerGithubAccess: "full"` is set. |
+| `OPENCODE_GO_API_KEY` | API key for the opencode-go OpenAI-compatible chat/completions endpoint (an optional LLM provider). |
+
+See `.env.example` for the full list of supported variables. None of them need to be set in order to run the dashboard and local Ollama supervision.
+
 ---
 
 ## API Endpoints
@@ -692,7 +714,7 @@ Persistent, queryable log of every prompt at every level of the orchestration hi
 ## Testing
 
 ```bash
-# Run all tests (417 tests across 25 files)
+# Run all tests (39 test files under src/tests/)
 bun test
 
 # Run a specific test file
@@ -700,6 +722,13 @@ bun test src/tests/dashboard-api.test.ts
 
 # Type check
 bun run typecheck
+
+# End-to-end smoke: clone/commit/push/merge against a local bare repo
+bun run smoke
+
+# Scan the working tree for committed secrets (also runs automatically
+# as a pre-commit hook when .githooks is activated)
+bun run check-secrets
 ```
 
 The test suite covers:

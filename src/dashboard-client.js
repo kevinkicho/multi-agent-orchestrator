@@ -2990,7 +2990,18 @@ async function submitProject() {
       body: JSON.stringify(payload),
     })
     if (!res.ok) {
-      alert('Failed to add project: server returned ' + res.status)
+      // Surface the server's error body — a bare "500" is unactionable, whereas
+      // the JSON body carries the underlying reason (missing token, worker
+      // spawn failure, etc). Fall back to the raw text if JSON parse fails.
+      let detail = ''
+      try {
+        const errBody = await res.json()
+        detail = errBody && typeof errBody.error === 'string' ? errBody.error : JSON.stringify(errBody)
+      } catch {
+        try { detail = await res.text() } catch { detail = '' }
+      }
+      console.error('[add-project] server ' + res.status + ':', detail)
+      alert('Failed to add project (HTTP ' + res.status + '):\n\n' + (detail || '(no response body)'))
       btn.disabled = false
       btn.textContent = 'Add Project'
       return

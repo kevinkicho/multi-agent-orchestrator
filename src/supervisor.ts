@@ -9,6 +9,7 @@ import {
   addProjectNote,
   addBehavioralNote,
   recordBehavioralNoteFires,
+  recordCycleOutcome,
   pruneAndPromoteBehavioralNotes,
   formatMemoryForPrompt,
   saveProgressAssessment,
@@ -191,6 +192,12 @@ export type AgentSupervisorConfig = {
    *  notes whose topic appears in the text get a fire[] entry for this cycle.
    *  Pure heuristic — no LLM call. Default: true. */
   fireTracking?: {
+    enabled?: boolean
+  }
+  /** Phase 4: record per-cycle outcome classification (success/partial/failure)
+   *  and use it to weight note promotion + trigger un-promotion of principles
+   *  that accumulate failure evidence after promotion. Default: true. */
+  outcomeWeighting?: {
     enabled?: boolean
   }
   /** Token usage tracker — records tokens per call for budget monitoring */
@@ -861,6 +868,7 @@ export async function runAgentSupervisor(
     const injectedEventIds = new Set<string>() // Dedup urgent bus events within a cycle
     let cycleStartCommit = "" // Capture commit at cycle start for false-progress detection
     let directiveChangedThisCycle = false // Track if @directive was used this cycle
+    let cycleHadFalseProgress = false // Phase 4: any false-progress warning downgrades cycle outcome
     let cycleValidationResult: { passed: boolean; command: string; exitCode: number; stdoutPreview: string } | null = null
     try { cycleStartCommit = await gitLatestCommit(directory) } catch { /* not a git repo */ }
     emit(`\n===== ${agentName} — CYCLE ${cycleCount} =====\n`)
@@ -1791,6 +1799,7 @@ Be specific with file paths, line numbers, and code snippets.`
                   const warning = `[WARNING] Your cycle summary claims progress but git shows no file changes and no new commits (last commit: ${latestCommit}). Please verify actual state before proceeding.`
                   messages.push({ role: "user", content: warning })
                   emit(`[false-progress] ${warning}`)
+                  cycleHadFalseProgress = true
                   config.eventBus?.emit({
                     type: "false-progress-warning",
                     source: "supervisor",
@@ -1896,6 +1905,18 @@ Be specific with file paths, line numbers, and code snippets.`
               }
             }
 
+            // Phase 4: record cycle outcome before emitting cycle-done so
+            // pruneAndPromote (which may run shortly after) sees this outcome.
+            if (config.outcomeWeighting?.enabled !== false) {
+              const outcome = cycleHadFalseProgress ? "failure" : "success"
+              const reason = cycleHadFalseProgress ? "done-false-progress" : "done"
+              try {
+                await recordCycleOutcome(agentName, cycleCount, outcome, reason)
+              } catch (err) {
+                console.error(`[${agentName}] Failed to record cycle outcome:`, err)
+              }
+            }
+
             // Emit cycle-done bus event
             config.eventBus?.emit({
               type: "cycle-done",
@@ -1917,6 +1938,18 @@ Be specific with file paths, line numbers, and code snippets.`
             config.resourceManager?.clearIntent(agentName)
             // Detect if this is a failure stop (mentions non-responsive, stuck, failure, cannot, etc.)
             const isFailure = /non-responsive|stuck|fail|cannot|unable|broken|crash|unresponsive|dead/i.test(cmd.summary)
+            // Phase 4: stop-with-failure = "failure"; clean stop = "partial".
+            if (config.outcomeWeighting?.enabled !== false) {
+              try {
+                await recordCycleOutcome(
+                  agentName, cycleCount,
+                  isFailure ? "failure" : "partial",
+                  isFailure ? "stop-failure" : "stop-partial",
+                )
+              } catch (err) {
+                console.error(`[${agentName}] Failed to record stop outcome:`, err)
+              }
+            }
             try {
               memory = await addMemoryEntry(memory, {
                 timestamp: Date.now(),
@@ -2189,6 +2222,20 @@ Be specific with file paths, line numbers, and code snippets.`
       // Feed results back to LLM
       if (results.length > 0) {
         messages.push({ role: "user", content: results.join("\n\n") })
+      }
+    }
+
+    // Phase 4: cycle exhausted rounds without @done or @stop — classify as
+    // "partial" (or "failure" if false-progress was raised). This is the only
+    // natural-exit path through the cycle loop that bypasses the @done/@stop
+    // outcome-recording sites above.
+    if (!cycleDone && !stopped && config.outcomeWeighting?.enabled !== false) {
+      try {
+        const outcome = cycleHadFalseProgress ? "failure" : "partial"
+        const reason = cycleHadFalseProgress ? "exhausted-false-progress" : "exhausted"
+        await recordCycleOutcome(agentName, cycleCount, outcome, reason)
+      } catch (err) {
+        console.error(`[${agentName}] Failed to record exhausted-cycle outcome:`, err)
       }
     }
 

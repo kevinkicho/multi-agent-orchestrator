@@ -47,6 +47,39 @@ export type BehavioralNotePromotionMarker = {
   clarified: boolean
 }
 
+/** Marker on notes un-promoted after accumulating failure evidence since
+ *  their promotion. Preserves the prior promotion context for audit so a
+ *  note can re-earn principle status later if the tide turns. */
+export type BehavioralNoteUnpromotionMarker = {
+  at: number
+  cycle: number
+  /** Count of failure-outcome fires observed since the note's promotion. */
+  failureFires: number
+  /** Count of success-outcome fires observed since the note's promotion. */
+  successFires: number
+  /** The promotedAt marker that was cleared — kept for audit. */
+  priorPromotion: BehavioralNotePromotionMarker
+}
+
+/** Cycle outcome — the coarse classification assigned when a cycle ends.
+ *  Drives evidence-weighted promotion and un-promotion of behavioral notes.
+ *
+ *    "success" — @done reached cleanly (no false-progress raised that cycle).
+ *    "partial" — cycle ended without clear success or failure (stop without
+ *                failure language, or cycle loop exhausted).
+ *    "failure" — @stop with failure language, or @done shadowed by false-progress. */
+export type CycleOutcome = "success" | "partial" | "failure"
+
+/** A single per-agent cycle outcome record. Keyed in-store by cycle number. */
+export type CycleOutcomeRecord = {
+  cycle: number
+  outcome: CycleOutcome
+  at: number
+  /** Short audit tag: "done", "done-false-progress", "stop-failure",
+   *  "stop-partial", "exhausted". */
+  reason: string
+}
+
 /** Structured behavioral note. Replaces the legacy `string` shape. */
 export type BehavioralNote = {
   id: string
@@ -57,6 +90,10 @@ export type BehavioralNote = {
   archivedAt?: BehavioralNoteArchiveMarker
   /** Set when the note has earned principle status via fire evidence. */
   promotedAt?: BehavioralNotePromotionMarker
+  /** Set when failure evidence since promotion triggers un-promotion.
+   *  Presence + absence of `promotedAt` means the note is back to
+   *  regular-note status but with an un-promotion audit trail. */
+  unpromotedAt?: BehavioralNoteUnpromotionMarker
 }
 
 export type BrainMemoryStore = {
@@ -73,6 +110,10 @@ export type BrainMemoryStore = {
   archivedBehavioralNotes?: Record<string, BehavioralNote[]>
   /** Per-agent progress assessments from the progress assessor, cap 10 each */
   progressAssessments?: Record<string, ProgressAssessment[]>
+  /** Per-agent, per-cycle outcome classifications used for weighting note
+   *  promotion/un-promotion evidence. Capped to the most recent 100 cycles
+   *  per agent. Missing entries default to "partial" when resolving. */
+  cycleOutcomes?: Record<string, Record<number, CycleOutcomeRecord>>
 }
 
 export type AgentMemoryArchive = {
@@ -367,6 +408,42 @@ function capBehavioralNotes(notes: BehavioralNote[]): BehavioralNote[] {
   return notes.filter(n => n.promotedAt || keptRegularIds.has(n.id))
 }
 
+/** Record the outcome classification for a completed cycle. Atomic; caps the
+ *  per-agent outcome map to the most recent CYCLE_OUTCOMES_CAP_PER_AGENT
+ *  entries so the store doesn't grow unbounded across long sessions. */
+export async function recordCycleOutcome(
+  agentName: string,
+  cycle: number,
+  outcome: CycleOutcome,
+  reason: string,
+): Promise<BrainMemoryStore> {
+  return withWriteLock(async () => {
+    const fresh = await loadBrainMemory()
+    const existing = fresh.cycleOutcomes?.[agentName] ?? {}
+    const nextRecord: CycleOutcomeRecord = { cycle, outcome, at: Date.now(), reason }
+    const merged: Record<number, CycleOutcomeRecord> = { ...existing, [cycle]: nextRecord }
+
+    // Cap: keep only the most recent N cycles per agent.
+    const cycleNums = Object.keys(merged).map(Number).sort((a, b) => a - b)
+    let capped: Record<number, CycleOutcomeRecord> = merged
+    if (cycleNums.length > CYCLE_OUTCOMES_CAP_PER_AGENT) {
+      const keep = cycleNums.slice(-CYCLE_OUTCOMES_CAP_PER_AGENT)
+      capped = {}
+      for (const c of keep) capped[c] = merged[c]!
+    }
+
+    const result: BrainMemoryStore = {
+      ...fresh,
+      cycleOutcomes: {
+        ...(fresh.cycleOutcomes ?? {}),
+        [agentName]: capped,
+      },
+    }
+    await saveBrainMemory(result)
+    return result
+  })
+}
+
 /** Record that one or more behavioral notes fired in a given cycle. Updates
  *  the `fires[]` trace for each matched note and persists atomically. */
 export async function recordBehavioralNoteFires(
@@ -416,6 +493,12 @@ export async function recordBehavioralNoteFires(
 export const PROMOTE_FIRE_COUNT_THRESHOLD = 3
 export const PROMOTE_DISTINCT_CYCLES_THRESHOLD = 2
 export const ARCHIVE_THRESHOLD_CYCLES = 20
+/** Minimum number of failure-outcome fires since promotion that triggers
+ *  un-promotion, provided failures outnumber successes in the same window. */
+export const UNPROMOTE_FAILURE_THRESHOLD = 3
+/** Per-agent cap on how many cycle outcomes we retain. Older outcomes are
+ *  dropped; fires that reference those cycles fall back to "partial". */
+export const CYCLE_OUTCOMES_CAP_PER_AGENT = 100
 
 export type NoteClarifier = (input: {
   noteText: string
@@ -425,15 +508,101 @@ export type NoteClarifier = (input: {
 export type PruneAndPromoteResult = {
   promoted: BehavioralNote[]
   archived: BehavioralNote[]
+  unpromoted: BehavioralNote[]
 }
 
-/** Should this note be promoted based on fire evidence? */
-export function shouldPromote(note: BehavioralNote): boolean {
+/** Outcome-weighted breakdown of a note's fires. */
+export type OutcomeEvidence = {
+  /** Fires whose cycle outcome was "success". */
+  successFires: number
+  /** Fires whose cycle outcome was "partial" OR unknown (legacy fires / cycles
+   *  whose outcome was dropped from the cap). */
+  partialFires: number
+  /** Fires whose cycle outcome was "failure". */
+  failureFires: number
+  /** Total fires across all outcomes. */
+  totalFires: number
+  /** Distinct cycles the note fired in. */
+  distinctCycles: number
+  /** Counts restricted to fires AFTER the note's most recent promotion. Used
+   *  for un-promotion — we only care about evidence observed while the note
+   *  was acting as a principle. */
+  successSincePromotion: number
+  failureSincePromotion: number
+  /** Total fires since promotion (includes partial/unknown). */
+  firesSincePromotion: number
+}
+
+/** Resolve the outcome map for an agent from a store. Missing cycles default
+ *  to "partial" at the callsite; this helper just returns the subset we know. */
+export function getOutcomesForAgent(
+  store: BrainMemoryStore,
+  agentName: string,
+): Record<number, CycleOutcome> {
+  const records = store.cycleOutcomes?.[agentName] ?? {}
+  const out: Record<number, CycleOutcome> = {}
+  for (const key of Object.keys(records)) {
+    const rec = records[Number(key)]
+    if (rec) out[rec.cycle] = rec.outcome
+  }
+  return out
+}
+
+/** Compute outcome-weighted evidence for a note against a cycle→outcome map.
+ *  Missing or unknown outcomes count as "partial". Exported for tests. */
+export function computeOutcomeEvidence(
+  note: BehavioralNote,
+  outcomesByCycle: Record<number, CycleOutcome>,
+): OutcomeEvidence {
+  const ev: OutcomeEvidence = {
+    successFires: 0, partialFires: 0, failureFires: 0,
+    totalFires: note.fires.length,
+    distinctCycles: new Set(note.fires.map(f => f.cycle)).size,
+    successSincePromotion: 0, failureSincePromotion: 0, firesSincePromotion: 0,
+  }
+  const promotedCycle = note.promotedAt?.cycle ?? null
+  for (const fire of note.fires) {
+    const outcome = outcomesByCycle[fire.cycle] ?? "partial"
+    if (outcome === "success") ev.successFires++
+    else if (outcome === "failure") ev.failureFires++
+    else ev.partialFires++
+    if (promotedCycle !== null && fire.cycle > promotedCycle) {
+      ev.firesSincePromotion++
+      if (outcome === "success") ev.successSincePromotion++
+      else if (outcome === "failure") ev.failureSincePromotion++
+    }
+  }
+  return ev
+}
+
+/** Should this note be promoted based on outcome-weighted fire evidence?
+ *  Requires: ≥3 total fires (relevance), ≥2 distinct cycles (spread), and
+ *  successes ≥ failures (net-non-negative outcome signal). Pre-Phase-4
+ *  notes with no recorded outcomes read as all-partial and behave exactly
+ *  like Phase 2 — backward-compatible. */
+export function shouldPromote(
+  note: BehavioralNote,
+  outcomesByCycle: Record<number, CycleOutcome>,
+): boolean {
   if (note.promotedAt) return false
   if (note.archivedAt) return false
-  if (note.fires.length < PROMOTE_FIRE_COUNT_THRESHOLD) return false
-  const distinctCycles = new Set(note.fires.map(f => f.cycle)).size
-  return distinctCycles >= PROMOTE_DISTINCT_CYCLES_THRESHOLD
+  const ev = computeOutcomeEvidence(note, outcomesByCycle)
+  if (ev.totalFires < PROMOTE_FIRE_COUNT_THRESHOLD) return false
+  if (ev.distinctCycles < PROMOTE_DISTINCT_CYCLES_THRESHOLD) return false
+  return ev.successFires >= ev.failureFires
+}
+
+/** Should a promoted note be un-promoted because failure evidence has
+ *  accumulated since its promotion and outweighs success evidence? */
+export function shouldUnpromote(
+  note: BehavioralNote,
+  outcomesByCycle: Record<number, CycleOutcome>,
+): boolean {
+  if (!note.promotedAt) return false
+  if (note.archivedAt) return false
+  const ev = computeOutcomeEvidence(note, outcomesByCycle)
+  if (ev.failureSincePromotion < UNPROMOTE_FAILURE_THRESHOLD) return false
+  return ev.failureSincePromotion > ev.successSincePromotion
 }
 
 /** Should this note be archived based on cycle age + lack of fires? */
@@ -459,14 +628,17 @@ export async function pruneAndPromoteBehavioralNotes(
   // so a concurrent write can't lose our work.
   const snapshot = await loadBrainMemory()
   const snapshotNotes = snapshot.behavioralNotes?.[agentName] ?? []
+  const outcomesByCycle = getOutcomesForAgent(snapshot, agentName)
   const pendingPromotions: Array<{ id: string; clarified?: string }> = []
   const pendingArchives = new Set<string>()
+  const pendingUnpromotions = new Set<string>()
   for (const note of snapshotNotes) {
-    if (shouldPromote(note)) pendingPromotions.push({ id: note.id })
+    if (shouldPromote(note, outcomesByCycle)) pendingPromotions.push({ id: note.id })
+    else if (shouldUnpromote(note, outcomesByCycle)) pendingUnpromotions.add(note.id)
     else if (shouldArchive(note, currentCycle)) pendingArchives.add(note.id)
   }
-  if (pendingPromotions.length === 0 && pendingArchives.size === 0) {
-    return { promoted: [], archived: [] }
+  if (pendingPromotions.length === 0 && pendingArchives.size === 0 && pendingUnpromotions.size === 0) {
+    return { promoted: [], archived: [], unpromoted: [] }
   }
 
   // Run the optional LLM clarifier outside the write lock — one call per
@@ -489,15 +661,19 @@ export async function pruneAndPromoteBehavioralNotes(
   return withWriteLock(async () => {
     const fresh = await loadBrainMemory()
     const activeNotes = fresh.behavioralNotes?.[agentName] ?? []
-    if (activeNotes.length === 0) return { promoted: [], archived: [] }
+    if (activeNotes.length === 0) return { promoted: [], archived: [], unpromoted: [] }
+    // Re-resolve outcomes under the lock so a concurrent recordCycleOutcome
+    // can't flip our decision after we validated.
+    const freshOutcomes = getOutcomesForAgent(fresh, agentName)
 
     const promotionMap = new Map(pendingPromotions.map(p => [p.id, p.clarified]))
     const promoted: BehavioralNote[] = []
     const archived: BehavioralNote[] = []
+    const unpromoted: BehavioralNote[] = []
     const keptActive: BehavioralNote[] = []
 
     for (const note of activeNotes) {
-      if (promotionMap.has(note.id) && shouldPromote(note)) {
+      if (promotionMap.has(note.id) && shouldPromote(note, freshOutcomes)) {
         const clarified = promotionMap.get(note.id)
         const updated: BehavioralNote = {
           ...note,
@@ -509,7 +685,25 @@ export async function pruneAndPromoteBehavioralNotes(
             clarified: Boolean(clarified),
           },
         }
+        // Clearing any stale unpromotedAt when re-promoting later is intentional.
+        delete (updated as { unpromotedAt?: unknown }).unpromotedAt
         promoted.push(updated)
+        keptActive.push(updated)
+      } else if (pendingUnpromotions.has(note.id) && shouldUnpromote(note, freshOutcomes)) {
+        const ev = computeOutcomeEvidence(note, freshOutcomes)
+        const priorPromotion = note.promotedAt!
+        const updated: BehavioralNote = {
+          ...note,
+          unpromotedAt: {
+            at: now,
+            cycle: currentCycle,
+            failureFires: ev.failureSincePromotion,
+            successFires: ev.successSincePromotion,
+            priorPromotion,
+          },
+        }
+        delete (updated as { promotedAt?: unknown }).promotedAt
+        unpromoted.push(updated)
         keptActive.push(updated)
       } else if (pendingArchives.has(note.id) && shouldArchive(note, currentCycle)) {
         const updated: BehavioralNote = {
@@ -522,9 +716,9 @@ export async function pruneAndPromoteBehavioralNotes(
       }
     }
 
-    if (promoted.length === 0 && archived.length === 0) {
+    if (promoted.length === 0 && archived.length === 0 && unpromoted.length === 0) {
       // Everything we planned got cancelled by a concurrent write — exit clean.
-      return { promoted: [], archived: [] }
+      return { promoted: [], archived: [], unpromoted: [] }
     }
 
     const existingArchived = fresh.archivedBehavioralNotes?.[agentName] ?? []
@@ -543,7 +737,7 @@ export async function pruneAndPromoteBehavioralNotes(
       },
     }
     await saveBrainMemory(result)
-    return { promoted, archived }
+    return { promoted, archived, unpromoted }
   })
 }
 

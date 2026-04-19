@@ -15,11 +15,18 @@ import {
   loadBrainMemory,
   addBehavioralNote,
   recordBehavioralNoteFires,
+  recordCycleOutcome,
   pruneAndPromoteBehavioralNotes,
   shouldPromote,
   shouldArchive,
+  shouldUnpromote,
+  computeOutcomeEvidence,
+  getOutcomesForAgent,
   ARCHIVE_THRESHOLD_CYCLES,
+  UNPROMOTE_FAILURE_THRESHOLD,
+  CYCLE_OUTCOMES_CAP_PER_AGENT,
   type BehavioralNote,
+  type CycleOutcome,
 } from "../brain-memory"
 import { matchFiresInText } from "../fire-tracker"
 
@@ -207,27 +214,31 @@ describe("shouldPromote / shouldArchive predicates", () => {
     ...opts,
   })
 
+  // Empty outcomes map → every fire treated as "partial" (backward-compatible
+  // baseline that preserves Phase 2 behavior).
+  const noOutcomes = {}
+
   test("promotes with 3 fires across 2 cycles", () => {
     const n = mkNote({
       fires: [
         { cycle: 1, at: 1 }, { cycle: 1, at: 2 }, { cycle: 2, at: 3 },
       ],
     })
-    expect(shouldPromote(n)).toBe(true)
+    expect(shouldPromote(n, noOutcomes)).toBe(true)
   })
 
   test("does not promote with 3 fires all in same cycle", () => {
     const n = mkNote({
       fires: [{ cycle: 5, at: 1 }, { cycle: 5, at: 2 }, { cycle: 5, at: 3 }],
     })
-    expect(shouldPromote(n)).toBe(false)
+    expect(shouldPromote(n, noOutcomes)).toBe(false)
   })
 
   test("does not promote with only 2 fires", () => {
     const n = mkNote({
       fires: [{ cycle: 1, at: 1 }, { cycle: 2, at: 2 }],
     })
-    expect(shouldPromote(n)).toBe(false)
+    expect(shouldPromote(n, noOutcomes)).toBe(false)
   })
 
   test("archives after threshold with zero fires", () => {
@@ -256,7 +267,7 @@ describe("shouldPromote / shouldArchive predicates", () => {
       cycle: 1,
       promotedAt: { at: 1, cycle: 2, originalText: "t", clarified: false },
     })
-    expect(shouldPromote(n)).toBe(false)
+    expect(shouldPromote(n, noOutcomes)).toBe(false)
     expect(shouldArchive(n, 100)).toBe(false)
   })
 
@@ -265,7 +276,7 @@ describe("shouldPromote / shouldArchive predicates", () => {
       archivedAt: { at: 1, cycle: 2, reason: "no-fires" },
       fires: [{ cycle: 3, at: 1 }, { cycle: 4, at: 2 }, { cycle: 5, at: 3 }],
     })
-    expect(shouldPromote(n)).toBe(false)
+    expect(shouldPromote(n, noOutcomes)).toBe(false)
     expect(shouldArchive(n, 100)).toBe(false)
   })
 })
@@ -347,7 +358,7 @@ describe("pruneAndPromoteBehavioralNotes", () => {
     const store = await loadBrainMemory()
     await addBehavioralNote(store, "agent", "recent note", { source: "manual", cycle: 5 })
     const result = await pruneAndPromoteBehavioralNotes("agent", 6)
-    expect(result).toEqual({ promoted: [], archived: [] })
+    expect(result).toEqual({ promoted: [], archived: [], unpromoted: [] })
   })
 
   test("promoted notes survive the non-promoted -10 cap", async () => {
@@ -370,5 +381,274 @@ describe("pruneAndPromoteBehavioralNotes", () => {
     expect(active.find(n => n.id === targetId)).toBeDefined()
     // Non-promoted cap = 10; plus the 1 promoted = 11 total
     expect(active.length).toBeLessThanOrEqual(11)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 4: outcome recording, outcome-weighted evidence, un-promotion
+// ---------------------------------------------------------------------------
+
+describe("recordCycleOutcome", () => {
+  test("persists outcome atomically and is retrievable", async () => {
+    await recordCycleOutcome("agent", 3, "success", "done")
+    const mem = await loadBrainMemory()
+    const rec = mem.cycleOutcomes?.agent?.[3]
+    expect(rec?.outcome).toBe("success")
+    expect(rec?.reason).toBe("done")
+    expect(rec?.cycle).toBe(3)
+  })
+
+  test("later outcome for the same cycle overwrites the earlier one", async () => {
+    await recordCycleOutcome("agent", 5, "success", "done")
+    await recordCycleOutcome("agent", 5, "failure", "done-false-progress")
+    const mem = await loadBrainMemory()
+    expect(mem.cycleOutcomes?.agent?.[5]?.outcome).toBe("failure")
+    expect(mem.cycleOutcomes?.agent?.[5]?.reason).toBe("done-false-progress")
+  })
+
+  test("caps the outcome map at CYCLE_OUTCOMES_CAP_PER_AGENT", async () => {
+    for (let c = 1; c <= CYCLE_OUTCOMES_CAP_PER_AGENT + 10; c++) {
+      await recordCycleOutcome("agent", c, "partial", "exhausted")
+    }
+    const mem = await loadBrainMemory()
+    const outcomes = mem.cycleOutcomes?.agent ?? {}
+    const cycles = Object.keys(outcomes).map(Number).sort((a, b) => a - b)
+    expect(cycles.length).toBe(CYCLE_OUTCOMES_CAP_PER_AGENT)
+    // Dropped cycles are the oldest; kept cycles are the most recent.
+    expect(cycles[0]).toBe(11)
+    expect(cycles.at(-1)).toBe(CYCLE_OUTCOMES_CAP_PER_AGENT + 10)
+  })
+
+  test("outcomes for different agents stay isolated", async () => {
+    await recordCycleOutcome("alice", 1, "success", "done")
+    await recordCycleOutcome("bob", 1, "failure", "stop-failure")
+    const mem = await loadBrainMemory()
+    expect(mem.cycleOutcomes?.alice?.[1]?.outcome).toBe("success")
+    expect(mem.cycleOutcomes?.bob?.[1]?.outcome).toBe("failure")
+  })
+})
+
+describe("computeOutcomeEvidence", () => {
+  const mkNote = (fires: Array<{ cycle: number; at: number }>, promotedCycle?: number): BehavioralNote => ({
+    id: "x", text: "t",
+    provenance: { source: "manual", cycle: 0, createdAt: 0 },
+    fires,
+    promotedAt: promotedCycle !== undefined
+      ? { at: 1, cycle: promotedCycle, originalText: "t", clarified: false }
+      : undefined,
+  })
+
+  test("splits fires by outcome; missing outcomes treated as partial", () => {
+    const outcomes: Record<number, CycleOutcome> = { 1: "success", 2: "failure" }
+    const note = mkNote([
+      { cycle: 1, at: 1 }, { cycle: 2, at: 2 }, { cycle: 3, at: 3 },
+    ])
+    const ev = computeOutcomeEvidence(note, outcomes)
+    expect(ev.successFires).toBe(1)
+    expect(ev.failureFires).toBe(1)
+    expect(ev.partialFires).toBe(1) // cycle 3 has no outcome record
+    expect(ev.totalFires).toBe(3)
+    expect(ev.distinctCycles).toBe(3)
+  })
+
+  test("since-promotion counters only include fires strictly after promotedAt.cycle", () => {
+    const outcomes: Record<number, CycleOutcome> = {
+      1: "success", 2: "success", 3: "failure", 4: "failure", 5: "failure",
+    }
+    const note = mkNote(
+      [
+        { cycle: 1, at: 1 }, { cycle: 2, at: 2 },
+        { cycle: 3, at: 3 }, { cycle: 4, at: 4 }, { cycle: 5, at: 5 },
+      ],
+      /* promotedCycle */ 2,
+    )
+    const ev = computeOutcomeEvidence(note, outcomes)
+    expect(ev.firesSincePromotion).toBe(3) // cycles 3, 4, 5
+    expect(ev.failureSincePromotion).toBe(3)
+    expect(ev.successSincePromotion).toBe(0)
+  })
+
+  test("unpromoted notes (no promotedAt) have zero since-promotion counters", () => {
+    const outcomes: Record<number, CycleOutcome> = { 1: "failure" }
+    const note = mkNote([{ cycle: 1, at: 1 }])
+    const ev = computeOutcomeEvidence(note, outcomes)
+    expect(ev.firesSincePromotion).toBe(0)
+    expect(ev.failureSincePromotion).toBe(0)
+  })
+})
+
+describe("outcome-weighted shouldPromote", () => {
+  const mkNote = (fires: Array<{ cycle: number; at: number }>): BehavioralNote => ({
+    id: "x", text: "t",
+    provenance: { source: "manual", cycle: 0, createdAt: 0 },
+    fires,
+  })
+
+  test("promotes when successFires ≥ failureFires", () => {
+    const outcomes: Record<number, CycleOutcome> = {
+      1: "success", 2: "success", 3: "failure",
+    }
+    const note = mkNote([{ cycle: 1, at: 1 }, { cycle: 2, at: 2 }, { cycle: 3, at: 3 }])
+    expect(shouldPromote(note, outcomes)).toBe(true)
+  })
+
+  test("does NOT promote when failures outnumber successes", () => {
+    const outcomes: Record<number, CycleOutcome> = {
+      1: "failure", 2: "failure", 3: "success",
+    }
+    const note = mkNote([{ cycle: 1, at: 1 }, { cycle: 2, at: 2 }, { cycle: 3, at: 3 }])
+    expect(shouldPromote(note, outcomes)).toBe(false)
+  })
+
+  test("promotes on all-partial evidence (backward-compat with pre-Phase-4 notes)", () => {
+    const note = mkNote([{ cycle: 1, at: 1 }, { cycle: 1, at: 2 }, { cycle: 2, at: 3 }])
+    expect(shouldPromote(note, {})).toBe(true)
+  })
+
+  test("distinct-cycles requirement still applies even with all successes", () => {
+    const outcomes: Record<number, CycleOutcome> = { 5: "success" }
+    const note = mkNote([{ cycle: 5, at: 1 }, { cycle: 5, at: 2 }, { cycle: 5, at: 3 }])
+    expect(shouldPromote(note, outcomes)).toBe(false)
+  })
+})
+
+describe("shouldUnpromote", () => {
+  const mkPromoted = (fires: Array<{ cycle: number; at: number }>, promotedCycle: number): BehavioralNote => ({
+    id: "x", text: "t",
+    provenance: { source: "manual", cycle: 0, createdAt: 0 },
+    fires,
+    promotedAt: { at: 1, cycle: promotedCycle, originalText: "t", clarified: false },
+  })
+
+  test("un-promotes when failures-since-promotion hit threshold AND outnumber successes", () => {
+    const outcomes: Record<number, CycleOutcome> = { 3: "failure", 4: "failure", 5: "failure" }
+    const note = mkPromoted(
+      [{ cycle: 3, at: 1 }, { cycle: 4, at: 2 }, { cycle: 5, at: 3 }],
+      /* promoted at */ 2,
+    )
+    expect(shouldUnpromote(note, outcomes)).toBe(true)
+  })
+
+  test("does not un-promote when successes balance failures", () => {
+    const outcomes: Record<number, CycleOutcome> = {
+      3: "failure", 4: "failure", 5: "failure", 6: "success", 7: "success", 8: "success",
+    }
+    const note = mkPromoted(
+      [
+        { cycle: 3, at: 1 }, { cycle: 4, at: 2 }, { cycle: 5, at: 3 },
+        { cycle: 6, at: 4 }, { cycle: 7, at: 5 }, { cycle: 8, at: 6 },
+      ],
+      2,
+    )
+    expect(shouldUnpromote(note, outcomes)).toBe(false)
+  })
+
+  test("ignores fires from BEFORE promotion when counting failure evidence", () => {
+    const outcomes: Record<number, CycleOutcome> = {
+      1: "failure", 2: "failure", 3: "failure", // all pre-promotion
+      4: "success",
+    }
+    const note = mkPromoted(
+      [{ cycle: 1, at: 1 }, { cycle: 2, at: 2 }, { cycle: 3, at: 3 }, { cycle: 4, at: 4 }],
+      /* promoted at */ 3,
+    )
+    // Only cycle 4 counts after promotion; that's a success → no un-promote.
+    expect(shouldUnpromote(note, outcomes)).toBe(false)
+  })
+
+  test("below threshold: ≥1 failure but < UNPROMOTE_FAILURE_THRESHOLD does not trigger", () => {
+    const fails = UNPROMOTE_FAILURE_THRESHOLD - 1
+    const fires: Array<{ cycle: number; at: number }> = []
+    const outcomes: Record<number, CycleOutcome> = {}
+    for (let i = 0; i < fails; i++) {
+      fires.push({ cycle: 10 + i, at: i })
+      outcomes[10 + i] = "failure"
+    }
+    const note = mkPromoted(fires, /* promoted at */ 9)
+    expect(shouldUnpromote(note, outcomes)).toBe(false)
+  })
+
+  test("not-yet-promoted notes cannot be un-promoted", () => {
+    const note: BehavioralNote = {
+      id: "x", text: "t",
+      provenance: { source: "manual", cycle: 0, createdAt: 0 },
+      fires: [{ cycle: 1, at: 1 }, { cycle: 2, at: 2 }, { cycle: 3, at: 3 }],
+    }
+    const outcomes: Record<number, CycleOutcome> = { 1: "failure", 2: "failure", 3: "failure" }
+    expect(shouldUnpromote(note, outcomes)).toBe(false)
+  })
+})
+
+describe("pruneAndPromoteBehavioralNotes — un-promotion integration", () => {
+  test("un-promotes a promoted note whose post-promotion evidence is ≥3 failures", async () => {
+    const store = await loadBrainMemory()
+    await addBehavioralNote(store, "agent", "principle under test", { source: "manual", cycle: 1 })
+    let loaded = await loadBrainMemory()
+    const noteId = loaded.behavioralNotes!.agent![0]!.id
+
+    // Three successful fires → promote
+    await recordCycleOutcome("agent", 2, "success", "done")
+    await recordCycleOutcome("agent", 3, "success", "done")
+    await recordCycleOutcome("agent", 4, "success", "done")
+    await recordBehavioralNoteFires("agent", [noteId], 2)
+    await recordBehavioralNoteFires("agent", [noteId], 3)
+    await recordBehavioralNoteFires("agent", [noteId], 4)
+    const promoteResult = await pruneAndPromoteBehavioralNotes("agent", 5)
+    expect(promoteResult.promoted.length).toBe(1)
+
+    // Three failure fires after promotion → un-promote
+    await recordCycleOutcome("agent", 6, "failure", "stop-failure")
+    await recordCycleOutcome("agent", 7, "failure", "stop-failure")
+    await recordCycleOutcome("agent", 8, "failure", "stop-failure")
+    await recordBehavioralNoteFires("agent", [noteId], 6)
+    await recordBehavioralNoteFires("agent", [noteId], 7)
+    await recordBehavioralNoteFires("agent", [noteId], 8)
+
+    const unpromoteResult = await pruneAndPromoteBehavioralNotes("agent", 9)
+    expect(unpromoteResult.unpromoted.length).toBe(1)
+    expect(unpromoteResult.promoted.length).toBe(0)
+    expect(unpromoteResult.archived.length).toBe(0)
+
+    const after = await loadBrainMemory()
+    const note = after.behavioralNotes!.agent!.find(n => n.id === noteId)!
+    expect(note.promotedAt).toBeUndefined()
+    expect(note.unpromotedAt).toBeDefined()
+    expect(note.unpromotedAt?.failureFires).toBe(3)
+    expect(note.unpromotedAt?.successFires).toBe(0)
+    expect(note.unpromotedAt?.priorPromotion?.originalText).toBe("principle under test")
+  })
+
+  test("does not un-promote when post-promotion evidence is mixed but net-positive", async () => {
+    const store = await loadBrainMemory()
+    await addBehavioralNote(store, "agent", "still solid", { source: "manual", cycle: 1 })
+    let loaded = await loadBrainMemory()
+    const noteId = loaded.behavioralNotes!.agent![0]!.id
+
+    for (const c of [2, 3, 4]) await recordCycleOutcome("agent", c, "success", "done")
+    for (const c of [2, 3, 4]) await recordBehavioralNoteFires("agent", [noteId], c)
+    await pruneAndPromoteBehavioralNotes("agent", 5)
+
+    // Post-promotion: 2 failures, 2 successes (tie — failures do NOT outnumber)
+    await recordCycleOutcome("agent", 6, "failure", "stop-failure")
+    await recordCycleOutcome("agent", 7, "success", "done")
+    await recordCycleOutcome("agent", 8, "failure", "stop-failure")
+    await recordCycleOutcome("agent", 9, "success", "done")
+    for (const c of [6, 7, 8, 9]) await recordBehavioralNoteFires("agent", [noteId], c)
+
+    const result = await pruneAndPromoteBehavioralNotes("agent", 10)
+    expect(result.unpromoted.length).toBe(0)
+
+    const after = await loadBrainMemory()
+    expect(after.behavioralNotes!.agent!.find(n => n.id === noteId)?.promotedAt).toBeDefined()
+  })
+
+  test("getOutcomesForAgent returns cycle→outcome view used by promote/unpromote", async () => {
+    await recordCycleOutcome("agent", 1, "success", "done")
+    await recordCycleOutcome("agent", 2, "failure", "stop-failure")
+    const mem = await loadBrainMemory()
+    const view = getOutcomesForAgent(mem, "agent")
+    expect(view[1]).toBe("success")
+    expect(view[2]).toBe("failure")
+    expect(view[99]).toBeUndefined()
   })
 })

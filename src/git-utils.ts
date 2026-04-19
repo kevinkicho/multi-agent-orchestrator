@@ -158,6 +158,48 @@ export async function gitRemoteBranchExists(cwd: string, branch: string, remote 
   }
 }
 
+/** Check if a branch exists on an arbitrary remote URL, without a local clone.
+ *  Used by the Add Project modal to validate baseBranch before cloning. */
+export async function gitLsRemoteUrlHasBranch(url: string, branch: string): Promise<boolean> {
+  try {
+    const proc = Bun.spawn(["git", "ls-remote", "--heads", url, branch], {
+      stdout: "pipe", stderr: "pipe",
+    })
+    const out = await new Response(proc.stdout).text()
+    const code = await proc.exited
+    if (code !== 0) return false
+    return out.trim().length > 0
+  } catch {
+    return false
+  }
+}
+
+/** Resolve the remote's default branch (what `HEAD` points at).
+ *  Works for both a local repo (`cwd` of a clone) and an arbitrary remote URL.
+ *  Returns null if detection fails — caller should fall back to "main". */
+export async function gitRemoteDefaultBranch(
+  target: string,
+  kind: "dir" | "url",
+): Promise<string | null> {
+  try {
+    const args = kind === "url"
+      ? ["ls-remote", "--symref", target, "HEAD"]
+      : ["ls-remote", "--symref", "origin", "HEAD"]
+    const proc = Bun.spawn(kind === "url" ? ["git", ...args] : ["git", ...args], {
+      cwd: kind === "dir" ? target : undefined,
+      stdout: "pipe", stderr: "pipe",
+    })
+    const out = await new Response(proc.stdout).text()
+    const code = await proc.exited
+    if (code !== 0) return null
+    // Format: "ref: refs/heads/main\tHEAD\n<sha>\tHEAD"
+    const match = out.match(/ref:\s*refs\/heads\/([^\s]+)\s+HEAD/)
+    return match?.[1] ?? null
+  } catch {
+    return null
+  }
+}
+
 /** List local branches matching an optional glob pattern (e.g. `agent/foo-*`).
  *  Returns an empty array if the pattern matches nothing or git is unavailable. */
 export async function gitListBranches(cwd: string, pattern?: string): Promise<string[]> {

@@ -3122,6 +3122,87 @@ async function submitProject() {
   btn.disabled = true
   btn.textContent = gitUrl ? 'Cloning...' : 'Starting...'
 
+  // Pre-submit base-branch validation. If the user specified a branch, confirm
+  // it exists on the remote before we spend time cloning / spawning workers —
+  // otherwise the branch-isolation step silently forks from HEAD and pins the
+  // project's baseBranch to whatever it found, defeating the safety rail.
+  //
+  // Returns true if the caller should proceed with add-project, false to abort.
+  async function validateBaseBranch() {
+    if (!baseBranch) return true
+    btn.textContent = 'Checking branch...'
+    let check
+    try {
+      const res = await apiFetch('/api/projects/check-base-branch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(gitUrl ? { gitUrl, branch: baseBranch } : { directory: dir, branch: baseBranch }),
+      })
+      check = await res.json()
+      if (!res.ok || !check.ok) {
+        const detail = check?.error || ('HTTP ' + res.status)
+        alert('Could not verify base branch: ' + detail + '\n\nAbort and try again.')
+        return false
+      }
+    } catch (err) {
+      alert('Network error while verifying base branch: ' + err)
+      return false
+    }
+
+    // Local-dir case with no git repo / no origin: treat as "no remote to check" —
+    // warn the user and let them proceed (baseBranch will just be a local hint).
+    if (check.mode === 'dir' && (!check.isGitRepo || !check.hasRemote)) {
+      if (!confirm('This folder has no git remote configured. Base branch "' + baseBranch
+        + '" cannot be validated against GitHub. Continue anyway?')) {
+        return false
+      }
+      return true
+    }
+
+    if (check.existsRemote) return true
+
+    // Branch is missing on origin — prompt to create it.
+    const fallback = check.defaultBranch || 'main'
+    const msg = 'Branch "' + baseBranch + '" does not exist on origin.\n\n'
+      + 'OK  → Create it from "' + fallback + '" and push to origin.\n'
+      + 'Cancel → Abort. No project will be created.'
+    if (!confirm(msg)) return false
+
+    // For the local-dir path we can create + push now. For the clone path we
+    // can't (nothing is cloned yet) — flip the createBaseBranchIfMissing flag
+    // and let the server do it post-clone.
+    if (gitUrl) {
+      createBaseBranchAfterClone = true
+      return true
+    }
+    btn.textContent = 'Creating branch...'
+    try {
+      const res = await apiFetch('/api/projects/create-base-branch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ directory: dir, branch: baseBranch, fromBranch: fallback }),
+      })
+      const data = await res.json()
+      if (!res.ok || !data.ok) {
+        alert('Failed to create branch: ' + (data.error || ('HTTP ' + res.status)))
+        return false
+      }
+      return true
+    } catch (err) {
+      alert('Network error creating branch: ' + err)
+      return false
+    }
+  }
+
+  let createBaseBranchAfterClone = false
+  const baseOk = await validateBaseBranch()
+  if (!baseOk) {
+    btn.disabled = false
+    btn.textContent = 'Add Project'
+    return
+  }
+  btn.textContent = gitUrl ? 'Cloning...' : 'Starting...'
+
   try {
     const endpoint = gitUrl ? '/api/projects/clone' : '/api/projects'
     const payload = gitUrl
@@ -3132,6 +3213,7 @@ async function submitProject() {
           directive: directive || undefined,
           model: model || undefined,
           baseBranch: baseBranch || undefined,
+          createBaseBranchIfMissing: createBaseBranchAfterClone,
         }
       : {
           directory: dir,

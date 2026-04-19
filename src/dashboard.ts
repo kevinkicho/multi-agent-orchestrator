@@ -9,6 +9,14 @@ import type { TeamManager } from "./team-manager"
 import { loadBrainMemory, addBehavioralNote, addProjectNote, listArchives, loadAgentArchive, restoreAgentMemory } from "./brain-memory"
 import { detectCrash, formatCrashReport } from "./session-state"
 import { appendChatEvent, readChatEvents } from "./chat-log"
+import {
+  gitBranchExists,
+  gitExec,
+  gitLsRemoteUrlHasBranch,
+  gitRemoteBranchExists,
+  gitRemoteDefaultBranch,
+  gitRemoteUrl,
+} from "./git-utils"
 
 /** Decode and sanitize a URL path segment — strips path traversal and control characters */
 function sanitizeParam(raw: string): string {
@@ -451,6 +459,128 @@ export async function startDashboard(
         }
       }
 
+      // ---- Base-branch validation for the Add Project modal ----
+      //
+      // The modal's "Remote Default Branch" field used to silently fall back to
+      // the repo's current HEAD when the requested branch was missing on the
+      // remote — overwriting the user's intent on disk (see KNOWN_LIMITATIONS §…).
+      // These two endpoints let the client (a) check whether the requested branch
+      // actually exists on origin, and (b) create it from the remote's default if
+      // the user confirms the prompt. Neither touches ProjectManager — they're
+      // pre-add-project utilities that operate on a directory or a raw git URL.
+      if (url.pathname === "/api/projects/check-base-branch" && req.method === "POST") {
+        try {
+          const body = (await req.json()) as {
+            directory?: string
+            gitUrl?: string
+            branch?: string
+          }
+          const branch = body.branch?.trim()
+          if (!branch) {
+            return Response.json({ error: "branch is required" }, { status: 400, headers: corsHeaders })
+          }
+          // Clone-path: validate against the raw git URL before any local work.
+          if (body.gitUrl?.trim()) {
+            const gitUrl = body.gitUrl.trim()
+            const existsRemote = await gitLsRemoteUrlHasBranch(gitUrl, branch)
+            const defaultBranch = await gitRemoteDefaultBranch(gitUrl, "url")
+            return Response.json(
+              { ok: true, mode: "url", existsLocal: false, existsRemote, defaultBranch },
+              { headers: corsHeaders },
+            )
+          }
+          // Local-dir path: must be an existing git repo with an origin remote.
+          const directory = body.directory?.trim()
+          if (!directory) {
+            return Response.json(
+              { error: "directory or gitUrl is required" },
+              { status: 400, headers: corsHeaders },
+            )
+          }
+          const remoteUrl = await gitRemoteUrl(directory)
+          if (!remoteUrl) {
+            return Response.json(
+              { ok: true, mode: "dir", isGitRepo: false, hasRemote: false, existsLocal: false, existsRemote: false },
+              { headers: corsHeaders },
+            )
+          }
+          const [existsLocal, existsRemote, defaultBranch] = await Promise.all([
+            gitBranchExists(directory, branch),
+            gitRemoteBranchExists(directory, branch),
+            gitRemoteDefaultBranch(directory, "dir"),
+          ])
+          return Response.json(
+            { ok: true, mode: "dir", isGitRepo: true, hasRemote: true, existsLocal, existsRemote, defaultBranch, remoteUrl },
+            { headers: corsHeaders },
+          )
+        } catch (err) {
+          return Response.json({ ok: false, error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      if (url.pathname === "/api/projects/create-base-branch" && req.method === "POST") {
+        try {
+          const body = (await req.json()) as {
+            directory?: string
+            branch?: string
+            fromBranch?: string
+          }
+          const directory = body.directory?.trim()
+          const branch = body.branch?.trim()
+          if (!directory || !branch) {
+            return Response.json(
+              { error: "directory and branch are required" },
+              { status: 400, headers: corsHeaders },
+            )
+          }
+          const remoteUrl = await gitRemoteUrl(directory)
+          if (!remoteUrl) {
+            return Response.json(
+              { error: "Directory has no 'origin' remote configured" },
+              { status: 400, headers: corsHeaders },
+            )
+          }
+          // Resolve source branch: explicit > remote default > "main".
+          const fromBranch = body.fromBranch?.trim()
+            || (await gitRemoteDefaultBranch(directory, "dir"))
+            || "main"
+          // Make sure we have the latest refs so branching from origin/<from> works.
+          try { await gitExec(directory, "fetch", "origin") } catch { /* non-fatal: we'll try local fallback */ }
+
+          // Prefer branching from origin/<from>. Fall back to a local branch of
+          // the same name if origin fetch didn't land it.
+          const remoteRef = `origin/${fromBranch}`
+          let createdFrom = remoteRef
+          try {
+            await gitExec(directory, "branch", branch, remoteRef)
+          } catch {
+            // Try local branch
+            try {
+              await gitExec(directory, "branch", branch, fromBranch)
+              createdFrom = fromBranch
+            } catch (innerErr) {
+              return Response.json(
+                { error: `Could not create branch from ${remoteRef} or ${fromBranch}: ${String(innerErr)}` },
+                { status: 500, headers: corsHeaders },
+              )
+            }
+          }
+          try {
+            await gitExec(directory, "push", "-u", "origin", branch)
+          } catch (pushErr) {
+            // Clean up the local branch we just made so a retry isn't blocked.
+            await gitExec(directory, "branch", "-D", branch).catch(() => {})
+            return Response.json(
+              { error: `Created branch locally but push failed: ${String(pushErr)}. Check GITHUB_TOKEN / credentials.` },
+              { status: 500, headers: corsHeaders },
+            )
+          }
+          return Response.json({ ok: true, branch, from: createdFrom }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ ok: false, error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
       if (url.pathname === "/api/projects/clone" && req.method === "POST") {
         const pm = opts?.projectManager
         if (!pm) return Response.json({ error: "Project manager not available" }, { status: 500, headers: corsHeaders })
@@ -458,6 +588,7 @@ export async function startDashboard(
           const body = await req.json() as {
             gitUrl?: string; parentDirectory?: string; targetName?: string
             directive?: string; name?: string; baseBranch?: string; model?: string
+            createBaseBranchIfMissing?: boolean
           }
           if (!body.gitUrl?.trim()) {
             return Response.json({ error: "gitUrl is required" }, { status: 400, headers: corsHeaders })
@@ -468,6 +599,31 @@ export async function startDashboard(
           const cloned = await pm.cloneGithubRepo(body.gitUrl.trim(), body.parentDirectory.trim(), {
             targetName: body.targetName?.trim() || undefined,
           })
+          // Post-clone base-branch creation. The client validated pre-clone and
+          // asked us to materialize the branch if missing — do it BEFORE addProject
+          // so the branch-isolation step in ProjectManager forks from the real
+          // baseBranch instead of silently substituting HEAD (see §…).
+          const requestedBase = body.baseBranch?.trim()
+          if (requestedBase && body.createBaseBranchIfMissing) {
+            try {
+              const onRemote = await gitRemoteBranchExists(cloned, requestedBase)
+              if (!onRemote) {
+                const fromBranch = (await gitRemoteDefaultBranch(cloned, "dir")) || "main"
+                try { await gitExec(cloned, "fetch", "origin") } catch { /* non-fatal */ }
+                try {
+                  await gitExec(cloned, "branch", requestedBase, `origin/${fromBranch}`)
+                } catch {
+                  await gitExec(cloned, "branch", requestedBase, fromBranch)
+                }
+                await gitExec(cloned, "push", "-u", "origin", requestedBase)
+              }
+            } catch (branchErr) {
+              return Response.json(
+                { ok: false, error: `Cloned ${cloned} but could not create base branch '${requestedBase}': ${String(branchErr)}` },
+                { status: 500, headers: corsHeaders },
+              )
+            }
+          }
           const project = await pm.addProject(
             cloned,
             body.directive?.trim() || "Work on this project. Review the codebase, fix bugs, add features, and improve code quality.",

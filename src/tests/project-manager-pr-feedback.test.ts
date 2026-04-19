@@ -20,6 +20,7 @@ import type { Orchestrator } from "../orchestrator"
 
 type Mutable<T> = { -readonly [K in keyof T]: T[K] }
 
+const createdPms: ProjectManager[] = []
 function makeProjectManager(): ProjectManager {
   const orchestrator: unknown = {
     agents: new Map(),
@@ -29,7 +30,9 @@ function makeProjectManager(): ProjectManager {
     async restartAgent() { return "s" }, forceResetAgentStatus() {}, shutdown() {},
   }
   const log = new DashboardLog()
-  return new ProjectManager(orchestrator as Orchestrator, log, { ollamaUrl: "http://127.0.0.1:11434" })
+  const pm = new ProjectManager(orchestrator as Orchestrator, log, { ollamaUrl: "http://127.0.0.1:11434" })
+  createdPms.push(pm)
+  return pm
 }
 
 function seedProject(
@@ -58,9 +61,13 @@ function seedProject(
 let workdir: string
 let root: string
 const originalToken = process.env.GITHUB_TOKEN
+const originalCwd = process.cwd()
 
 beforeAll(async () => {
   root = mkdtempSync(resolve(tmpdir(), "pm-prfb-"))
+  // Isolate cwd so ProjectManager.saveProjects() writes into the tmpdir
+  // instead of polluting the repo root's orchestrator-projects.json.
+  process.chdir(root)
   const baredir = join(root, "github.com-fake.git")
   mkdirSync(baredir, { recursive: true })
   await gitExec(baredir, "init", "--bare", "-b", "main")
@@ -76,9 +83,14 @@ beforeAll(async () => {
   await gitExec(workdir, "commit", "--allow-empty", "-m", "agent-1")
 })
 
-afterAll(() => {
+afterAll(async () => {
   if (originalToken === undefined) delete process.env.GITHUB_TOKEN
   else process.env.GITHUB_TOKEN = originalToken
+  // Await in-flight saveProjects() writes before tearing down the tmpdir —
+  // otherwise writeJsonFile's tmp-file rename races against rmSync and prints
+  // a spurious ENOENT (already .caught, but visually noisy in CI logs).
+  await Promise.all(createdPms.map(pm => pm.drainPendingWrites()))
+  process.chdir(originalCwd)
   rmSync(root, { recursive: true, force: true })
 })
 

@@ -6,11 +6,37 @@
  * baked in at serve-spawn time.
  */
 
-import { describe, test, expect } from "bun:test"
+import { describe, test, expect, beforeAll, afterAll } from "bun:test"
+import { mkdtempSync, rmSync } from "fs"
+import { tmpdir } from "os"
+import { resolve } from "path"
 import type { AgentState } from "../agent"
 import { ProjectManager } from "../project-manager"
 import { DashboardLog } from "../dashboard"
 import type { Orchestrator } from "../orchestrator"
+
+// updateModel/updateSupervisorModel trigger ProjectManager.saveProjects(),
+// which writes `orchestrator-projects.json` in process.cwd(). Isolate cwd so
+// the write lands in a tmpdir instead of the repo root.
+let isolatedRoot: string
+const originalCwd = process.cwd()
+const createdPms: ProjectManager[] = []
+function makePm(...args: ConstructorParameters<typeof ProjectManager>): ProjectManager {
+  const pm = new ProjectManager(...args)
+  createdPms.push(pm)
+  return pm
+}
+beforeAll(() => {
+  isolatedRoot = mkdtempSync(resolve(tmpdir(), "pm-model-"))
+  process.chdir(isolatedRoot)
+})
+afterAll(async () => {
+  // Drain in-flight saveProjects() writes so writeJsonFile's tmp-file rename
+  // can't race against rmSync below.
+  await Promise.all(createdPms.map(pm => pm.drainPendingWrites()))
+  process.chdir(originalCwd)
+  rmSync(isolatedRoot, { recursive: true, force: true })
+})
 
 function makeOrchestrator() {
   const agents = new Map<string, AgentState>()
@@ -64,7 +90,7 @@ describe("updateModel propagates the new model to the worker", () => {
   test("mutates the live agent's config.model so the next prompt uses the new model", () => {
     const orch = makeOrchestrator()
     const agent = seedAgent(orch, "worker-1", { providerID: "opencode-go", modelID: "qwen3.6-plus" })
-    const pm = new ProjectManager(orch, new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
+    const pm = makePm(orch, new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
     seedProject(pm, "p1", "worker-1", "opencode-go:qwen3.6-plus")
 
     pm.updateModel("p1", "opencode-go:glm-5.1")
@@ -74,14 +100,14 @@ describe("updateModel propagates the new model to the worker", () => {
 
   test("no-ops gracefully when the agent hasn't connected yet (project exists, no agent in map)", () => {
     const orch = makeOrchestrator()
-    const pm = new ProjectManager(orch, new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
+    const pm = makePm(orch, new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
     seedProject(pm, "p1", "worker-missing", "opencode-go:qwen3.6-plus")
 
     expect(() => pm.updateModel("p1", "opencode-go:glm-5.1")).not.toThrow()
   })
 
   test("throws when the project id is unknown — matches other accessors", () => {
-    const pm = new ProjectManager(makeOrchestrator(), new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
+    const pm = makePm(makeOrchestrator(), new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
     expect(() => pm.updateModel("nope", "opencode-go:glm-5.1")).toThrow(/Unknown project/)
   })
 })
@@ -91,7 +117,7 @@ describe("updateSupervisorModel — supervisor-only override", () => {
     const orch = makeOrchestrator()
     const workerModel = { providerID: "opencode-go", modelID: "qwen3.6-plus" }
     const agent = seedAgent(orch, "worker-1", workerModel)
-    const pm = new ProjectManager(orch, new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
+    const pm = makePm(orch, new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
     seedProject(pm, "p1", "worker-1", "opencode-go:qwen3.6-plus")
 
     pm.updateSupervisorModel("p1", "opencode-go:glm-5.1")
@@ -102,7 +128,7 @@ describe("updateSupervisorModel — supervisor-only override", () => {
   })
 
   test("empty or undefined clears the override", () => {
-    const pm = new ProjectManager(makeOrchestrator(), new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
+    const pm = makePm(makeOrchestrator(), new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
     seedProject(pm, "p1", "worker-1", "opencode-go:qwen3.6-plus", "opencode-go:glm-5.1")
 
     pm.updateSupervisorModel("p1", "")
@@ -112,7 +138,7 @@ describe("updateSupervisorModel — supervisor-only override", () => {
   })
 
   test("throws when the project id is unknown", () => {
-    const pm = new ProjectManager(makeOrchestrator(), new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
+    const pm = makePm(makeOrchestrator(), new DashboardLog(), { ollamaUrl: "http://127.0.0.1:11434" })
     expect(() => pm.updateSupervisorModel("nope", "opencode-go:glm-5.1")).toThrow(/Unknown project/)
   })
 })

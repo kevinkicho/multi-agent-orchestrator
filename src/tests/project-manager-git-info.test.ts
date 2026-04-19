@@ -47,9 +47,13 @@ let workdir: string
 let baredir: string
 let root: string
 const originalToken = process.env.GITHUB_TOKEN
+const originalCwd = process.cwd()
 
 beforeAll(async () => {
   root = mkdtempSync(resolve(tmpdir(), "pm-gitinfo-"))
+  // Isolate cwd so ProjectManager.saveProjects() writes into the tmpdir
+  // instead of polluting the repo root's orchestrator-projects.json.
+  process.chdir(root)
   baredir = join(root, "github.com-fake.git")
   mkdirSync(baredir, { recursive: true })
   await gitExec(baredir, "init", "--bare", "-b", "main")
@@ -76,6 +80,7 @@ beforeAll(async () => {
 afterAll(() => {
   if (originalToken === undefined) delete process.env.GITHUB_TOKEN
   else process.env.GITHUB_TOKEN = originalToken
+  process.chdir(originalCwd)
   rmSync(root, { recursive: true, force: true })
 })
 

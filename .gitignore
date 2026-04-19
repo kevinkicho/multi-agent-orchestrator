@@ -5,6 +5,7 @@ nul/
 
 # Runtime data files (generated at runtime, not part of source)
 .orchestrator-memory.json
+.orchestrator-brain.json
 .orchestrator-session.json
 .orchestrator/
 .orchestrator-ledger.json

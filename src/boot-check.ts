@@ -13,11 +13,13 @@
  * the CLI log the diagnosis before a single worker spins up.
  */
 import {
+  formatModelRef,
   loadProviders,
   resolveApiKey,
   resolveDefaultModel,
   type LLMProvider,
 } from "./providers"
+import { getBrainSession } from "./brain-session"
 
 /** Outcome of probing a single provider. All timing/diagnostic data lives here
  *  so the dashboard can render a row per provider without re-querying. */
@@ -48,11 +50,19 @@ export type BootCheckReport = {
   startedAt: number
   completedAt: number
   providers: BootCheckResult[]
-  /** Model resolveDefaultModel() picked — what the brain/default path will use. */
+  /** The session brain — what the user actually picked in the dashboard modal.
+   *  null means the orchestrator is parked on awaitBrainSession() and no LLM
+   *  calls can fire yet. The dashboard uses this to render the modal. */
   brainModel: string | null
+  /** The ref resolveDefaultModel() would pick as a suggestion. Shown in the
+   *  modal as "suggested" but never committed automatically — that's the
+   *  whole point of the session gate. Distinct from `brainModel` so the CLI
+   *  and dashboard can show both without conflating "picked" vs "suggested". */
+  suggestedModel: string | null
   /** Aggregate traffic-light: ready = at least one working provider, degraded =
-   *  one enabled provider partially working, blocked = nothing routable. */
-  brainStatus: "ready" | "degraded" | "blocked"
+   *  one enabled provider partially working, blocked = nothing routable,
+   *  pending = providers are healthy but no brain pick has been made yet. */
+  brainStatus: "ready" | "degraded" | "blocked" | "pending"
   /** One-line summary for CLI output. */
   summary: string
 }
@@ -255,6 +265,23 @@ export async function checkProvider(provider: LLMProvider): Promise<BootCheckRes
   }
 }
 
+/** Pick a suggestion from probe results: first enabled provider whose soft
+ *  probe returned "ok", using whichever model the probe actually exercised
+ *  (which is `configuredModels[0]` for key-based providers, or the first
+ *  listed model for Ollama when nothing is pinned). Returns null when no
+ *  enabled provider is currently healthy — callers fall back to the static
+ *  `resolveDefaultModel()` pick in that case, though that fallback may itself
+ *  be quota-exhausted. Honors provider order in orchestrator-providers.json. */
+export function pickHealthySuggestion(results: BootCheckResult[]): string | null {
+  for (const r of results) {
+    if (!r.enabled || r.quotaStatus !== "ok") continue
+    const model = r.configuredModels[0] ?? r.listedModels?.[0]
+    if (!model) continue
+    return formatModelRef({ provider: r.providerId, model })
+  }
+  return null
+}
+
 /** Full boot-check: probe every provider in parallel, resolve the brain model,
  *  and compute an aggregate status. Never throws — infrastructure probes that
  *  blow up should surface in the report, not kill startup. */
@@ -280,7 +307,14 @@ export async function runBootCheck(): Promise<BootCheckReport> {
     return result
   })))
 
-  const brainModel = await resolveDefaultModel().catch(() => null)
+  // The *session* brain is the authoritative answer to "what will drive
+  // cycles" — null means the user hasn't picked yet and every supervisor is
+  // parked on awaitBrainSession(). The suggestion is the model we'd recommend
+  // in the dashboard modal; kept separate so we never conflate "available"
+  // with "chosen" (the old behavior quietly committed you to the suggestion
+  // and that's exactly what we're undoing).
+  const brainModel = getBrainSession()
+  const suggestedModel = pickHealthySuggestion(results) ?? await resolveDefaultModel().catch(() => null)
 
   const healthyEnabled = results.filter(r => r.enabled && r.quotaStatus === "ok")
   const anyEnabled = results.some(r => r.enabled)
@@ -295,12 +329,18 @@ export async function runBootCheck(): Promise<BootCheckReport> {
     brainStatus = "blocked"
     const blockers = results.filter(r => r.enabled).map(r => `${r.providerId} (${r.quotaStatus})`).join(", ")
     summary = `All enabled providers are blocked: ${blockers}. Brain cannot route.`
+  } else if (brainModel === null) {
+    // Providers are healthy but the human hasn't picked yet — the orchestrator
+    // is intentionally parked. Surface that as its own state rather than
+    // claiming READY with an auto-picked model the user never chose.
+    brainStatus = "pending"
+    summary = `${healthyEnabled.length} provider(s) healthy — waiting for brain model pick (open the dashboard modal).`
   } else if (anyBlocked) {
     brainStatus = "degraded"
-    summary = `${healthyEnabled.length} provider(s) healthy, some degraded. Brain model: ${brainModel ?? "none"}.`
+    summary = `${healthyEnabled.length} provider(s) healthy, some degraded. Brain model: ${brainModel}.`
   } else {
     brainStatus = "ready"
-    summary = `${healthyEnabled.length} provider(s) healthy. Brain model: ${brainModel ?? "none"}.`
+    summary = `${healthyEnabled.length} provider(s) healthy. Brain model: ${brainModel}.`
   }
 
   return {
@@ -308,6 +348,7 @@ export async function runBootCheck(): Promise<BootCheckReport> {
     completedAt: Date.now(),
     providers: results,
     brainModel,
+    suggestedModel,
     brainStatus,
     summary,
   }

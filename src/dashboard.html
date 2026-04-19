@@ -46,6 +46,40 @@
     </div>
   </div>
 
+  <!-- Brain-Model Picker Modal — shown on boot when no session brain is set.
+       Blocks the UI until the user picks; every supervisor/manager/observer
+       loop is parked on awaitBrainSession() server-side until this resolves. -->
+  <div class="modal-overlay" id="brain-model-modal" role="dialog" aria-modal="true" aria-label="Pick brain model">
+    <div class="modal brain-model-modal-body">
+      <h2>Pick a brain model to start</h2>
+      <p class="brain-model-intro">
+        No LLM calls will fire until you choose. Status is live boot-check data — see the tooltip on each row for the probe response.
+        This pick drives the supervisor/observer loops and is the default for any project without an explicit worker model.
+      </p>
+
+      <div class="brain-model-toolbar">
+        <label class="brain-model-chip" title="Hide models whose provider failed the boot-check probe">
+          <input type="checkbox" id="brain-model-filter-available" checked onchange="onBrainModelFilterChange()">
+          <span>Available only</span>
+        </label>
+        <span class="brain-model-count" id="brain-model-count"></span>
+        <span class="brain-model-probed" id="brain-model-probed"></span>
+      </div>
+
+      <div id="brain-model-options" class="brain-model-table-wrap">
+        <div class="brain-model-empty">Loading…</div>
+      </div>
+
+      <div id="brain-model-error" class="brain-model-error" hidden></div>
+
+      <div class="modal-actions">
+        <button class="modal-btn" id="brain-model-cancel" onclick="closeBrainModelModal()" style="display:none;" title="Close the picker and keep the current brain model">Cancel</button>
+        <button class="modal-btn" onclick="refreshBrainModelOptions()" title="Re-run the boot-check probe">Re-probe</button>
+        <button class="modal-btn primary" id="brain-model-submit" onclick="submitBrainModel()" disabled>Use selected</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Add Project Modal -->
   <div class="modal-overlay" id="add-project-modal" role="dialog" aria-modal="true" aria-label="Add project">
     <div class="modal">

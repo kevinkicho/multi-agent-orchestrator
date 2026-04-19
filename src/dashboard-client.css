@@ -1407,6 +1407,140 @@ body.light .admin-drawer-overlay.open { background: rgba(0,0,0,0.2); }
 .modal .modal-btn:hover { background: #2a2a4a; }
 .modal .modal-btn:disabled { opacity: 0.4; cursor: default; }
 
+/* Brain-model picker modal — table of enabled providers × models with live
+   boot-check health, a filter chip, and tooltip-first probe detail. */
+.brain-model-modal-body { width: 720px; max-width: 96vw; }
+.brain-model-intro { color: #bbb; font-size: 12px; margin-bottom: 12px; line-height: 1.5; }
+.brain-model-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 2px 10px;
+  border-bottom: 1px solid #1e1e2e;
+  margin-bottom: 8px;
+}
+.brain-model-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid #2a2a4a;
+  border-radius: 999px;
+  font-size: 11px;
+  color: #c0c0ff;
+  background: #16162a;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.12s, border-color 0.12s;
+}
+.brain-model-chip:hover { background: #1c1c36; border-color: #3a3a5a; }
+.brain-model-chip input { margin: 0; accent-color: #8b8bff; }
+.brain-model-chip input:checked + span { color: #8b8bff; font-weight: 600; }
+.brain-model-count { color: #888; font-size: 11px; }
+.brain-model-probed { color: #555; font-size: 10px; margin-left: auto; font-style: italic; }
+.brain-model-table-wrap {
+  max-height: 360px;
+  overflow-y: auto;
+  border: 1px solid #2a2a3a;
+  border-radius: 5px;
+}
+.brain-model-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.brain-model-table thead th {
+  position: sticky;
+  top: 0;
+  background: #0f0f1c;
+  color: #888;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid #2a2a3a;
+}
+.brain-model-table tbody tr {
+  border-bottom: 1px solid #1a1a2a;
+  cursor: pointer;
+  transition: background 0.08s;
+}
+.brain-model-table tbody tr:hover { background: #1a1a2a; }
+.brain-model-table tbody tr.row-blocked {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.brain-model-table tbody tr.row-blocked:hover { background: transparent; }
+.brain-model-table tbody tr.row-selected { background: #1e1e3a; }
+.brain-model-table tbody tr.row-selected:hover { background: #25254a; }
+.brain-model-table td {
+  padding: 9px 10px;
+  vertical-align: middle;
+}
+.brain-model-table td.col-radio { width: 28px; padding-right: 0; }
+.brain-model-table td.col-radio input { accent-color: #8b8bff; margin: 0; }
+.brain-model-table td.col-model {
+  font-family: 'SF Mono', Consolas, monospace;
+  color: #e0e0e0;
+  word-break: break-all;
+}
+.brain-model-table td.col-model .suggest-tag {
+  color: #8b8bff;
+  font-size: 9px;
+  font-family: inherit;
+  margin-left: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+.brain-model-table td.col-provider { color: #aaa; white-space: nowrap; }
+.brain-model-table td.col-provider .provider-id {
+  color: #555;
+  font-size: 10px;
+  margin-left: 6px;
+  font-family: 'SF Mono', Consolas, monospace;
+}
+.brain-model-table td.col-status { white-space: nowrap; }
+.brain-model-table td.col-latency { color: #777; font-size: 11px; white-space: nowrap; }
+.brain-model-table td.col-detail {
+  color: #888;
+  font-size: 11px;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.brain-model-status-badge {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.brain-model-status-badge.health-ok { background: #22c55e22; color: #22c55e; border: 1px solid #22c55e55; }
+.brain-model-status-badge.health-quota { background: #facc1522; color: #facc15; border: 1px solid #facc1555; }
+.brain-model-status-badge.health-auth { background: #ef444422; color: #ef4444; border: 1px solid #ef444455; }
+.brain-model-status-badge.health-down { background: #ef444422; color: #ef4444; border: 1px solid #ef444455; }
+.brain-model-status-badge.health-unknown { background: #88888822; color: #aaa; border: 1px solid #88888855; }
+.brain-model-empty {
+  padding: 18px 16px;
+  color: #888;
+  font-style: italic;
+  text-align: center;
+}
+.brain-model-error {
+  color: #ef4444;
+  font-size: 12px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: #ef444418;
+  border-left: 3px solid #ef4444;
+  border-radius: 3px;
+}
+
 /* Folder picker */
 .folder-picker {
   display: flex;

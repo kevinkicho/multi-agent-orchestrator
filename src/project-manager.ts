@@ -30,7 +30,8 @@ import { isOrchestratorRepo, canonicalAgentName } from "./repo-identity"
 import type { EventBus } from "./event-bus"
 import type { ResourceManager } from "./resource-manager"
 import { archiveAgentMemory, hasAgentArchive, restoreAgentMemory } from "./brain-memory"
-import { resolveDefaultModel, validateModelRoutable, parseModelRef, selectProjectModel, toAgentModelRef } from "./providers"
+import { validateModelRoutable, parseModelRef, selectProjectModel, toAgentModelRef } from "./providers"
+import { awaitBrainSession, getBrainSession } from "./brain-session"
 import {
   type Responsibility,
   buildDefaultResponsibilities,
@@ -607,11 +608,27 @@ export class ProjectManager {
         throw new Error(`Agent for ${projectName} failed to start on port ${port}`)
       }
 
-      // Register with orchestrator. Include the project's model so the worker's
-      // opencode session uses it (without a model field, opencode falls back to
-      // its own default, making the dashboard's per-project model picker a no-op
-      // for worker prompts).
-      const workerModel = toAgentModelRef(project.model)
+      // Register with orchestrator. Include a model so the worker's opencode
+      // session uses it — without a model field opencode falls back to its
+      // own global default, which is how workers silently routed to
+      // ollama/glm-5.1:cloud even after we registered opencode-go in the
+      // scratch config. Precedence: project.model (explicit) > session
+      // brain (what the human picked in the modal). When no explicit model
+      // is set we BLOCK on the brain-session gate — same contract as the
+      // supervisor path, so restored projects wait for the modal instead
+      // of spawning workers wired to whatever opencode's global default
+      // happens to be.
+      let workerModel = toAgentModelRef(project.model)
+      if (!workerModel) {
+        if (getBrainSession() === null) {
+          this.dashLog.push({
+            type: "brain-thinking",
+            text: `${projectName}: waiting for brain model pick before wiring worker — open the dashboard modal.`,
+          })
+        }
+        const sessionRef = await awaitBrainSession()
+        workerModel = toAgentModelRef(sessionRef)
+      }
       await this.orchestrator.addAgent({
         name: agentName,
         url,
@@ -714,19 +731,34 @@ export class ProjectManager {
 
   /** Resolve the model a project should use. Delegates the tiered fallback to
    *  `selectProjectModel` (pure decision) and layers on contextual dashboard
-   *  logging when a non-explicit tier is used. Throws when no route exists. */
+   *  logging when a non-explicit tier is used.
+   *
+   *  The "default" tier now comes from the brain-session gate instead of
+   *  resolveDefaultModel() — so when the user hasn't picked a brain model
+   *  yet, this method BLOCKS (and logs once to the dashboard) instead of
+   *  silently committing the project to the first enabled provider. That
+   *  makes "no brain → no cycles" a structural invariant: the supervisor
+   *  loop literally can't fire until the modal is resolved. */
   private async resolveProjectModel(project: ProjectState): Promise<string> {
-    const defaultModel = await resolveDefaultModel()
+    const effective = project.supervisorModel ?? project.model
+    // When no explicit project model is set AND no legacy brain.model is
+    // configured, we're going to block on the brain-session gate. Log it so
+    // the operator knows why the supervisor isn't ticking.
+    if (!effective && !this.brainConfig.model && getBrainSession() === null) {
+      this.dashLog.push({
+        type: "brain-thinking",
+        text: `${project.name}: waiting for brain model pick — open the dashboard modal to choose a provider.`,
+      })
+    }
+    // Block until the session brain is picked (or return immediately if it
+    // already is). Never returns null — the gate holds open indefinitely.
+    const defaultModel = await awaitBrainSession()
     try {
-      // Supervisor-only override wins when set; otherwise fall back to the
-      // primary model (which the worker also uses). Keeps old projects working
-      // without migration — supervisorModel defaults to undefined.
-      const effective = project.supervisorModel ?? project.model
       const resolved = selectProjectModel(effective, defaultModel, this.brainConfig.model)
       if (resolved.source === "default") {
         this.dashLog.push({
           type: "brain-thinking",
-          text: `${project.name}: no per-project model set — falling back to "${resolved.model}" (first enabled provider). Set a model on the project to pin this.`,
+          text: `${project.name}: no per-project model set — using session brain "${resolved.model}". Set a model on the project to pin this.`,
         })
       } else if (resolved.source === "legacy") {
         this.dashLog.push({
@@ -1905,6 +1937,12 @@ export class ProjectManager {
     return this.projects.get(id)
   }
 
+  /** Tracks the most recent in-flight saveProjects() promise so tests (and
+   *  graceful shutdown) can await completion before tearing down the cwd.
+   *  Without this, writeJsonFile's tmp-file rename races against rmSync and
+   *  prints a confusing ENOENT to stderr even though the .catch swallows it. */
+  private pendingSave: Promise<void> = Promise.resolve()
+
   /** Persist project configs (directory + directive) for quick re-add */
   private saveProjects() {
     const data: SavedProjects = {
@@ -1921,10 +1959,17 @@ export class ProjectManager {
           ...(p.timeline && p.timeline.length > 0 ? { timeline: p.timeline } : {}),
         })),
     }
-    writeJsonFile(resolve(process.cwd(), PROJECTS_FILE), data).catch(err => {
+    this.pendingSave = writeJsonFile(resolve(process.cwd(), PROJECTS_FILE), data).catch(err => {
       console.error(`[project-manager] Failed to save projects file: ${err}`)
       this.dashLog.push({ type: "brain-thinking", text: `WARNING: Failed to persist project state to disk. In-memory state may diverge from saved state on restart: ${err}` })
     })
+  }
+
+  /** Await any in-flight saveProjects() write. Tests call this before rmSync'ing
+   *  the tmpdir the manager is writing into, so the fire-and-forget save can't
+   *  race past teardown. No-ops when nothing is pending. */
+  async drainPendingWrites(): Promise<void> {
+    await this.pendingSave
   }
 
   /** Audit saved project configs against the provider registry. Warns for any

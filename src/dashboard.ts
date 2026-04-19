@@ -983,6 +983,98 @@ export async function startDashboard(
         }
       }
 
+      // Brain-session endpoints — the human picks a model on boot, and every
+      // supervisor/manager/observer loop blocks on that pick via
+      // awaitBrainSession(). GET surfaces the current pick + health-annotated
+      // options so the dashboard modal can render traffic-light badges.
+      if (url.pathname === "/api/brain-model" && req.method === "GET") {
+        try {
+          const { getBrainSession } = await import("./brain-session")
+          const { getCachedBootCheck, refreshBootCheck } = await import("./boot-check")
+          // Use cached report when fresh, otherwise probe now so the modal's
+          // health badges aren't stale on first open.
+          const cached = getCachedBootCheck()
+          const report = cached ?? await refreshBootCheck()
+          const options: Array<{
+            ref: string
+            providerId: string
+            providerName: string
+            modelId: string
+            health: "ok" | "quota-exhausted" | "auth-error" | "unreachable" | "unknown"
+            latencyMs: number | null
+            error: string | null
+          }> = []
+          for (const r of report.providers) {
+            if (!r.enabled) continue
+            const modelList = r.configuredModels.length > 0
+              ? r.configuredModels
+              : (r.listedModels ?? [])
+            for (const modelId of modelList) {
+              const ref = r.providerId === "ollama" ? modelId : `${r.providerId}:${modelId}`
+              const health = r.quotaStatus === "ok" ? "ok"
+                : r.quotaStatus === "exhausted" ? "quota-exhausted"
+                : r.quotaStatus === "auth-error" ? "auth-error"
+                : r.quotaStatus === "unreachable" ? "unreachable"
+                : "unknown"
+              options.push({
+                ref,
+                providerId: r.providerId,
+                providerName: r.providerName,
+                modelId,
+                health,
+                latencyMs: r.latencyMs,
+                error: r.errorMessage,
+              })
+            }
+          }
+          return Response.json({
+            current: getBrainSession(),
+            suggestion: report.suggestedModel,
+            // `probedAt` lets the modal show "probed at 14:02:15" so the user
+            // can tell the health badges aren't stale. Uses the report's
+            // `completedAt` (when the last probe finished) so it reflects the
+            // actual probe time, not when this request happened to fire.
+            probedAt: report.completedAt,
+            options,
+          }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: `Failed to read brain model: ${err instanceof Error ? err.message : String(err)}` }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      if (url.pathname === "/api/brain-model" && req.method === "POST") {
+        try {
+          const body = await req.json() as { ref?: string }
+          const ref = body.ref?.trim()
+          if (!ref) {
+            return Response.json({ ok: false, error: "ref is required" }, { status: 400, headers: corsHeaders })
+          }
+          // Validate before committing — don't let the user pin to a model
+          // whose provider isn't routable. Surfaces the same diagnosis the
+          // supervisor would have hit a minute later.
+          const { validateModelRoutable } = await import("./providers")
+          const check = await validateModelRoutable(ref)
+          if (!check.ok) {
+            return Response.json({ ok: false, error: check.reason }, { status: 400, headers: corsHeaders })
+          }
+          const { setBrainSession } = await import("./brain-session")
+          setBrainSession(ref)
+          return Response.json({ ok: true, current: ref }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ ok: false, error: `Failed to set brain model: ${err instanceof Error ? err.message : String(err)}` }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      if (url.pathname === "/api/brain-model" && req.method === "DELETE") {
+        try {
+          const { clearBrainSession } = await import("./brain-session")
+          clearBrainSession()
+          return Response.json({ ok: true }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ ok: false, error: String(err) }, { status: 500, headers: corsHeaders })
+        }
+      }
+
       // Re-run the boot-check probe. Used by the dashboard refresh button
       // and after provider enable/disable toggles so stale status clears fast.
       if (url.pathname === "/api/boot-check/refresh" && req.method === "POST") {

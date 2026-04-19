@@ -47,9 +47,13 @@ function seedProject(pm: ProjectManager, id: string, directory: string, agentBra
 
 let workdir: string
 let root: string
+const originalCwd = process.cwd()
 
 beforeAll(async () => {
   root = mkdtempSync(resolve(tmpdir(), "pm-merge-"))
+  // Isolate cwd so ProjectManager.saveProjects() writes into the tmpdir
+  // instead of polluting the repo root's orchestrator-projects.json.
+  process.chdir(root)
   workdir = join(root, "work")
   mkdirSync(workdir, { recursive: true })
   await gitExec(workdir, "init", "-b", "main")
@@ -65,6 +69,7 @@ beforeAll(async () => {
 })
 
 afterAll(() => {
+  process.chdir(originalCwd)
   rmSync(root, { recursive: true, force: true })
 })
 

@@ -3654,6 +3654,258 @@ function startPolling() {
 }
 startPolling()
 
+// ---- Brain-Model Picker Modal ----
+// Boots with the orchestrator parked on awaitBrainSession() — supervisors
+// won't fire until the user picks here. On mount we fetch /api/brain-model;
+// if `current` is null, we show the modal and block on submit. The picker
+// also doubles as the default for any project without an explicit worker
+// model, which is how we close the "silent fallback to ollama" hole.
+
+var brainModelSelectedRef = null
+var brainModelLastPayload = null // cached so filter toggles don't re-fetch
+
+function escapeBrainHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+}
+
+// Map the server's `health` enum into (css class, label, one-line reason).
+// The label is terse for the badge; the reason is shown in the Details column
+// and, with latency + error appended, as the row's tooltip so hover gives the
+// full probe diagnosis without cluttering the cell.
+function brainHealthMeta(health) {
+  if (health === 'ok') return { cls: 'health-ok', label: 'available', reason: 'Probe succeeded — provider responded cleanly' }
+  if (health === 'quota-exhausted') return { cls: 'health-quota', label: 'quota full', reason: 'Provider returned 429 — weekly/monthly quota reached' }
+  if (health === 'auth-error') return { cls: 'health-auth', label: 'auth error', reason: 'Provider returned 401/403 — API key missing, wrong, or revoked' }
+  if (health === 'unreachable') return { cls: 'health-down', label: 'unreachable', reason: 'Boot-check could not connect — endpoint down or network blocked' }
+  return { cls: 'health-unknown', label: 'unknown', reason: 'Probe result was inconclusive — re-probe or check provider logs' }
+}
+
+function renderBrainModelOptions(payload) {
+  brainModelLastPayload = payload
+  var container = document.getElementById('brain-model-options')
+  var submit = document.getElementById('brain-model-submit')
+  var countEl = document.getElementById('brain-model-count')
+  var probedEl = document.getElementById('brain-model-probed')
+  // Single source of truth for Cancel visibility: if the gate already has a
+  // current pick, Cancel is safe (closing preserves that pick). If no pick
+  // exists, Cancel is hidden so initial boot stays blocking.
+  var cancelBtn = document.getElementById('brain-model-cancel')
+  if (cancelBtn) cancelBtn.style.display = (payload && payload.current) ? '' : 'none'
+  if (!container) return
+
+  var options = (payload && payload.options) || []
+
+  if (options.length === 0) {
+    container.innerHTML = '<div class="brain-model-empty" style="color:#ef4444;">No providers configured. Open the Providers section and enable one with at least one model.</div>'
+    if (submit) submit.disabled = true
+    if (countEl) countEl.textContent = ''
+    if (probedEl) probedEl.textContent = ''
+    return
+  }
+
+  var filterEl = document.getElementById('brain-model-filter-available')
+  var availableOnly = filterEl ? filterEl.checked : true
+
+  var availableCount = 0
+  for (var j = 0; j < options.length; j++) {
+    if (options[j].health === 'ok') availableCount++
+  }
+  if (countEl) {
+    countEl.textContent = availableCount + ' of ' + options.length + ' available'
+  }
+  if (probedEl && payload.probedAt) {
+    probedEl.textContent = 'probed ' + new Date(payload.probedAt).toLocaleTimeString()
+  } else if (probedEl) {
+    probedEl.textContent = ''
+  }
+
+  var rows = ''
+  var rendered = 0
+  for (var i = 0; i < options.length; i++) {
+    var o = options[i]
+    var meta = brainHealthMeta(o.health)
+    var isBlocked = o.health !== 'ok'
+    var isSuggestion = payload.suggestion && o.ref === payload.suggestion
+
+    if (availableOnly && isBlocked) continue
+    rendered++
+
+    var detail = o.error ? o.error : meta.reason
+    var tooltip = meta.reason
+      + (o.latencyMs != null ? ' · probe took ' + o.latencyMs + 'ms' : '')
+      + (o.error ? ' · ' + o.error : '')
+
+    var rowCls = 'brain-model-row' + (isBlocked ? ' row-blocked' : '')
+    var idAttr = 'brain-model-row-' + i
+    var safeRef = escapeBrainHtml(o.ref)
+    var suggestTag = isSuggestion ? '<span class="suggest-tag">suggested</span>' : ''
+
+    rows += '<tr id="' + idAttr + '" class="' + rowCls + '" data-ref="' + safeRef + '" title="' + escapeBrainHtml(tooltip) + '">'
+    rows += '<td class="col-radio"><input type="radio" name="brain-model-pick" value="' + safeRef + '"' + (isBlocked ? ' disabled' : '') + '></td>'
+    rows += '<td class="col-model">' + safeRef + suggestTag + '</td>'
+    rows += '<td class="col-provider">' + escapeBrainHtml(o.providerName) + '<span class="provider-id">' + escapeBrainHtml(o.providerId) + '</span></td>'
+    rows += '<td class="col-status"><span class="brain-model-status-badge ' + meta.cls + '">' + meta.label + '</span></td>'
+    rows += '<td class="col-latency">' + (o.latencyMs != null ? o.latencyMs + ' ms' : '—') + '</td>'
+    rows += '<td class="col-detail">' + escapeBrainHtml(detail) + '</td>'
+    rows += '</tr>'
+  }
+
+  if (rendered === 0) {
+    container.innerHTML = '<div class="brain-model-empty">'
+      + (availableOnly
+        ? 'No available models. Uncheck "Available only" to see blocked providers, or open Providers to enable one.'
+        : 'No models to show.')
+      + '</div>'
+    brainModelSelectedRef = null
+    if (submit) submit.disabled = true
+    return
+  }
+
+  container.innerHTML = '<table class="brain-model-table">'
+    + '<thead><tr>'
+    + '<th></th><th>Model</th><th>Provider</th><th>Status</th><th>Latency</th><th>Details</th>'
+    + '</tr></thead>'
+    + '<tbody>' + rows + '</tbody>'
+    + '</table>'
+
+  // Wire up row clicks — clicking anywhere on a non-blocked row picks the
+  // model, same as hitting the radio directly. More forgiving target.
+  var rowEls = container.querySelectorAll('tr.brain-model-row')
+  for (var k = 0; k < rowEls.length; k++) {
+    (function(row) {
+      row.addEventListener('click', function(ev) {
+        if (row.classList.contains('row-blocked')) return
+        var ref = row.getAttribute('data-ref')
+        var radio = row.querySelector('input[type="radio"]')
+        if (radio) radio.checked = true
+        if (ref) onBrainModelPick(ref)
+        // Swallow label->input propagation where the radio already fired the change.
+        if (ev.target && ev.target.tagName === 'INPUT') return
+      })
+    })(rowEls[k])
+  }
+
+  // Pre-select the suggestion if it's available. Otherwise leave the user to pick.
+  if (payload.suggestion) {
+    var suggestedRow = container.querySelector('tr[data-ref="' + String(payload.suggestion).replace(/"/g, '\\"') + '"]')
+    if (suggestedRow && !suggestedRow.classList.contains('row-blocked')) {
+      var rad = suggestedRow.querySelector('input[type="radio"]')
+      if (rad) {
+        rad.checked = true
+        onBrainModelPick(payload.suggestion)
+        return
+      }
+    }
+  }
+  brainModelSelectedRef = null
+  if (submit) submit.disabled = true
+}
+
+function onBrainModelFilterChange() {
+  if (brainModelLastPayload) renderBrainModelOptions(brainModelLastPayload)
+}
+
+function onBrainModelPick(ref) {
+  brainModelSelectedRef = ref
+  var submit = document.getElementById('brain-model-submit')
+  if (submit) submit.disabled = !ref
+  var errEl = document.getElementById('brain-model-error')
+  if (errEl) errEl.hidden = true
+  // Update visual selection state on the table rows.
+  var container = document.getElementById('brain-model-options')
+  if (!container) return
+  var rowEls = container.querySelectorAll('tr.brain-model-row')
+  for (var i = 0; i < rowEls.length; i++) {
+    if (rowEls[i].getAttribute('data-ref') === ref) rowEls[i].classList.add('row-selected')
+    else rowEls[i].classList.remove('row-selected')
+  }
+}
+
+async function refreshBrainModelOptions() {
+  var container = document.getElementById('brain-model-options')
+  if (container) container.innerHTML = '<div class="brain-model-empty">Probing providers…</div>'
+  try {
+    // Force a fresh probe so badges reflect current state, not a stale cache.
+    await apiFetch('/api/boot-check/refresh', { method: 'POST' }).catch(function() {})
+    var res = await apiFetch('/api/brain-model')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    var data = await res.json()
+    renderBrainModelOptions(data)
+  } catch (err) {
+    if (container) container.innerHTML = '<div class="brain-model-empty" style="color:#ef4444;">Failed to load: ' + escapeBrainHtml(err.message || String(err)) + '</div>'
+  }
+}
+
+async function submitBrainModel() {
+  if (!brainModelSelectedRef) return
+  var submitBtn = document.getElementById('brain-model-submit')
+  var errEl = document.getElementById('brain-model-error')
+  if (submitBtn) submitBtn.disabled = true
+  if (errEl) errEl.hidden = true
+  try {
+    var res = await apiFetch('/api/brain-model', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ref: brainModelSelectedRef }),
+    })
+    var data = await res.json()
+    if (!res.ok || !data.ok) throw new Error(data.error || ('HTTP ' + res.status))
+    document.getElementById('brain-model-modal').classList.remove('open')
+    showNotification('Brain model set: ' + brainModelSelectedRef, 'success')
+  } catch (err) {
+    if (errEl) {
+      errEl.textContent = String(err.message || err)
+      errEl.hidden = false
+    }
+    if (submitBtn) submitBtn.disabled = false
+  }
+}
+
+async function checkBrainModelOnBoot() {
+  try {
+    var res = await apiFetch('/api/brain-model')
+    if (!res.ok) return
+    var data = await res.json()
+    if (data.current) return // Already picked; no modal needed.
+    renderBrainModelOptions(data)
+    document.getElementById('brain-model-modal').classList.add('open')
+  } catch (err) {
+    console.warn('[brain-model] Boot check failed:', err)
+  }
+}
+
+// Opens the picker modal unconditionally — called by the "Change" button on
+// the boot-check card so operators can swap brain models without restarting.
+// Closing the modal without submitting leaves the existing pick intact; POSTing
+// a new ref overwrites. Kicks off a fresh probe so badges aren't stale. The
+// Cancel button is shown only in this "change" flow; on initial boot when no
+// pick exists, the modal stays blocking (Cancel hidden) so the operator can't
+// dismiss it and end up with a dashboard where no LLM calls will ever fire.
+async function openBrainModelModal() {
+  var modal = document.getElementById('brain-model-modal')
+  if (!modal) return
+  var cancelBtn = document.getElementById('brain-model-cancel')
+  if (cancelBtn) cancelBtn.style.display = ''
+  modal.classList.add('open')
+  await refreshBrainModelOptions()
+}
+
+function closeBrainModelModal() {
+  var modal = document.getElementById('brain-model-modal')
+  if (modal) modal.classList.remove('open')
+}
+
+// Expose for the HTML onclick handlers (which run in global scope).
+window.refreshBrainModelOptions = refreshBrainModelOptions
+window.submitBrainModel = submitBrainModel
+window.onBrainModelPick = onBrainModelPick
+window.onBrainModelFilterChange = onBrainModelFilterChange
+window.openBrainModelModal = openBrainModelModal
+window.closeBrainModelModal = closeBrainModelModal
+checkBrainModelOnBoot()
+
 // ---- LLM Providers ----
 var ollamaAvailableModels = [] // cached from /api/ollama-models
 
@@ -3725,6 +3977,7 @@ function renderBootCheck(report) {
   }
   var color = report.brainStatus === 'ready' ? '#10b981'
     : report.brainStatus === 'degraded' ? '#f59e0b'
+    : report.brainStatus === 'pending' ? '#facc15'
     : '#ef4444'
   badge.textContent = report.brainStatus.toUpperCase()
   badge.style.background = color
@@ -3760,7 +4013,21 @@ function renderBootCheck(report) {
   }).join('')
   list.innerHTML = rows
   if (brain) {
-    brain.innerHTML = '<span style="color:#888;">Brain model:</span> <code style="color:' + color + ';">' + escapeHtml(report.brainModel || '(none)') + '</code>'
+    // "Change" button reopens the picker modal without requiring a restart —
+    // useful when the current pick hits a quota mid-session and the operator
+    // wants to swap to a different provider.
+    var changeBtn = '<button onclick="openBrainModelModal()" style="margin-left:8px;background:#1a1a2e;color:#c084fc;border:1px solid #3a3a5a;padding:2px 8px;font-size:10px;border-radius:3px;cursor:pointer;" title="Reopen the picker modal">Change</button>'
+    if (report.brainModel) {
+      brain.innerHTML = '<span style="color:#888;">Brain model:</span> <code style="color:' + color + ';">' + escapeHtml(report.brainModel) + '</code>' + changeBtn
+    } else {
+      // Session brain is null — orchestrator is parked. Show the suggestion
+      // (what would be auto-picked if we ever auto-picked) next to a clear
+      // "not yet" label so the operator doesn't read this as "already set".
+      var suggestionHtml = report.suggestedModel
+        ? ' <span style="color:#555;font-size:10px;">suggested: ' + escapeHtml(report.suggestedModel) + '</span>'
+        : ''
+      brain.innerHTML = '<span style="color:#888;">Brain model:</span> <code style="color:#facc15;">(not yet picked — pick in modal)</code>' + suggestionHtml + changeBtn
+    }
   }
 }
 

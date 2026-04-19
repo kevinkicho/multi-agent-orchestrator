@@ -11,21 +11,21 @@ import { extractLastAssistantText, formatRecentMessages } from "./message-utils"
 import { formatThought, C } from "./tui-format"
 import { detectCrash, initSessionState, markCleanShutdown, formatCrashReport, tryLiberatePort } from "./session-state"
 import { recordPrompt } from "./prompt-ledger"
-import { resolveDefaultModel } from "./providers"
+import { awaitBrainSession, onBrainSessionChange } from "./brain-session"
 
 /**
  * Resolves the brain/team/supervisor model when there is no per-project
- * preference: explicit `brain.model` from orchestrator.json wins, then the
- * first enabled provider's first model. Throws when nothing is routable so
- * callers fail loudly instead of silently defaulting to Ollama.
+ * preference. Legacy `brain.model` from orchestrator.json still wins for
+ * backwards compat (deprecation warning emitted on config load); otherwise
+ * we BLOCK on the brain-session gate until the human picks from the
+ * dashboard modal. The gate is what makes "no brain → no cycles" a
+ * structural invariant: there is no silent fallback to resolveDefaultModel()
+ * anymore, so we can't accidentally commit the user to a quota-exhausted
+ * or unreachable provider.
  */
 async function resolveBrainModel(brainConfig: { model?: string }): Promise<string> {
   if (brainConfig.model) return brainConfig.model
-  const fallback = await resolveDefaultModel()
-  if (fallback) return fallback
-  throw new Error(
-    "No model configured. Set brain.model in orchestrator.json or enable a provider with at least one model in the LLM Providers tab.",
-  )
+  return await awaitBrainSession()
 }
 
 /** Tunable supervisor limits — all optional with sensible defaults */
@@ -1186,6 +1186,29 @@ async function main() {
     }
   }).catch(() => {})
 
+  // Brain session: always boot in pending state. We intentionally do NOT
+  // auto-restore from `.orchestrator-brain.json` — every `bun run start` forces
+  // the operator to confirm the model via the dashboard modal. The file still
+  // gets written on pick (so the dashboard can reflect current state across
+  // page refreshes within a single process lifetime), it's just not read on
+  // subsequent boots. Every supervisor/manager/observer loop parks on
+  // awaitBrainSession() until the modal resolves the pick.
+  console.log(`${C.brightYellow}[brain-session] No brain model set — open the dashboard to pick one. All supervisor cycles are paused until then.${C.reset}`)
+  dashLog.push({ type: "brain-thinking", text: "[brain-session] Waiting for brain model pick — open the dashboard modal to choose a provider." })
+
+  // Surface dashboard-driven picks + clears in the terminal. Without this the
+  // picker modal "disappeared but nothing printed" and the operator has no way
+  // to confirm from the terminal that the POST actually landed.
+  onBrainSessionChange(ref => {
+    if (ref) {
+      console.log(`${C.brightGreen}[brain-session] Picked: ${ref} (via dashboard) — supervisor cycles unblocked.${C.reset}`)
+      dashLog.push({ type: "brain-thinking", text: `[brain-session] Picked: ${ref}. Supervisor cycles unblocked.` })
+    } else {
+      console.log(`${C.brightYellow}[brain-session] Cleared — supervisor cycles paused until a new pick.${C.reset}`)
+      dashLog.push({ type: "brain-thinking", text: "[brain-session] Cleared. Waiting for new pick from dashboard modal." })
+    }
+  })
+
   // Boot-check: probe every enabled LLM provider for reachability + quota so the
   // user sees a traffic-light state before the first supervisor cycle. Runs
   // fully in background — startup doesn't block on network round-trips.
@@ -1196,6 +1219,7 @@ async function main() {
       const report = await refreshBootCheck()
       const statusColor = report.brainStatus === "ready" ? C.brightGreen
         : report.brainStatus === "degraded" ? C.brightYellow
+        : report.brainStatus === "pending" ? C.brightYellow
         : C.brightRed
       console.log(`${statusColor}[boot-check] ${report.brainStatus.toUpperCase()} — ${report.summary}${C.reset}`)
       for (const r of report.providers) {

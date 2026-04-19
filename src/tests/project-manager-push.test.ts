@@ -47,16 +47,23 @@ function seedProject(pm: ProjectManager, id: string, directory: string, agentBra
 
 let workdir: string
 let baredir: string
+let testRoot: string
 const originalToken = process.env.GITHUB_TOKEN
+const originalCwd = process.cwd()
 
 beforeAll(async () => {
-  const root = mkdtempSync(resolve(tmpdir(), "pm-push-"))
+  testRoot = mkdtempSync(resolve(tmpdir(), "pm-push-"))
+  // ProjectManager.saveProjects() writes to `process.cwd()/orchestrator-projects.json`,
+  // and this test exercises pushAgentBranch which emits a timeline event that
+  // triggers that save. Chdir into the tmpdir so the write lands in throwaway
+  // scratch space instead of polluting the repo root's real projects file.
+  process.chdir(testRoot)
   // Bare repo path intentionally contains "github.com" so the URL guard passes.
-  baredir = join(root, "github.com-fake.git")
+  baredir = join(testRoot, "github.com-fake.git")
   mkdirSync(baredir, { recursive: true })
   await gitExec(baredir, "init", "--bare", "-b", "main")
 
-  workdir = join(root, "work")
+  workdir = join(testRoot, "work")
   mkdirSync(workdir, { recursive: true })
   await gitExec(workdir, "init", "-b", "main")
   await gitExec(workdir, "config", "user.email", "test@example.com")
@@ -70,7 +77,9 @@ beforeAll(async () => {
 afterAll(() => {
   if (originalToken === undefined) delete process.env.GITHUB_TOKEN
   else process.env.GITHUB_TOKEN = originalToken
-  rmSync(resolve(workdir, ".."), { recursive: true, force: true })
+  // Restore cwd before rmSync so we don't try to delete the directory we're in.
+  process.chdir(originalCwd)
+  rmSync(testRoot, { recursive: true, force: true })
 })
 
 beforeEach(() => {

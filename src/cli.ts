@@ -1186,6 +1186,34 @@ async function main() {
     }
   }).catch(() => {})
 
+  // Boot-check: probe every enabled LLM provider for reachability + quota so the
+  // user sees a traffic-light state before the first supervisor cycle. Runs
+  // fully in background — startup doesn't block on network round-trips.
+  ;(async () => {
+    try {
+      const { refreshBootCheck } = await import("./boot-check")
+      dashLog.push({ type: "brain-thinking", text: "[boot-check] Probing providers…" })
+      const report = await refreshBootCheck()
+      const statusColor = report.brainStatus === "ready" ? C.brightGreen
+        : report.brainStatus === "degraded" ? C.brightYellow
+        : C.brightRed
+      console.log(`${statusColor}[boot-check] ${report.brainStatus.toUpperCase()} — ${report.summary}${C.reset}`)
+      for (const r of report.providers) {
+        if (!r.enabled) continue
+        const mark = r.quotaStatus === "ok" ? "✓"
+          : r.quotaStatus === "exhausted" ? "⚠ quota"
+          : r.quotaStatus === "auth-error" ? "✗ auth"
+          : r.quotaStatus === "unreachable" ? "✗ down"
+          : "?"
+        const latency = r.latencyMs != null ? ` ${r.latencyMs}ms` : ""
+        console.log(`  ${mark} ${r.providerId}${latency}${r.errorMessage ? ` — ${r.errorMessage.slice(0, 120)}` : ""}`)
+      }
+      dashLog.push({ type: "brain-thinking", text: `[boot-check] ${report.summary}` })
+    } catch (err) {
+      console.warn(`[boot-check] Failed: ${err instanceof Error ? err.message : err}`)
+    }
+  })()
+
   // Confirm to the user whether a GitHub token is in scope — makes it obvious
   // when .env is missing/stale without needing to test a push to find out.
   if (process.env.GITHUB_TOKEN) {

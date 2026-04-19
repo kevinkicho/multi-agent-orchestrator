@@ -222,6 +222,22 @@
     </div>
   </div>
 
+  <div class="brain-section" id="boot-check-section" style="border-color:#22c55e;" role="region" aria-label="Boot-check status">
+    <div class="brain-header" onclick="document.getElementById('boot-check-section').classList.toggle('open')" style="border-color:#22c55e;" role="button" tabindex="0" aria-expanded="false" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click()}">
+      <h2><span class="brain-arrow" aria-hidden="true">&#9654;</span> Boot Status <span id="boot-check-badge" style="margin-left:8px;font-size:10px;padding:1px 6px;border-radius:3px;background:#333;color:#aaa;">—</span></h2>
+      <button class="toolbar-btn" onclick="event.stopPropagation();refreshBootCheck(true)" style="font-size:10px;">Re-probe</button>
+    </div>
+    <div class="brain-body">
+      <div style="padding:8px 12px;">
+        <div id="boot-check-summary" style="font-size:11px;color:#aaa;margin-bottom:8px;">
+          <em style="color:#555;">Probing providers on startup…</em>
+        </div>
+        <div id="boot-check-list" style="font-size:11px;color:#aaa;"></div>
+        <div id="boot-check-brain" style="margin-top:8px;padding-top:8px;border-top:1px solid #2a2a3a;font-size:11px;color:#aaa;"></div>
+      </div>
+    </div>
+  </div>
+
   <div class="brain-section" id="providers-section" style="border-color:#06b6d4;" role="region" aria-label="LLM providers">
     <div class="brain-header" onclick="document.getElementById('providers-section').classList.toggle('open')" style="border-color:#06b6d4;" role="button" tabindex="0" aria-expanded="false" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click()}">
       <h2><span class="brain-arrow" aria-hidden="true">&#9654;</span> LLM Providers</h2>

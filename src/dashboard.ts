@@ -971,6 +971,30 @@ export async function startDashboard(
         }
       }
 
+      // Boot-check report — cached in-memory result from startup probe.
+      // Dashboard polls this to render the provider health panel.
+      if (url.pathname === "/api/boot-check" && req.method === "GET") {
+        try {
+          const { getCachedBootCheck } = await import("./boot-check")
+          const report = getCachedBootCheck()
+          return Response.json({ report }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: `Failed to read boot-check: ${err instanceof Error ? err.message : String(err)}` }, { status: 500, headers: corsHeaders })
+        }
+      }
+
+      // Re-run the boot-check probe. Used by the dashboard refresh button
+      // and after provider enable/disable toggles so stale status clears fast.
+      if (url.pathname === "/api/boot-check/refresh" && req.method === "POST") {
+        try {
+          const { refreshBootCheck } = await import("./boot-check")
+          const report = await refreshBootCheck()
+          return Response.json({ report }, { headers: corsHeaders })
+        } catch (err) {
+          return Response.json({ error: `Failed to refresh boot-check: ${err instanceof Error ? err.message : String(err)}` }, { status: 500, headers: corsHeaders })
+        }
+      }
+
       // Performance log endpoint
       if (url.pathname === "/api/performance" && req.method === "GET") {
         try {

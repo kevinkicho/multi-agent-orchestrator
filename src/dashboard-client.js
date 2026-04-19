@@ -3708,6 +3708,103 @@ async function refreshProviders() {
   }
 }
 
+function renderBootCheck(report) {
+  var badge = document.getElementById('boot-check-badge')
+  var summary = document.getElementById('boot-check-summary')
+  var list = document.getElementById('boot-check-list')
+  var brain = document.getElementById('boot-check-brain')
+  if (!badge || !summary || !list) return
+  if (!report) {
+    badge.textContent = '—'
+    badge.style.background = '#333'
+    badge.style.color = '#aaa'
+    summary.innerHTML = '<em style="color:#555;">No boot-check yet. Click Re-probe to run one.</em>'
+    list.innerHTML = ''
+    if (brain) brain.innerHTML = ''
+    return
+  }
+  var color = report.brainStatus === 'ready' ? '#10b981'
+    : report.brainStatus === 'degraded' ? '#f59e0b'
+    : '#ef4444'
+  badge.textContent = report.brainStatus.toUpperCase()
+  badge.style.background = color
+  badge.style.color = '#000'
+  summary.innerHTML = '<span style="color:' + color + ';">' + escapeHtml(report.summary) + '</span>' +
+    ' <span style="color:#555;font-size:10px;">(' + new Date(report.completedAt).toLocaleTimeString() + ')</span>'
+
+  var rows = (report.providers || []).map(function(r) {
+    var mark, markColor
+    if (!r.enabled) { mark = 'off'; markColor = '#555' }
+    else if (r.quotaStatus === 'ok') { mark = 'OK'; markColor = '#10b981' }
+    else if (r.quotaStatus === 'exhausted') { mark = 'QUOTA'; markColor = '#f59e0b' }
+    else if (r.quotaStatus === 'auth-error') { mark = 'AUTH'; markColor = '#ef4444' }
+    else if (r.quotaStatus === 'unreachable') { mark = 'DOWN'; markColor = '#ef4444' }
+    else if (r.quotaStatus === 'skipped') { mark = 'SKIP'; markColor = '#555' }
+    else { mark = '?'; markColor = '#888' }
+    var latency = r.latencyMs != null ? r.latencyMs + 'ms' : ''
+    var models = (r.listedModels && r.listedModels.length > 0)
+      ? r.listedModels.slice(0, 6).join(', ') + (r.listedModels.length > 6 ? ' (+' + (r.listedModels.length - 6) + ')' : '')
+      : '(no models)'
+    var errLine = r.errorMessage
+      ? '<div style="color:#777;font-size:10px;margin-top:2px;padding-left:80px;" title="' + escapeHtml(r.errorMessage) + '">' + escapeHtml(r.errorMessage.slice(0, 120)) + '</div>'
+      : ''
+    return '<div style="padding:5px 0;border-bottom:1px solid #1a1a2e;">' +
+      '<div style="display:flex;align-items:center;gap:8px;">' +
+      '<span style="display:inline-block;min-width:60px;text-align:center;background:' + markColor + ';color:#000;padding:1px 4px;font-size:9px;font-weight:bold;border-radius:3px;">' + mark + '</span>' +
+      '<span style="color:#06b6d4;font-weight:bold;min-width:100px;">' + escapeHtml(r.providerName) + '</span>' +
+      '<span style="color:#888;font-size:10px;">' + escapeHtml(latency) + '</span>' +
+      '</div>' +
+      '<div style="color:#888;font-size:10px;margin-top:2px;padding-left:80px;">' + escapeHtml(models) + '</div>' +
+      errLine +
+      '</div>'
+  }).join('')
+  list.innerHTML = rows
+  if (brain) {
+    brain.innerHTML = '<span style="color:#888;">Brain model:</span> <code style="color:' + color + ';">' + escapeHtml(report.brainModel || '(none)') + '</code>'
+  }
+}
+
+async function refreshBootCheck(forceRefresh) {
+  var badge = document.getElementById('boot-check-badge')
+  try {
+    var res = await apiFetch(forceRefresh ? '/api/boot-check/refresh' : '/api/boot-check', {
+      method: forceRefresh ? 'POST' : 'GET',
+    })
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    var data = await res.json()
+    renderBootCheck(data.report)
+  } catch (err) {
+    if (badge) {
+      badge.textContent = 'ERR'
+      badge.style.background = '#ef4444'
+      badge.style.color = '#000'
+    }
+    var summary = document.getElementById('boot-check-summary')
+    if (summary) summary.innerHTML = '<em style="color:#ef4444;">Error: ' + escapeHtml(String(err)) + '</em>'
+  }
+}
+
+// Poll for the initial boot-check report — startup runs it in the background
+// so the first poll might return null; retry a few times before giving up.
+;(function pollInitialBootCheck() {
+  var tries = 0
+  var timer = setInterval(async function() {
+    tries++
+    try {
+      var res = await apiFetch('/api/boot-check')
+      if (res.ok) {
+        var data = await res.json()
+        if (data.report) {
+          renderBootCheck(data.report)
+          clearInterval(timer)
+          return
+        }
+      }
+    } catch (e) { /* dashboard still booting */ }
+    if (tries >= 20) clearInterval(timer) // ~40s max
+  }, 2000)
+})()
+
 async function addOllamaModel(selectEl) {
   var model = selectEl.value
   if (!model) return
@@ -4192,6 +4289,9 @@ setInterval(() => {
   try {
     if (document.getElementById('intents-section')?.classList.contains('open')) refreshIntents()
   } catch (e) { console.error('[orchestrator-dashboard] refreshIntents error:', e) }
+  try {
+    if (document.getElementById('boot-check-section')?.classList.contains('open')) refreshBootCheck(false)
+  } catch (e) { console.error('[orchestrator-dashboard] refreshBootCheck error:', e) }
 }, 30000)
 
 // ---- Per-project branch & validation UI helpers ----

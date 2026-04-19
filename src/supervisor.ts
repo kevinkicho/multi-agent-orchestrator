@@ -3,14 +3,17 @@ import type { DashboardLog } from "./dashboard"
 import { chatCompletion, chatCompletionWithUsage, warmupModel } from "./brain"
 import {
   type BrainMemoryStore,
+  type BehavioralNote,
   loadBrainMemory,
   addMemoryEntry,
   addProjectNote,
   addBehavioralNote,
+  recordBehavioralNoteFires,
   formatMemoryForPrompt,
   saveProgressAssessment,
   getProgressAssessments,
 } from "./brain-memory"
+import { matchFiresInText } from "./fire-tracker"
 import { extractLastAssistantText, summarizeLastAssistantTurn, formatRecentMessages, smartTrim, trimConversation } from "./message-utils"
 import { logPerformance } from "./performance-log"
 import { checkpointSupervisor } from "./session-state"
@@ -182,6 +185,13 @@ export type AgentSupervisorConfig = {
     /** Aux model for the reflection call. Defaults to config.model. */
     auxModel?: string
   }
+  /** Heuristic fire-tracking of behavioral notes. When enabled, every review
+   *  and worker response is scanned against the agent's current notes, and
+   *  notes whose topic appears in the text get a fire[] entry for this cycle.
+   *  Pure heuristic — no LLM call. Default: true. */
+  fireTracking?: {
+    enabled?: boolean
+  }
   /** Token usage tracker — records tokens per call for budget monitoring */
   tokenTracker?: TokenTracker
   /** Probe agent capabilities on first cycle. Default: true */
@@ -227,13 +237,13 @@ export type ParallelSupervisorsConfig = {
 // System prompt — Socratic dialogue mode
 // ---------------------------------------------------------------------------
 
-function buildSocraticPrompt(agentName: string, directory: string, reviewEnabled: boolean, hasReviewer: boolean, behavioralNotes: string[]): string {
+function buildSocraticPrompt(agentName: string, directory: string, reviewEnabled: boolean, hasReviewer: boolean, behavioralNotes: BehavioralNote[]): string {
   const reviewAction = reviewEnabled
     ? `- @review — ${hasReviewer ? "Send work to a dedicated reviewer" : "Ask the worker to self-review recent changes"}\n`
     : ""
 
   const behavioralSection = behavioralNotes.length > 0
-    ? `\n## Lessons from Previous Cycles\n${behavioralNotes.map(n => `- ${n}`).join("\n")}\n`
+    ? `\n## Lessons from Previous Cycles\n${behavioralNotes.map(n => `- ${n.text}`).join("\n")}\n`
     : ""
 
   return `You are a thinking partner and supervisor for an AI coding agent ("the worker") on a software project.
@@ -310,7 +320,7 @@ At the start of each cycle, you may see a "### Shared Knowledge from Other Agent
 }
 
 /** Legacy prompt builder — kept for reference/fallback */
-function buildSupervisorPrompt(agentName: string, directory: string, reviewEnabled: boolean, hasReviewer: boolean, behavioralNotes: string[]): string {
+function buildSupervisorPrompt(agentName: string, directory: string, reviewEnabled: boolean, hasReviewer: boolean, behavioralNotes: BehavioralNote[]): string {
   return buildSocraticPrompt(agentName, directory, reviewEnabled, hasReviewer, behavioralNotes)
 }
 
@@ -809,7 +819,7 @@ export async function runAgentSupervisor(
           agentCapabilities = probeResponse.slice(0, 500)
           emit(`Capability probe result: ${agentCapabilities.slice(0, 200)}`)
           // Save as behavioral note for persistence
-          try { await addBehavioralNote(await loadBrainMemory(), agentName, `Available tools: ${agentCapabilities.slice(0, 300)}`) } catch (err) { console.error(`[supervisor] Failed to save capability note:`, err); config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save capability note to memory: ${err}` }) }
+          try { await addBehavioralNote(await loadBrainMemory(), agentName, `Available tools: ${agentCapabilities.slice(0, 300)}`, { source: "manual", cycle: null }) } catch (err) { console.error(`[supervisor] Failed to save capability note:`, err); config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save capability note to memory: ${err}` }) }
         }
       }
     } catch {
@@ -1385,6 +1395,22 @@ Be specific with file paths, line numbers, and code snippets.`
                 content: reviewText, tags: ["review"],
               }).catch(() => {}) // Intentionally silent: best-effort prompt ledger
 
+              // Post-review fire-tracking: which of the agent's current
+              // behavioral notes would have been useful context for this
+              // review? Heuristic only — no LLM call.
+              if (config.fireTracking?.enabled !== false) {
+                try {
+                  const currentNotes = memory.behavioralNotes?.[agentName] ?? []
+                  const hitIds = matchFiresInText(currentNotes, reviewText)
+                  if (hitIds.length > 0) {
+                    const refreshed = await recordBehavioralNoteFires(agentName, hitIds, cycleCount)
+                    if (refreshed) memory = refreshed
+                  }
+                } catch (err) {
+                  console.error(`[supervisor] fire-tracking (review) failed:`, err)
+                }
+              }
+
               // Post-review lesson extraction (inspired by Hermes Agent / Nous Research).
               // Best-effort: failures must not block the supervisor loop.
               if (config.lessonExtraction !== false) {
@@ -1397,7 +1423,7 @@ Be specific with file paths, line numbers, and code snippets.`
                     ollamaUrl: config.ollamaUrl,
                   })
                   for (const lesson of lessons) {
-                    memory = await addBehavioralNote(memory, agentName, lesson)
+                    memory = await addBehavioralNote(memory, agentName, lesson, { source: "review", cycle: cycleCount })
                     emit(`Lesson captured: ${lesson}`)
                   }
                   if (lessons.length > 0) {
@@ -1478,7 +1504,7 @@ Be specific with file paths, line numbers, and code snippets.`
 
           case "note_behavior": {
             try {
-              memory = await addBehavioralNote(memory, agentName, cmd.text)
+              memory = await addBehavioralNote(memory, agentName, cmd.text, { source: "manual", cycle: cycleCount })
               results.push(`Saved behavioral note: "${cmd.text}" — this will be injected into future system prompts.`)
               emit(`Behavioral note saved: ${cmd.text}`)
             } catch (err) {
@@ -1626,13 +1652,13 @@ Be specific with file paths, line numbers, and code snippets.`
                     agentName,
                     directory,
                     recentSummaries: summaries.slice(-everyN),
-                    behavioralNotes: memory.behavioralNotes?.[agentName] ?? [],
+                    behavioralNotes: (memory.behavioralNotes?.[agentName] ?? []).map(n => n.text),
                     projectNotes: memory.projectNotes[agentName] ?? [],
                     model: config.metaReflection?.auxModel ?? config.model,
                     ollamaUrl: config.ollamaUrl,
                   })
                   for (const p of principles) {
-                    memory = await addBehavioralNote(memory, agentName, p)
+                    memory = await addBehavioralNote(memory, agentName, p, { source: "meta-reflection", cycle: cycleCount })
                     emit(`Meta-reflection principle: ${p}`)
                   }
                   if (principles.length > 0) {
@@ -1782,7 +1808,7 @@ Be specific with file paths, line numbers, and code snippets.`
                 // Collect new notes from this cycle
                 const newNotes = [
                   ...((memory.projectNotes[agentName] ?? []).slice(-1)),
-                  ...((memory.behavioralNotes?.[agentName] ?? []).slice(-2)),
+                  ...((memory.behavioralNotes?.[agentName] ?? []).slice(-2)).map(n => n.text),
                 ]
 
                 // Get git delta for this cycle
@@ -1949,7 +1975,7 @@ Be specific with file paths, line numbers, and code snippets.`
             console.error(`[${agentName}] Failed to force-reset agent status after stale detection: ${err}`)
           }
           cycleRestartCount++
-          try { await addBehavioralNote(memory, agentName, `Agent went stale (silent ${waitResult.silentSeconds}s while busy). May need simpler prompts or the opencode process may be unstable.`) } catch (err) { console.error(`[supervisor] Failed to save behavioral note:`, err); config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save behavioral note (stale agent): ${err}` }) }
+          try { await addBehavioralNote(memory, agentName, `Agent went stale (silent ${waitResult.silentSeconds}s while busy). May need simpler prompts or the opencode process may be unstable.`, { source: "manual", cycle: cycleCount }) } catch (err) { console.error(`[supervisor] Failed to save behavioral note:`, err); config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save behavioral note (stale agent): ${err}` }) }
           continue // Skip response collection — retry with next round
         }
 
@@ -1999,6 +2025,21 @@ Be specific with file paths, line numbers, and code snippets.`
               sessionId: analyticsSessionId ?? undefined,
               content: lastText,
             }).catch(() => {}) // Intentionally silent: best-effort prompt ledger
+
+            // Fire-tracking on worker replies — heuristic match of current
+            // behavioral notes against the reply text.
+            if (config.fireTracking?.enabled !== false) {
+              try {
+                const currentNotes = memory.behavioralNotes?.[agentName] ?? []
+                const hitIds = matchFiresInText(currentNotes, lastText)
+                if (hitIds.length > 0) {
+                  const refreshed = await recordBehavioralNoteFires(agentName, hitIds, cycleCount)
+                  if (refreshed) memory = refreshed
+                }
+              } catch (err) {
+                console.error(`[supervisor] fire-tracking (worker) failed:`, err)
+              }
+            }
           } else {
             // Agent responded with empty content — track and escalate
             consecutiveEmptyResponses++
@@ -2020,7 +2061,7 @@ Be specific with file paths, line numbers, and code snippets.`
                 results.push(`Agent hit restart cap (${MAX_RESTARTS_PER_CYCLE} restarts this cycle). Ending cycle — will retry next cycle with longer pause.`)
                 // Only save behavioral note once per cap-hit (not every empty response)
                 if (!restartCapHit) {
-                  try { await addBehavioralNote(memory, agentName, `Agent hit restart cap (${MAX_RESTARTS_PER_CYCLE} restarts in cycle ${cycleCount}). Agent needs much simpler prompts — one action per prompt, no multi-step tasks.`) } catch (err) { console.error(`[supervisor] Failed to save behavioral note:`, err); config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save behavioral note (restart cap): ${err}` }) }
+                  try { await addBehavioralNote(memory, agentName, `Agent hit restart cap (${MAX_RESTARTS_PER_CYCLE} restarts in cycle ${cycleCount}). Agent needs much simpler prompts — one action per prompt, no multi-step tasks.`, { source: "manual", cycle: cycleCount }) } catch (err) { console.error(`[supervisor] Failed to save behavioral note:`, err); config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save behavioral note (restart cap): ${err}` }) }
                 }
                 restartCapHit = true
                 break
@@ -2061,7 +2102,7 @@ Be specific with file paths, line numbers, and code snippets.`
                   })
                   // Only save behavioral note on first restart, not every one
                   if (cycleRestartCount === 1) {
-                    try { await addBehavioralNote(memory, agentName, `Agent non-responsive (${emptyCount} empty responses in cycle ${cycleCount}). Restarted session. Use short, single-action prompts. Avoid multi-step instructions.`) } catch (err) { console.error(`[supervisor] Failed to save behavioral note:`, err); config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save behavioral note (non-responsive agent): ${err}` }) }
+                    try { await addBehavioralNote(memory, agentName, `Agent non-responsive (${emptyCount} empty responses in cycle ${cycleCount}). Restarted session. Use short, single-action prompts. Avoid multi-step instructions.`, { source: "manual", cycle: cycleCount }) } catch (err) { console.error(`[supervisor] Failed to save behavioral note:`, err); config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save behavioral note (non-responsive agent): ${err}` }) }
                   }
                 } catch (err) {
                   results.push(`Agent non-responsive and restart failed: ${err}`)

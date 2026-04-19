@@ -612,3 +612,15 @@ The `data-action` click handler switch had no try-catch. A sync throw in any act
 ### 32d. Body Size Limit
 
 Dashboard mutating endpoints now require a `Content-Length` header (rejects chunked transfers with 411) and enforce a 1MB limit (413). This prevents unbounded request body consumption on the local HTTP server.
+
+---
+
+## 33. Behavioral-note fire matching is heuristic
+
+**What:** Each behavioral note in `.orchestrator-memory.json` now carries a `fires[]` array recording the cycles in which the note was judged relevant to an active text (a `@review` reply, or a worker response). The matching is pure heuristic — a substring match on any long keyword from the note, plus a keyword-overlap similarity threshold. There is no LLM evaluation of whether the match is meaningful.
+
+**Why:** Per the learning-orchestrator directive, fire-tracking must not add another LLM call per cycle. A heuristic keeps the signal cheap enough to run on every review and every worker response without budget impact, which is what lets Phase 2 (prune/promote) have evidence to work from.
+
+**Tradeoff:** False positives (a note about "restart" fires on any text mentioning "restart", even out of context) and false negatives (a note about "non-responsive workers" may not fire on a review that uses different vocabulary). The fire count is therefore a coarse proxy for relevance, not a precise measurement.
+
+**Ruled out:** LLM-based match judging. Adds one aux call per review/response, inflates token spend, and introduces another failure mode (LLM timeouts) in a hot path. Phase 2 can re-evaluate if signal quality proves insufficient.

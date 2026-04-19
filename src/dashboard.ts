@@ -413,7 +413,32 @@ export async function startDashboard(
             e.objective.includes(agentName) || agentName in e.agentLearnings
           )
           const projectNotes = store.projectNotes[agentName] ?? []
-          const behavioralNotes = store.behavioralNotes?.[agentName] ?? []
+          const rawNotes = store.behavioralNotes?.[agentName] ?? []
+          // Derive per-note fire stats for the Memory tab column.
+          // latestCycle is the max cycle across all fires — cyclesSinceLastFire
+          // is relative to that so the dashboard can surface notes that fire
+          // often vs. notes that have gone quiet.
+          let latestCycle = 0
+          for (const n of rawNotes) {
+            for (const f of n.fires) {
+              if (f.cycle > latestCycle) latestCycle = f.cycle
+            }
+          }
+          const behavioralNotes = rawNotes.map(n => {
+            const fireCount = n.fires.length
+            const lastFireCycle = fireCount > 0 ? n.fires[fireCount - 1]!.cycle : null
+            const cyclesSinceLastFire = lastFireCycle !== null && latestCycle > 0
+              ? Math.max(0, latestCycle - lastFireCycle)
+              : null
+            return {
+              id: n.id,
+              text: n.text,
+              provenance: n.provenance,
+              fires: n.fires,
+              fireCount,
+              cyclesSinceLastFire,
+            }
+          })
           return Response.json({ agentName, sessions, projectNotes, behavioralNotes }, { headers: corsHeaders })
         } catch (err) {
           return Response.json({ agentName, sessions: [], projectNotes: [], behavioralNotes: [] }, { headers: corsHeaders })
@@ -898,7 +923,7 @@ export async function startDashboard(
           if (body.feedbackType === "project") {
             await addProjectNote(store, agentName, fullNote)
           } else {
-            await addBehavioralNote(store, agentName, fullNote)
+            await addBehavioralNote(store, agentName, fullNote, { source: "manual", cycle: null })
           }
           // Record in prompt ledger
           const { recordPrompt: recordP } = await import("./prompt-ledger")

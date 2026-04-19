@@ -180,7 +180,7 @@ describe("archiveAgentMemory", () => {
     expect(archive.agentName).toBe("test-agent")
     expect(archive.sessionSummaries.length).toBe(1)
     expect(archive.projectNotes).toEqual(["important note"])
-    expect(archive.behavioralNotes).toEqual(["always use small prompts"])
+    expect(archive.behavioralNotes.map((n: any) => n.text)).toEqual(["always use small prompts"])
     expect(archive.lastDirective).toBe("Build the feature")
 
     // Active store should be clean
@@ -223,7 +223,7 @@ describe("loadAgentArchive", () => {
     const archive = await loadAgentArchive("archived-agent")
     expect(archive).not.toBeNull()
     expect(archive!.agentName).toBe("archived-agent")
-    expect(archive!.behavioralNotes).toEqual(["be concise"])
+    expect(archive!.behavioralNotes.map(n => n.text)).toEqual(["be concise"])
   })
 })
 
@@ -261,7 +261,7 @@ describe("restoreAgentMemory", () => {
     active = await loadBrainMemory()
     expect(active.agentEntries?.["restored"]?.length).toBe(1)
     expect(active.projectNotes["restored"]).toEqual(["old note"])
-    expect(active.behavioralNotes?.["restored"]).toEqual(["old behavior"])
+    expect(active.behavioralNotes?.["restored"]?.map(n => n.text)).toEqual(["old behavior"])
 
     // Archive file should be deleted
     expect(await hasAgentArchive("restored")).toBe(false)
@@ -290,7 +290,7 @@ describe("restoreAgentMemory", () => {
 
     const final = await loadBrainMemory()
     expect(final.projectNotes["merger"]).toContain("new active note")
-    expect(final.behavioralNotes?.["merger"]).toContain("archived behavior")
+    expect(final.behavioralNotes?.["merger"]?.map(n => n.text)).toContain("archived behavior")
   })
 })
 

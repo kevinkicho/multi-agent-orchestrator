@@ -413,6 +413,26 @@ body.light .role-item .role-desc { color: #666; }
 .mem-behavioral { border-left-color: #f59e0b; }
 .mem-project { border-left-color: #22c55e; }
 .mem-session { border-left-color: #8b5cf6; }
+.mem-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  color: #c0c0c0;
+}
+.mem-table th {
+  text-align: left;
+  font-weight: 600;
+  color: #22d3ee;
+  border-bottom: 1px solid #1a1a2e;
+  padding: 4px 6px;
+}
+.mem-table td {
+  padding: 5px 6px;
+  border-bottom: 1px solid #0d0d1a;
+  vertical-align: top;
+  word-break: break-word;
+}
+.mem-table tr.mem-behavioral { border-left: 3px solid #f59e0b; }
 .mem-session-header {
   display: flex;
   gap: 8px;

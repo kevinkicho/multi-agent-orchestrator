@@ -13,6 +13,30 @@ export type BrainMemoryEntry = {
   agentLearnings: Record<string, string[]>
 }
 
+/** Source of a behavioral note — where in the learning loop it came from. */
+export type BehavioralNoteSource = "review" | "meta-reflection" | "manual" | "legacy"
+
+/** Provenance of a behavioral note — where/when/why it was created. */
+export type BehavioralNoteProvenance = {
+  source: BehavioralNoteSource
+  cycle: number | null
+  createdAt: number
+}
+
+/** A single firing — a cycle in which this note was judged relevant to context. */
+export type BehavioralNoteFire = {
+  cycle: number
+  at: number
+}
+
+/** Structured behavioral note. Replaces the legacy `string` shape. */
+export type BehavioralNote = {
+  id: string
+  text: string
+  provenance: BehavioralNoteProvenance
+  fires: BehavioralNoteFire[]
+}
+
 export type BrainMemoryStore = {
   /** @deprecated Flat entries — kept for migration from old format */
   entries: BrainMemoryEntry[]
@@ -21,7 +45,7 @@ export type BrainMemoryStore = {
   /** Persistent notes the brain has accumulated about the projects */
   projectNotes: Record<string, string[]>
   /** Behavioral notes about how agents work best (injected into supervisor system prompts) */
-  behavioralNotes?: Record<string, string[]>
+  behavioralNotes?: Record<string, BehavioralNote[]>
   /** Per-agent progress assessments from the progress assessor, cap 10 each */
   progressAssessments?: Record<string, ProgressAssessment[]>
 }
@@ -32,7 +56,7 @@ export type AgentMemoryArchive = {
   directoryHash: string
   directory?: string
   archivedAt: number
-  behavioralNotes: string[]
+  behavioralNotes: BehavioralNote[]
   projectNotes: string[]
   sessionSummaries: BrainMemoryEntry[]
   lastDirective?: string
@@ -80,6 +104,52 @@ function withWriteLock<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Migration: legacy string[] behavioralNotes → BehavioralNote[]
+// ---------------------------------------------------------------------------
+
+/** Stable short ID for a note. Hash of text keeps replays deterministic. */
+function makeNoteId(text: string, createdAt: number): string {
+  return createHash("sha256").update(`${createdAt}:${text}`).digest("hex").slice(0, 12)
+}
+
+/** Wrap a legacy string entry as a BehavioralNote with source="legacy". */
+function wrapLegacyBehavioralNote(text: string): BehavioralNote {
+  return {
+    id: makeNoteId(text, 0),
+    text,
+    provenance: { source: "legacy", cycle: null, createdAt: 0 },
+    fires: [],
+  }
+}
+
+/** Structural check — a widened note has .text/.provenance/.fires. */
+function isBehavioralNote(v: unknown): v is BehavioralNote {
+  if (!v || typeof v !== "object") return false
+  const o = v as Record<string, unknown>
+  return typeof o.text === "string"
+    && typeof o.provenance === "object"
+    && Array.isArray(o.fires)
+}
+
+/** Migrate the behavioralNotes map, wrapping any legacy string entries. */
+function migrateBehavioralNotes(
+  raw: Record<string, unknown> | undefined,
+): Record<string, BehavioralNote[]> | undefined {
+  if (!raw) return undefined
+  const out: Record<string, BehavioralNote[]> = {}
+  for (const [agent, val] of Object.entries(raw)) {
+    if (!Array.isArray(val)) continue
+    out[agent] = val.map(item => {
+      if (typeof item === "string") return wrapLegacyBehavioralNote(item)
+      if (isBehavioralNote(item)) return item
+      // Unknown shape — drop silently rather than crash on load
+      return null
+    }).filter((n): n is BehavioralNote => n !== null)
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
 // Migration: flat entries[] → per-agent agentEntries{}
 // ---------------------------------------------------------------------------
 
@@ -118,7 +188,9 @@ function migrateBrainMemory(store: BrainMemoryStore): BrainMemoryStore {
 
 export async function loadBrainMemory(): Promise<BrainMemoryStore> {
   const raw = await readJsonFile<BrainMemoryStore>(getMemoryPath(), { ...DEFAULT_STORE, entries: [], projectNotes: {} })
-  return migrateBrainMemory(raw)
+  const migrated = migrateBrainMemory(raw)
+  const behavioralNotes = migrateBehavioralNotes(raw.behavioralNotes as Record<string, unknown> | undefined)
+  return { ...migrated, behavioralNotes }
 }
 
 export async function saveBrainMemory(store: BrainMemoryStore): Promise<void> {
@@ -170,8 +242,9 @@ export async function addProjectNote(
   })
 }
 
-/** Extract meaningful keywords from a note (>3 chars, lowercased, no numbers-only) */
-function extractKeywords(text: string): Set<string> {
+/** Extract meaningful keywords from a note (>3 chars, lowercased, no numbers-only).
+ *  Exported so the fire-tracker can reuse the same tokenization heuristic. */
+export function extractKeywords(text: string): Set<string> {
   return new Set(
     text.toLowerCase()
       .replace(/[^a-z0-9\s]/g, "")
@@ -180,8 +253,8 @@ function extractKeywords(text: string): Set<string> {
   )
 }
 
-/** Keyword overlap similarity — returns 0..1 */
-function keywordSimilarity(a: string, b: string): number {
+/** Keyword overlap similarity — returns 0..1. Exported for fire-tracker reuse. */
+export function keywordSimilarity(a: string, b: string): number {
   const wordsA = extractKeywords(a)
   const wordsB = extractKeywords(b)
   if (wordsA.size === 0 || wordsB.size === 0) return 0
@@ -204,28 +277,45 @@ function isSameTopic(a: string, b: string): boolean {
   return false
 }
 
+export type AddBehavioralNoteOptions = {
+  source?: BehavioralNoteSource
+  cycle?: number | null
+}
+
 export async function addBehavioralNote(
   _store: BrainMemoryStore,
   agentName: string,
   note: string,
+  options?: AddBehavioralNoteOptions,
 ): Promise<BrainMemoryStore> {
   return withWriteLock(async () => {
     const fresh = await loadBrainMemory()
     const notes = fresh.behavioralNotes?.[agentName] ?? []
+    const createdAt = Date.now()
+    const source: BehavioralNoteSource = options?.source ?? "manual"
+    const cycle = options?.cycle ?? null
 
-    const sameTopicIdx = notes.findIndex(existing => isSameTopic(existing, note))
+    const sameTopicIdx = notes.findIndex(existing => isSameTopic(existing.text, note))
 
-    let updated: string[]
+    let updated: BehavioralNote[]
     if (sameTopicIdx !== -1) {
       const existing = notes[sameTopicIdx]!
-      if (note.length >= existing.length) {
+      if (note.length >= existing.text.length) {
+        // Replace the text but preserve ID + fires + original provenance. Fire
+        // history is a property of the topic, not the specific wording.
         updated = [...notes]
-        updated[sameTopicIdx] = note
+        updated[sameTopicIdx] = { ...existing, text: note }
       } else {
         return fresh
       }
     } else {
-      updated = [...notes, note]
+      const fresh_note: BehavioralNote = {
+        id: makeNoteId(note, createdAt),
+        text: note,
+        provenance: { source, cycle, createdAt },
+        fires: [],
+      }
+      updated = [...notes, fresh_note]
     }
 
     const result: BrainMemoryStore = {
@@ -233,6 +323,39 @@ export async function addBehavioralNote(
       behavioralNotes: {
         ...(fresh.behavioralNotes ?? {}),
         [agentName]: updated.slice(-10),
+      },
+    }
+    await saveBrainMemory(result)
+    return result
+  })
+}
+
+/** Record that one or more behavioral notes fired in a given cycle. Updates
+ *  the `fires[]` trace for each matched note and persists atomically. */
+export async function recordBehavioralNoteFires(
+  agentName: string,
+  noteIds: string[],
+  cycle: number,
+): Promise<BrainMemoryStore | null> {
+  if (noteIds.length === 0) return null
+  return withWriteLock(async () => {
+    const fresh = await loadBrainMemory()
+    const notes = fresh.behavioralNotes?.[agentName] ?? []
+    if (notes.length === 0) return fresh
+    const idSet = new Set(noteIds)
+    const at = Date.now()
+    let changed = false
+    const updated = notes.map(n => {
+      if (!idSet.has(n.id)) return n
+      changed = true
+      return { ...n, fires: [...n.fires, { cycle, at }] }
+    })
+    if (!changed) return fresh
+    const result: BrainMemoryStore = {
+      ...fresh,
+      behavioralNotes: {
+        ...(fresh.behavioralNotes ?? {}),
+        [agentName]: updated,
       },
     }
     await saveBrainMemory(result)
@@ -459,14 +582,20 @@ export async function loadAgentArchive(agentName: string, directory?: string): P
     const content = await readFileOrNull(path)
     if (!content) continue
     try {
-      const archive = JSON.parse(content) as AgentMemoryArchive
-      if (!archive.agentName || !Array.isArray(archive.behavioralNotes)) continue
+      const rawArchive = JSON.parse(content) as AgentMemoryArchive & { behavioralNotes?: unknown[] }
+      if (!rawArchive.agentName || !Array.isArray(rawArchive.behavioralNotes)) continue
       // If both the archive and the request have directory info, verify they match
-      if (directory && archive.directoryHash) {
+      if (directory && rawArchive.directoryHash) {
         const expected = hashDirectory(directory)
-        if (archive.directoryHash !== expected) continue // wrong project — skip
+        if (rawArchive.directoryHash !== expected) continue // wrong project — skip
       }
-      return archive
+      // Wrap any legacy string behavioral notes in the archive
+      const notes: BehavioralNote[] = rawArchive.behavioralNotes.map(item =>
+        typeof item === "string"
+          ? wrapLegacyBehavioralNote(item)
+          : isBehavioralNote(item) ? item : null
+      ).filter((n): n is BehavioralNote => n !== null)
+      return { ...rawArchive, behavioralNotes: notes }
     } catch {
       continue
     }

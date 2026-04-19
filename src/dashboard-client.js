@@ -2350,13 +2350,31 @@ async function loadNotes(agentName) {
 
     // Behavioral notes — supervisor writes these about worker interaction,
     // for the orchestrator agent to review and improve project execution.
+    // API now returns objects: { text, provenance, fireCount, cyclesSinceLastFire, ... }
+    // Also accepts legacy string entries for backward compatibility.
     if (data.behavioralNotes && data.behavioralNotes.length > 0) {
       html += '<div class="mem-section">'
       html += '<div class="mem-section-title">Behavioral Notes</div>'
+      html += '<table class="mem-table"><thead><tr>'
+      html += '<th>Lesson</th><th>Source</th><th>Fires</th><th>Since last</th>'
+      html += '</tr></thead><tbody>'
       for (var i = 0; i < data.behavioralNotes.length; i++) {
-        html += '<div class="mem-entry mem-behavioral">' + escapeHtml(data.behavioralNotes[i]) + '</div>'
+        var n = data.behavioralNotes[i]
+        if (typeof n === 'string') {
+          html += '<tr class="mem-behavioral"><td>' + escapeHtml(n) + '</td><td>—</td><td>0</td><td>—</td></tr>'
+          continue
+        }
+        var src = n.provenance && n.provenance.source ? n.provenance.source : '—'
+        var fires = typeof n.fireCount === 'number' ? n.fireCount : (n.fires ? n.fires.length : 0)
+        var since = n.cyclesSinceLastFire === null || n.cyclesSinceLastFire === undefined ? '—' : String(n.cyclesSinceLastFire)
+        html += '<tr class="mem-behavioral">'
+          + '<td>' + escapeHtml(n.text || '') + '</td>'
+          + '<td>' + escapeHtml(src) + '</td>'
+          + '<td>' + fires + '</td>'
+          + '<td>' + since + '</td>'
+          + '</tr>'
       }
-      html += '</div>'
+      html += '</tbody></table></div>'
     }
 
     // Project notes

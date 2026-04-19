@@ -62,8 +62,12 @@ export function resolveOpencode(deps: ResolveOpencodeDeps = {}): OpencodeLaunch 
 }
 
 export function buildOpencodeSpawnCmd(launch: OpencodeLaunch, port: number): string[] {
+  // `--print-logs` mirrors opencode's internal logs to stderr. Without it, the
+  // piped stderr is empty no matter what goes wrong inside — provider-load
+  // failures, missing-API-key errors, and upstream 4xx/5xx all vanish. INFO is
+  // chatty enough to expose real issues but not so chatty it floods the log.
   if (launch.mode === "binary") {
-    return [launch.bin, "serve", "--port", String(port), "--hostname", "127.0.0.1"]
+    return [launch.bin, "serve", "--print-logs", "--log-level", "INFO", "--port", String(port), "--hostname", "127.0.0.1"]
   }
   return [
     "bun", "run",
@@ -71,6 +75,8 @@ export function buildOpencodeSpawnCmd(launch: OpencodeLaunch, port: number): str
     "--conditions=browser",
     launch.entry,
     "serve",
+    "--print-logs",
+    "--log-level", "INFO",
     "--port", String(port),
   ]
 }

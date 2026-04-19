@@ -86,6 +86,8 @@ describe("buildOpencodeSpawnCmd", () => {
     expect(buildOpencodeSpawnCmd(launch, 12345)).toEqual([
       "/repo/node_modules/.bin/opencode",
       "serve",
+      "--print-logs",
+      "--log-level", "INFO",
       "--port", "12345",
       "--hostname", "127.0.0.1",
     ])
@@ -103,6 +105,8 @@ describe("buildOpencodeSpawnCmd", () => {
       "--conditions=browser",
       "/src/opencode/src/index.ts",
       "serve",
+      "--print-logs",
+      "--log-level", "INFO",
       "--port", "23456",
     ])
   })

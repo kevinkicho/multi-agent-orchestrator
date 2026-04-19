@@ -562,28 +562,31 @@ export class ProjectManager {
     this.dashLog.push({ type: "brain-thinking", text: `Adding project: ${projectName} at ${resolvedDir} (port ${port})` })
 
     try {
-      // Spawn opencode serve instance. We run it with cwd set to a
-      // scratch workspace that contains an opencode.json synthesized from our
-      // own provider registry — without this, opencode reads only its global
-      // config (~/.config/opencode/opencode.json) and silently falls back to
-      // whatever default model that file has, making our provider picker a no-op.
+      // Spawn opencode serve instance. We generate an opencode.json from our
+      // own provider registry and point OPENCODE_CONFIG at it — without this,
+      // opencode reads only its global config (~/.config/opencode/opencode.json)
+      // and silently falls back to whatever default model that file has,
+      // making our provider picker a no-op. (Cwd is NOT the right lever:
+      // opencode resolves project config from the session's `directory` SDK
+      // param, not from the serve process's cwd.)
       const launch = getOpencodeLaunch()
       const { prepareWorkerScratch } = await import("./opencode-config")
       const { loadProviders } = await import("./providers")
       const providers = await loadProviders()
-      const scratchDir = await prepareWorkerScratch(id, providers).catch((err) => {
+      const scratchConfigPath = await prepareWorkerScratch(id, providers).catch((err) => {
         // Non-fatal: if we can't write the scratch config, fall through to
         // opencode's global config. Surface the reason so the user sees why
         // the worker is going to misroute.
         this.dashLog.push({ type: "brain-thinking", text: `[worker-spawn] Could not prepare opencode scratch config: ${err instanceof Error ? err.message : String(err)}` })
         return null
       })
+      const spawnEnv = computeWorkerSpawnEnv(process.env, resolvedDir, this.securityConfig)
+      if (scratchConfigPath) spawnEnv.OPENCODE_CONFIG = scratchConfigPath
       const proc = spawn({
         cmd: buildOpencodeSpawnCmd(launch, port),
         stdout: "pipe",
         stderr: "pipe",
-        env: computeWorkerSpawnEnv(process.env, resolvedDir, this.securityConfig),
-        ...(scratchDir ? { cwd: scratchDir } : {}),
+        env: spawnEnv,
       })
       this.processes.set(id, proc)
 

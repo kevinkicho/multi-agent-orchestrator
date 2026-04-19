@@ -16,6 +16,7 @@ import {
   toOpencodeProviderEntry,
   prepareWorkerScratch,
   scratchDirFor,
+  scratchConfigPathFor,
 } from "../opencode-config"
 
 function mk(overrides: Partial<LLMProvider>): LLMProvider {
@@ -115,16 +116,18 @@ describe("buildOpencodeConfig", () => {
 })
 
 describe("prepareWorkerScratch", () => {
-  test("writes an opencode.json into a scratch dir under the given repo root", async () => {
+  test("writes an opencode.json and returns the file path (not the dir)", async () => {
     const tmp = await mkdtemp(resolve(tmpdir(), "oc-cfg-"))
     try {
-      const dir = await prepareWorkerScratch("proj-1", [mk({ id: "opencode-go", apiKeyEnv: "OPENCODE_GO_API_KEY" })], tmp)
+      const configPath = await prepareWorkerScratch("proj-1", [mk({ id: "opencode-go", apiKeyEnv: "OPENCODE_GO_API_KEY" })], tmp)
 
-      expect(dir).toBe(scratchDirFor("proj-1", tmp))
-      const s = await stat(dir)
-      expect(s.isDirectory()).toBe(true)
+      // Callers pass the returned path to OPENCODE_CONFIG — it must be the
+      // file path, not the directory, because opencode expects a file.
+      expect(configPath).toBe(scratchConfigPathFor("proj-1", tmp))
+      const dirStat = await stat(scratchDirFor("proj-1", tmp))
+      expect(dirStat.isDirectory()).toBe(true)
 
-      const contents = await readFile(resolve(dir, "opencode.json"), "utf-8")
+      const contents = await readFile(configPath, "utf-8")
       const parsed = JSON.parse(contents)
       expect(parsed.$schema).toBe("https://opencode.ai/config.json")
       expect(parsed.provider["opencode-go"]).toBeDefined()
@@ -138,9 +141,9 @@ describe("prepareWorkerScratch", () => {
     const tmp = await mkdtemp(resolve(tmpdir(), "oc-cfg-"))
     try {
       await prepareWorkerScratch("proj-1", [mk({ id: "a", models: ["m"] })], tmp)
-      await prepareWorkerScratch("proj-1", [mk({ id: "b", models: ["m"] })], tmp)
+      const configPath = await prepareWorkerScratch("proj-1", [mk({ id: "b", models: ["m"] })], tmp)
 
-      const contents = await readFile(resolve(scratchDirFor("proj-1", tmp), "opencode.json"), "utf-8")
+      const contents = await readFile(configPath, "utf-8")
       const parsed = JSON.parse(contents)
       expect(Object.keys(parsed.provider)).toEqual(["b"])
     } finally {
@@ -151,12 +154,12 @@ describe("prepareWorkerScratch", () => {
   test("different project IDs get isolated scratch dirs", async () => {
     const tmp = await mkdtemp(resolve(tmpdir(), "oc-cfg-"))
     try {
-      const dirA = await prepareWorkerScratch("p-a", [mk({ id: "a", models: ["m"] })], tmp)
-      const dirB = await prepareWorkerScratch("p-b", [mk({ id: "b", models: ["m"] })], tmp)
-      expect(dirA).not.toBe(dirB)
+      const pathA = await prepareWorkerScratch("p-a", [mk({ id: "a", models: ["m"] })], tmp)
+      const pathB = await prepareWorkerScratch("p-b", [mk({ id: "b", models: ["m"] })], tmp)
+      expect(pathA).not.toBe(pathB)
 
-      const parsedA = JSON.parse(await readFile(resolve(dirA, "opencode.json"), "utf-8"))
-      const parsedB = JSON.parse(await readFile(resolve(dirB, "opencode.json"), "utf-8"))
+      const parsedA = JSON.parse(await readFile(pathA, "utf-8"))
+      const parsedB = JSON.parse(await readFile(pathB, "utf-8"))
       expect(Object.keys(parsedA.provider)).toEqual(["a"])
       expect(Object.keys(parsedB.provider)).toEqual(["b"])
     } finally {

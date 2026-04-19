@@ -11,11 +11,14 @@
  * empty responses without surfacing any error.
  *
  * Solution: before spawning opencode serve for a worker, we generate an
- * opencode.json into a scratch directory that we own, set the worker's cwd to
- * that scratch dir, and set OPENCODE_PROJECT_DIR to the actual project. Opencode
- * picks up the scratch config (merging with the global one) and the worker gets
- * access to exactly the providers we've enabled — with `{env:VAR}` templates
- * expanded from the worker's own environment.
+ * opencode.json into a scratch directory we own, then point OPENCODE_CONFIG
+ * at it on the spawn env. Opencode merges that file with its global config,
+ * so the worker sees exactly the providers we've enabled — with `{env:VAR}`
+ * templates expanded from the spawn environment. Cwd isn't the right lever
+ * here: opencode resolves project config from the session's `directory`
+ * param (the worker's branch checkout), not from the serve process's cwd,
+ * which is why the earlier cwd-based attempt looked plausible but never
+ * actually got the config merged.
  */
 import { mkdir, writeFile } from "fs/promises"
 import { resolve } from "path"
@@ -115,9 +118,17 @@ export function scratchDirFor(projectId: string, repoRoot?: string): string {
   return resolve(root, SCRATCH_ROOT, projectId)
 }
 
-/** Ensure the scratch directory exists and contains an opencode.json derived
- *  from the given providers. Returns the path to the scratch dir. The caller
- *  spawns opencode with cwd = scratchDir so opencode picks up this config. */
+/** Resolve the scratch opencode.json path for a given project ID.
+ *  Callers pass this as OPENCODE_CONFIG on the worker spawn env. */
+export function scratchConfigPathFor(projectId: string, repoRoot?: string): string {
+  return resolve(scratchDirFor(projectId, repoRoot), "opencode.json")
+}
+
+/** Write the generated opencode.json into the project's scratch dir.
+ *  Returns the *config file path* (not the dir) — callers pass it as
+ *  OPENCODE_CONFIG on the worker spawn env, which is the only reliable
+ *  way to get opencode to merge our provider list (serve process cwd is
+ *  not consulted for project-scoped config). */
 export async function prepareWorkerScratch(
   projectId: string,
   providers: LLMProvider[],
@@ -126,7 +137,7 @@ export async function prepareWorkerScratch(
   const dir = scratchDirFor(projectId, repoRoot)
   await mkdir(dir, { recursive: true })
   const config = buildOpencodeConfig(providers)
-  const configPath = resolve(dir, "opencode.json")
+  const configPath = scratchConfigPathFor(projectId, repoRoot)
   await writeFile(configPath, JSON.stringify(config, null, 2), "utf-8")
-  return dir
+  return configPath
 }

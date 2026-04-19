@@ -8,6 +8,7 @@ nul/
 .orchestrator-session.json
 .orchestrator/
 .orchestrator-ledger.json
+.orchestrator-shared.json
 .orchestrator-chat-log/
 orchestrator-projects.json
 orchestrator-tasks.json

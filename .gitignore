@@ -10,6 +10,7 @@ nul/
 .orchestrator-ledger.json
 .orchestrator-shared.json
 .orchestrator-chat-log/
+.orchestrator-workspaces/
 orchestrator-projects.json
 orchestrator-tasks.json
 orchestrator-performance.json

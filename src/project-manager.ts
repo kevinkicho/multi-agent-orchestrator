@@ -562,13 +562,28 @@ export class ProjectManager {
     this.dashLog.push({ type: "brain-thinking", text: `Adding project: ${projectName} at ${resolvedDir} (port ${port})` })
 
     try {
-      // Spawn opencode serve instance
+      // Spawn opencode serve instance. We run it with cwd set to a
+      // scratch workspace that contains an opencode.json synthesized from our
+      // own provider registry — without this, opencode reads only its global
+      // config (~/.config/opencode/opencode.json) and silently falls back to
+      // whatever default model that file has, making our provider picker a no-op.
       const launch = getOpencodeLaunch()
+      const { prepareWorkerScratch } = await import("./opencode-config")
+      const { loadProviders } = await import("./providers")
+      const providers = await loadProviders()
+      const scratchDir = await prepareWorkerScratch(id, providers).catch((err) => {
+        // Non-fatal: if we can't write the scratch config, fall through to
+        // opencode's global config. Surface the reason so the user sees why
+        // the worker is going to misroute.
+        this.dashLog.push({ type: "brain-thinking", text: `[worker-spawn] Could not prepare opencode scratch config: ${err instanceof Error ? err.message : String(err)}` })
+        return null
+      })
       const proc = spawn({
         cmd: buildOpencodeSpawnCmd(launch, port),
         stdout: "pipe",
         stderr: "pipe",
         env: computeWorkerSpawnEnv(process.env, resolvedDir, this.securityConfig),
+        ...(scratchDir ? { cwd: scratchDir } : {}),
       })
       this.processes.set(id, proc)
 
@@ -1012,6 +1027,14 @@ export class ProjectManager {
     }
 
     usedPorts.delete(project.workerPort)
+
+    // Clean up the opencode scratch workspace so dead projects don't leave
+    // stale provider configs lying around. Non-fatal — missing/already-gone is fine.
+    try {
+      const { rm } = await import("fs/promises")
+      const { scratchDirFor } = await import("./opencode-config")
+      await rm(scratchDirFor(projectId), { recursive: true, force: true }).catch(() => {})
+    } catch { /* best-effort cleanup */ }
 
     // Remove from the projects map so it doesn't leak memory over many add/remove cycles
     this.projects.delete(projectId)

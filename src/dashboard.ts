@@ -134,6 +134,9 @@ export async function startDashboard(
     appendChatEvent(event).catch((err) => console.error("[chat-log] persist failed:", err))
   })
 
+  // Track active SSE stream controllers so we can broadcast shutdown and close them gracefully
+  const sseControllers = new Set<ReadableStreamDefaultController>()
+
   const server = Bun.serve({
     port,
     hostname: "127.0.0.1",
@@ -240,6 +243,7 @@ export async function startDashboard(
 
         const stream = new ReadableStream({
           start(controller) {
+            sseControllers.add(controller)
             const encoder = new TextEncoder()
             const send = (data: string) => {
               try { controller.enqueue(encoder.encode(`data: ${data}\n\n`)) } catch { /* client disconnected */ }
@@ -259,6 +263,7 @@ export async function startDashboard(
 
             // Clean up on disconnect
             req.signal.addEventListener("abort", () => {
+              sseControllers.delete(controller)
               unsub()
               try { controller.close() } catch {}
             })
@@ -1661,10 +1666,26 @@ export async function startDashboard(
 
 
 
+  // Broadcast shutdown event to all SSE clients, then close their streams
+  function broadcastSseShutdown() {
+    const encoder = new TextEncoder()
+    for (const controller of sseControllers) {
+      try {
+        controller.enqueue(encoder.encode(`data: {"type":"server_shutdown"}\n\n`))
+      } catch {}
+      try { controller.close() } catch {}
+    }
+    sseControllers.clear()
+  }
+
   return {
     stop() {
       persistUnsub()
-      server.stop(true) // close all open connections immediately
+      broadcastSseShutdown()
+      server.stop(false) // stop accepting new connections, let in-flight drain
+      setTimeout(() => {
+        try { server.stop(true) } catch {} // force-kill anything still lingering after 5s
+      }, 5000)
     },
   }
 }

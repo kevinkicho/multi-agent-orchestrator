@@ -162,7 +162,7 @@ function parseArgs(): {
   const args = process.argv.slice(2)
   let autoApprove = false
   let verbose = false
-  let dashboardPort = 4000
+  let dashboardPort = 15828
   let dashboardPortExplicit = false
   let configPath: string | undefined
   let tui = false

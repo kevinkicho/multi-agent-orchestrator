@@ -1,7 +1,7 @@
 {
   "autoApprove": false,
   "pollInterval": 2000,
-  "dashboardPort": 4000,
+  "dashboardPort": 15828,
   "mode": "projects",
   "brain": {
     "ollamaUrl": "http://127.0.0.1:11434",

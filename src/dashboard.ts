@@ -23,6 +23,29 @@ function sanitizeParam(raw: string): string {
   return decodeURIComponent(raw).replace(/[\/\\\.]{2,}/g, "").replace(/[\x00-\x1f]/g, "")
 }
 
+/** Slice a list from the newest end, honoring ?limit & ?offset query params.
+ *  Convention: offset counts backward from the end, so `offset=0,limit=50`
+ *  returns the most-recent 50 entries (in their original order). A negative
+ *  or non-numeric limit falls back to `defaultLimit`; out-of-range values
+ *  clamp to `[1, maxLimit]`. Returns `{slice, total}` so callers can expose
+ *  the pre-slice count in a header or body field. See KNOWN_LIMITATIONS §7. */
+export function sliceFromTail<T>(
+  items: readonly T[],
+  params: URLSearchParams,
+  opts: { defaultLimit: number; maxLimit: number },
+): { slice: T[]; total: number } {
+  const limitRaw = Number(params.get("limit"))
+  const offsetRaw = Number(params.get("offset"))
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0
+    ? Math.min(Math.floor(limitRaw), opts.maxLimit)
+    : opts.defaultLimit
+  const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? Math.floor(offsetRaw) : 0
+  const total = items.length
+  const end = Math.max(total - offset, 0)
+  const start = Math.max(end - limit, 0)
+  return { slice: items.slice(start, end), total }
+}
+
 /** Base shape shared by every dashboard event. `t` is stamped server-side by
  *  DashboardLog.push so clients can dedupe between live SSE and replayed history. */
 type DashboardEventBase = { t?: number }
@@ -111,7 +134,7 @@ export async function startDashboard(
     resourceManager?: import("./resource-manager").ResourceManager;
     tokenTracker?: import("./token-tracker").TokenTracker;
   },
-): Promise<{ stop: () => void }> {
+): Promise<{ stop: () => void; gracefulStop: (opts?: { drainMs?: number }) => Promise<void> }> {
   // Generate a session token for API authentication.
   // This prevents other local processes from executing arbitrary commands
   // via the dashboard API. The token is injected into the HTML page and
@@ -121,6 +144,13 @@ export async function startDashboard(
   // Pre-check port availability — Bun.serve() crashes at a low level on EADDRINUSE
   // before a JS catch block can intercept it, so we detect conflicts early.
   checkPortAvailable(port)
+
+  // Track active SSE subscribers so graceful shutdown can send a close frame
+  // and release their connections. Each entry carries a lightweight `send`
+  // for the farewell event and a `close` that tears down the underlying
+  // ReadableStream controller. See KNOWN_LIMITATIONS §13.
+  type SseSubscriber = { send: (payload: string) => void; close: () => void }
+  const sseSubscribers = new Set<SseSubscriber>()
 
   // Pre-build the HTML with token injected — avoids string replacement on every request
   const injectedHtml = DASHBOARD_HTML.replace(
@@ -257,10 +287,21 @@ export async function startDashboard(
               send(JSON.stringify(evt))
             })
 
-            // Clean up on disconnect
+            // Register with the graceful-shutdown set so SIGTERM/SIGINT can
+            // send a farewell frame and close this controller cleanly.
+            const entry: SseSubscriber = {
+              send,
+              close: () => {
+                unsub()
+                try { controller.close() } catch {}
+              },
+            }
+            sseSubscribers.add(entry)
+
+            // Clean up on disconnect (client side)
             req.signal.addEventListener("abort", () => {
-              unsub()
-              try { controller.close() } catch {}
+              sseSubscribers.delete(entry)
+              entry.close()
             })
           },
         })
@@ -290,12 +331,19 @@ export async function startDashboard(
         return Response.json(statuses, { headers: corsHeaders })
       }
 
-      // Messages endpoint
+      // Messages endpoint — paginated from the newest end (§7). Default
+      // returns the last 200 messages so long-running sessions don't send
+      // megabytes over the wire on every poll. Response stays as a bare
+      // array (backward-compatible with pre-pagination callers); the full
+      // pre-slice count is exposed via the `X-Total-Count` header.
       if (url.pathname.startsWith("/api/messages/")) {
         const agentName = sanitizeParam(url.pathname.slice("/api/messages/".length))
         try {
           const msgs = await orchestrator.getMessages(agentName)
-          return Response.json(msgs, { headers: corsHeaders })
+          const { slice, total } = sliceFromTail(msgs, url.searchParams, { defaultLimit: 200, maxLimit: 1000 })
+          return Response.json(slice, {
+            headers: { ...corsHeaders, "X-Total-Count": String(total) },
+          })
         } catch (err) {
           return Response.json({ error: String(err) }, { status: 404, headers: corsHeaders })
         }
@@ -949,13 +997,17 @@ export async function startDashboard(
         }
       }
 
-      // Performance log endpoint
+      // Performance log endpoint — paginated (§7). The on-disk log is capped
+      // at 500 entries, but returning all of them on every poll is still
+      // wasteful; default slice is the last 200.
       if (url.pathname === "/api/performance" && req.method === "GET") {
         try {
           const { loadPerformanceLog } = await import("./performance-log")
-          return Response.json(await loadPerformanceLog(), { headers: corsHeaders })
+          const log = await loadPerformanceLog()
+          const { slice, total } = sliceFromTail(log.entries, url.searchParams, { defaultLimit: 200, maxLimit: 500 })
+          return Response.json({ entries: slice, total }, { headers: corsHeaders })
         } catch {
-          return Response.json({ entries: [] }, { headers: corsHeaders })
+          return Response.json({ entries: [], total: 0 }, { headers: corsHeaders })
         }
       }
 
@@ -1526,7 +1578,64 @@ export async function startDashboard(
   return {
     stop() {
       persistUnsub()
+      // Best-effort drain of SSE subscribers even on immediate stop so we
+      // don't leak controllers when callers don't use gracefulStop.
+      for (const s of sseSubscribers) {
+        try { s.close() } catch {}
+      }
+      sseSubscribers.clear()
       server.stop(true) // close all open connections immediately
+    },
+    /**
+     * Drain-aware shutdown (§13). Broadcasts a `{type:"shutdown"}` frame to
+     * every active SSE subscriber so dashboards can show a disconnect
+     * message instead of silently freezing, closes those streams after a
+     * short flush window, then lets Bun's `server.stop(false)` drain in-
+     * flight HTTP requests. Falls back to a forced `stop(true)` after
+     * `drainMs` (default 5000ms) so shutdown can never hang indefinitely
+     * on a slow request.
+     */
+    async gracefulStop(opts: { drainMs?: number } = {}): Promise<void> {
+      const drainMs = Math.max(opts.drainMs ?? 5000, 0)
+      persistUnsub()
+
+      // 1. Farewell frame — give SSE clients a chance to distinguish a clean
+      //    shutdown from a network drop. Shape mirrors a BusEvent so existing
+      //    client handlers can consume it without a special branch.
+      const farewell = JSON.stringify({
+        id: `bus-shutdown-${Date.now()}`,
+        type: "dashboard-shutdown",
+        source: "dashboard",
+        timestamp: Date.now(),
+        data: { drainMs },
+      })
+      for (const s of sseSubscribers) {
+        try { s.send(farewell) } catch {}
+      }
+
+      // 2. Flush delay — let the event bytes hit the wire before we close the
+      //    controllers. 50ms is plenty for localhost; bounded by drainMs so
+      //    we never wait longer than the caller's budget.
+      const flushMs = Math.min(50, drainMs)
+      if (flushMs > 0) await new Promise(r => setTimeout(r, flushMs))
+
+      // 3. Close every SSE controller. These streams never end on their own,
+      //    so `server.stop(false)` alone would hang waiting for them.
+      for (const s of sseSubscribers) {
+        try { s.close() } catch {}
+      }
+      sseSubscribers.clear()
+
+      // 4. Ask the server to drain — stop accepting new connections, let
+      //    active HTTP requests finish. Race against drainMs and force-close
+      //    if it doesn't finish in time.
+      await Promise.race([
+        server.stop(false),
+        new Promise<void>(r => setTimeout(r, Math.max(drainMs - flushMs, 0))),
+      ])
+      // 5. Final force-close for anything still pending (long-polls, hung
+      //    handlers, etc.). Idempotent if the drain already finished.
+      try { server.stop(true) } catch {}
     },
   }
 }

@@ -44,6 +44,15 @@ type SupervisorLimits = {
   maxRoundsPerCycle?: number
   /** Time (ms) before an agent is considered stuck. Default: 300000 */
   stuckThresholdMs?: number
+  /** Max auto-restart attempts after a supervisor stops with failure.
+   *  Default: Infinity (never give up). Useful on paid APIs to cap spend on
+   *  permanently broken projects. */
+  maxSupervisorRestartAttempts?: number
+  /** Size of the rolling window used to evaluate LLM failure density before
+   *  tripping the circuit breaker. Default: 10. Trips when
+   *  `maxConsecutiveLlmFailures` failures (default 5) appear within this
+   *  window — see KNOWN_LIMITATIONS §22b. */
+  llmFailureWindow?: number
 }
 
 type TeamMemberConfig = {
@@ -1153,7 +1162,7 @@ async function main() {
   }
 
   // Start the dashboard web server
-  let dashboard: { stop: () => void }
+  let dashboard: Awaited<ReturnType<typeof startDashboard>>
   try {
     dashboard = await startDashboard(orchestrator, dashLog, dashboardPort, {
       onSoftStop() {
@@ -1203,21 +1212,29 @@ async function main() {
     updateSessionHeartbeat().catch(() => {})
   }, 30_000)
 
-  // --- Graceful shutdown on signals ---
+  // --- Graceful shutdown on signals (§13) ---
+  // First signal drains the dashboard (lets SSE clients see a farewell frame
+  // and active HTTP requests finish within a 5s budget). A second signal
+  // force-exits, so operators impatient with a hung drain still have escape.
   let shuttingDown = false
-  function gracefulShutdown(signal: string) {
+  async function gracefulShutdown(signal: string) {
     if (shuttingDown) {
       console.log(`\n[${signal}] Forced exit.`)
       process.exit(1)
     }
     shuttingDown = true
-    console.log(`\n[${signal}] Shutting down...`)
+    console.log(`\n[${signal}] Shutting down (draining dashboard connections)...`)
     clearInterval(heartbeatTimer)
     // Mark session as cleanly shut down before stopping components
     markCleanShutdown().catch(() => {})
     if (managerHandle) { try { managerHandle.stop() } catch {} }
     projectManager.shutdown()
-    dashboard.stop()
+    try {
+      await dashboard.gracefulStop({ drainMs: 5000 })
+    } catch (err) {
+      console.error(`[${signal}] Dashboard drain failed, forcing stop:`, err)
+      try { dashboard.stop() } catch {}
+    }
     orchestrator.shutdown()
     process.exit(0)
   }

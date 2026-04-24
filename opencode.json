@@ -13,5 +13,31 @@
         }
       }
     }
+  },
+  "agent": {
+    "swarm": {
+      "mode": "primary",
+      "description": "Pure text-in/text-out agent for the ollama_swarm orchestrator. No filesystem or shell access.",
+      "tools": {
+        "read": false,
+        "write": false,
+        "edit": false,
+        "multiedit": false,
+        "patch": false,
+        "bash": false,
+        "grep": false,
+        "glob": false,
+        "list": false,
+        "webfetch": false,
+        "task": false,
+        "todoread": false,
+        "todowrite": false
+      },
+      "permission": {
+        "edit": "deny",
+        "bash": "deny",
+        "webfetch": "deny"
+      }
+    }
   }
 }

@@ -207,11 +207,12 @@ export class ResourceManager {
     return this.llmCurrent
   }
 
-  /** Reset LLM slot counter — use when counter drifts due to error paths. */
+  /** Reset LLM slot counter — use when counter drifts due to error paths.
+   *  Wakes up to llmMax waiters (each callback increments llmCurrent), and
+   *  leaves any remainder queued so the invariant llmCurrent <= llmMax holds. */
   resetLlmSlots(): void {
     this.llmCurrent = 0
-    // Wake all waiters so they don't block forever
-    while (this.llmWaiters.length > 0) {
+    while (this.llmWaiters.length > 0 && this.llmCurrent < this.llmMax) {
       const next = this.llmWaiters.shift()
       if (next) next()
     }

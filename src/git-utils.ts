@@ -8,9 +8,11 @@
 // ---------------------------------------------------------------------------
 
 export async function gitExec(cwd: string, ...args: string[]): Promise<string> {
-  // Flatten so callers can pass "status --porcelain" or "status", "--porcelain"
-  const flatArgs = args.flatMap(a => a.split(" ").filter(Boolean))
-  const proc = Bun.spawn(["git", ...flatArgs], { cwd, stdout: "pipe", stderr: "pipe" })
+  // Pass args through unchanged. We intentionally do NOT split on whitespace
+  // because that would silently break legitimate args containing spaces
+  // (commit messages, file paths, --grep patterns, etc.). Callers must
+  // pre-tokenize; Bun.spawn array form is injection-safe.
+  const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" })
   // Read stdout and stderr concurrently before awaiting exit
   const [out, stderr] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -18,7 +20,7 @@ export async function gitExec(cwd: string, ...args: string[]): Promise<string> {
   ])
   const code = await proc.exited
   if (code !== 0) {
-    throw new Error(`git ${flatArgs[0]} failed (code ${code}): ${stderr.trim()}`)
+    throw new Error(`git ${args[0]} failed (code ${code}): ${stderr.trim()}`)
   }
   return out.trim()
 }

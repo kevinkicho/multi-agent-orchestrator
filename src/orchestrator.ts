@@ -436,17 +436,24 @@ export async function createOrchestrator(config: OrchestratorConfig): Promise<Or
       }
       config.onStatusChange?.(agentConfig.name, "connected")
 
+      let sessionCreated = false
       try {
         const sessionID = await agentCreateSession(agent)
         config.onStatusChange?.(agentConfig.name, "idle", `Session: ${sessionID}`)
+        sessionCreated = true
       } catch (err) {
         config.onStatusChange?.(agentConfig.name, "error", `Failed to create session: ${err}`)
       }
 
-      const sub = subscribeToAgentEvents(agent, (event) => {
-        handleEvent(agentConfig.name, agent, event)
-      })
-      eventAborts.set(agentConfig.name, sub)
+      // Only attach an SSE subscription if the session was created. Otherwise
+      // we'd hold a live reconnect loop against an agent that has no session
+      // and will never emit meaningful events.
+      if (sessionCreated) {
+        const sub = subscribeToAgentEvents(agent, (event) => {
+          handleEvent(agentConfig.name, agent, event)
+        })
+        eventAborts.set(agentConfig.name, sub)
+      }
     },
 
     removeAgent(name) {

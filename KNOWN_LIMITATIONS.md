@@ -6,6 +6,48 @@ Changes to behavior that fix these limitations should reference the relevant sec
 
 ---
 
+## For Future Agents
+
+This doc is both a record of past tradeoffs and a pick-up queue. If you've been asked to "work on a known limitation," use the **Pick-up Queue** below to choose an item, then read that § for context and ruled-out alternatives before proposing a fix.
+
+### Status legend
+
+Each § starts with a status signal (either explicit `Status:` text or implicit in the framing):
+
+- **Open** — no fix shipped yet; reasonable to work on.
+- **Partially addressed** — some concrete improvements shipped; residual work documented inline.
+- **Addressed** / **Fixed** / **Resolved** — done; kept in the doc so the rationale stays discoverable for anyone wondering "why was it built this way?"
+- **Accepted** — tradeoff is intentional for a local, single-user dev tool. Only re-open if deployment context changes (multi-user, production exposure, paid APIs at scale).
+
+### Pick-up queue
+
+Only **Open** and **Partially addressed** items appear here, sorted high → low priority. The full context lives in the linked §.
+
+| § | Title | Priority | Effort | Primary files | What a fix looks like |
+|---|---|---|---|---|---|
+| [38](#38-llm-usage-ledger-only-covers-the-orchestration-layer) | Worker LLM usage telemetry | **High** | M | `workers`, `src/llm-usage.ts` | Have worker processes append usage lines to a JSONL that the orchestrator tails — or add a small hook in opencode. Closes the biggest observability gap on paid APIs. |
+| [7](#7-dashboard-api-limitations) | Request timeouts / rate limiting on dashboard | **High** | S | `src/dashboard.ts` | Wrap mutating route handlers with a 30s timeout helper; 413-reject requests that already overflow `Content-Length` (already done) but also add a simple token-bucket per session. |
+| [8](#8-memory-not-saved-on-early-exit) | Memory not saved on circuit-break / max-rounds / abort | **High** | M | `src/supervisor.ts`, `src/brain-memory.ts` | Write a structured `{status:"interrupted", lastAction, reason}` entry to brain-memory on the early-exit paths. Feeds §36's outcome signal with real data. |
+| [22d](#22d-scope-braints-and-team-managerts-still-use-the-old-counter) | Migrate brain.ts and team-manager.ts to `FailureWindow` | **High** | S | `src/brain.ts`, `src/team-manager.ts`, `src/failure-window.ts` | Mechanical change — replace `consecutiveLlmFailures` counter with a `FailureWindow` instance; update thresholds to call `failuresInWindow()`. The helper is already exported. |
+| [14](#14-crash-recovery-loses-mid-cycle-state) | Mid-cycle crash loses failure counters | Medium | M | `src/supervisor.ts`, `src/session-state.ts` | Checkpoint critical counters (`consecutiveFailedCycles`, `cycleRestartCount`, failure window snapshot) every N rounds so a crash recovery doesn't restart with zero backoff state. |
+| [23](#23-dashboard-surfacing-of-write-failures) | Persistent write-failure log | Medium | S | `src/supervisor.ts`, `src/brain.ts`, `src/file-utils.ts` | Append failures to `.orchestrator-errors.jsonl` (capped at 500), surface from the dashboard. A supervisor running on stale memory after a silent write failure is one of the sharpest foot-guns left. |
+| [25b](#25b-tradeoff-relevance-scoring-is-heuristic-not-semantic) | Shared-knowledge false negatives on untagged notes | Medium | S | `src/shared-knowledge.ts` | Always include the N most recent notes unconditionally alongside file-filtered ones — prevents a genuinely relevant note without `[files:]` tags from silently getting dropped. |
+| [30b](#30b-tradeoff-generic-500-hides-context)–[d](#30d-supervisor-loadbrainmemory-guard) | Dashboard error-boundary gaps | Medium | M | `src/dashboard.ts` | Introduce a structured `dashboard-error` event type; route server-side handler errors and listener exceptions through it so operators see a single timeline of failures instead of console-only logs. |
+| [34](#34-prunepromote-thresholds-are-static) | Adaptive prune/promote thresholds | Medium | L | `src/brain-memory.ts`, `src/meta-reflection.ts` | **Blocked on data.** Run a multi-week session; collect promotion/unpromotion stats; only then tune. Doing this without real observations is the bike-shed failure mode. |
+| [33](#33-behavioral-note-fire-matching-is-heuristic) | Fire-matching heuristic accuracy | Medium | L | `src/fire-tracker.ts` | **Blocked on data.** Same rationale as §34. Consider embedding-based matching once it's clear where the heuristic misses. |
+| [36](#36-cycle-outcomes-are-coarse-and-heuristic) | Coarse cycle outcome bucketing | Medium | L | `src/brain-memory.ts`, `src/supervisor.ts` | **Blocked on data.** Three-bucket taxonomy may need expansion or weighting, but we need real run-log evidence first. |
+
+### Workflow tips
+
+- **Read before you code.** Every § documents what was *ruled out* and why. Many "obvious" fixes were considered and rejected — skipping that section is the fastest path to re-proposing a bad idea.
+- **Status updates after shipping.** Change the §'s first paragraph to `**Status: Addressed.**` and add a short paragraph describing the concrete change. Preserve the original framing (rename "What:" to "What (original issue):") so future readers can still see what the world looked like before.
+- **Test discipline.** `bun test` runs the full suite; add tests per module in `src/tests/` following the one-test-file-per-source-module convention. `bun x tsc --noEmit` has pre-existing `@types/node` env errors in the current tsconfig — grep out `Cannot find name 'process'|'Bun'|'fs'|'path'` when reviewing its output.
+- **Effort scale.** `S` = under half a day, `M` = half-to-one day, `L` = multi-day or blocked on prerequisite work / data.
+- **Scope discipline.** A fix for §X should only touch §X. If you notice a related limitation mid-fix, add a note to it rather than expanding scope silently — a small shipped change is better than a sprawling one that stalls in review.
+- **Don't add to this queue casually.** The signal-to-noise of this doc depends on every entry being a real tradeoff with a ruled-out paragraph, not a TODO.
+
+---
+
 ## 1. In-Memory State
 
 **What:** The event bus (200-event ring buffer) and `DashboardLog` (500-event history) are purely in-memory. All state is lost on process restart — no events, logs, or dashboard history survive.
@@ -72,16 +114,17 @@ Changes to behavior that fix these limitations should reference the relevant sec
 
 ## 7. Dashboard API Limitations
 
-**What:** The dashboard HTTP server has several limitations:
-- **No pagination** on list endpoints (`/api/ledger`, `/api/messages`, `/api/performance`, `/api/status`). These return unbounded arrays that grow over time.
+**Status: Pagination addressed.** `/api/ledger` has always honored `?limit=&offset=` via `queryLedger`. `/api/messages/<agent>` and `/api/performance` now accept the same params via a shared `sliceFromTail(items, params, {defaultLimit, maxLimit})` helper (tail-relative offset — `offset=0,limit=50` returns the most recent 50). Defaults are 200 for messages (max 1000) and 200 for performance (max 500). Response shape on `/api/messages` stays a bare array for backward compatibility; the pre-slice count is exposed via the `X-Total-Count` header. `/api/performance` returns `{ entries, total }`. `/api/status` is not paginated because it returns a fixed-size map keyed by agent name.
+
+**Remaining limitations:**
 - **No request timeouts** on slow operations like agent restart or git merge. A hung operation blocks the HTTP response indefinitely.
 - **No rate limiting** on API endpoints. Any local process with the session token can make unlimited requests.
 - **Dynamic imports** in handlers (e.g., `await import("./providers")`). These are resolved on each request rather than cached at startup, adding latency on cold paths.
 - **No graceful request cancellation** — if a client disconnects mid-request, server-side work continues.
 
-**Why:** The dashboard is a local development tool, not a production API. It serves a single user on localhost. Pagination, rate limiting, and request timeouts add complexity that doesn't provide value for single-user local usage.
+**Why:** The dashboard is a local development tool, not a production API. It serves a single user on localhost. Rate limiting and per-route timeouts add complexity that doesn't provide value for single-user local usage.
 
-**Ruled out:** Full REST framework (Express, Hono middleware chains, etc.) is overkill for a local dashboard. Dynamic imports were chosen to avoid loading unused modules (e.g., providers, analytics) on every startup. A future refactor could move to eager imports if cold-path latency becomes noticeable. Pagination should be added to `/api/ledger` and `/api/messages` if session lengths grow significantly.
+**Ruled out:** Full REST framework (Express, Hono middleware chains, etc.) is overkill for a local dashboard. Dynamic imports were chosen to avoid loading unused modules (e.g., providers, analytics) on every startup. A future refactor could move to eager imports if cold-path latency becomes noticeable.
 
 ---
 
@@ -137,13 +180,19 @@ Changes to behavior that fix these limitations should reference the relevant sec
 
 ---
 
-## 13. No Graceful Shutdown
+## 13. Graceful Dashboard Shutdown
 
-**What:** The dashboard server (`dashboard.ts`) calls `server.stop(true)` which immediately kills all connections. In-flight HTTP requests, SSE streams, and long-poll connections are terminated without completion. There is no connection draining, no SSE close frame, and no signal to the orchestrator to stop agents gracefully.
+**Status: Addressed.** `startDashboard` now returns both a `stop()` (immediate, legacy behavior) and a `gracefulStop({drainMs=5000})`. On SIGINT/SIGTERM/SIGHUP/uncaught-exception, `cli.ts::gracefulShutdown` awaits `gracefulStop(5000)`:
 
-**Why:** The dashboard is a local development tool that is typically stopped with Ctrl+C. Immediate shutdown is simpler and avoids the complexity of tracking in-flight requests, draining connections, and coordinating with the orchestrator.
+1. Every active SSE subscriber receives a `dashboard-shutdown` frame so clients can distinguish a clean shutdown from a network drop.
+2. A 50 ms flush delay lets those bytes hit the wire.
+3. Every tracked SSE controller is closed (SSE streams never terminate on their own, so `server.stop(false)` alone would hang on them).
+4. `server.stop(false)` drains in-flight HTTP requests, raced against the remaining drain budget.
+5. A final `server.stop(true)` force-closes anything still pending (hung long-polls, slow handlers) so shutdown can never hang indefinitely.
 
-**Ruled out:** Full graceful shutdown with connection draining (for now). This would require tracking all in-flight requests, implementing a drain timeout, sending SSE close frames, and signaling the orchestrator. A simpler improvement worth considering: registering SIGTERM/SIGINT handlers that call `server.stop(false)` with a 5-second drain timeout, and broadcasting a shutdown event to SSE clients.
+A second interrupt signal during shutdown force-exits immediately (`shuttingDown` flag), so operators impatient with a hung drain still have escape.
+
+**Tradeoff: no cross-process coordination.** The drain stops HTTP/SSE activity on the dashboard but does not wait for in-flight LLM calls, worker process shutdown, or git operations. Those are shut down separately by `projectManager.shutdown()` and `orchestrator.shutdown()` (both synchronous, best-effort). A true end-to-end graceful shutdown that awaits worker exits would add complexity with little payoff — workers are killed by process signal and their cleanup is idempotent.
 
 ---
 
@@ -398,36 +447,50 @@ The `EventBus` class (`event-bus.ts:38-76`) uses a `buffer` array capped at 200 
 
 4. **Network: Poll loop HTTP requests** — 2 requests every 10 seconds (status + projects) plus 1 long-poll connection. This does NOT scale with agent count and is negligible for any reasonable deployment.
 
-## 21. Auto-Restart Exponential Backoff (Never Gives Up)
+## 21. Auto-Restart Exponential Backoff
 
 ### 21a. Behavior
 
-When a supervisor stops due to failure, `ProjectManager` auto-restarts it with escalating delays rather than giving up. The first 3 failures use a fixed schedule (10s, 30s, 60s); after that, delays follow exponential backoff (30s × 2^(n-3)) capped at 10 minutes. The count resets on any of:
+When a supervisor stops due to failure, `ProjectManager` auto-restarts it with escalating delays. The first 3 failures use a fixed schedule (10s, 30s, 60s); after that, delays follow exponential backoff (30s × 2^(n-3)) capped at 10 minutes. The count resets on any of:
 
 - Successful cycle completion (`onCycleComplete`)
 - Clean supervisor stop (`isFailure=false`)
 - Manual restart via `restartSupervisor()`
 - Project removal or shutdown
 
-### 21b. Tradeoff: Perpetual Retry on Permanent Failure
+### 21b. Opt-In Cap on Restart Attempts
 
-A supervisor that will never succeed (e.g., broken directive, missing dependency) will be restarted every 10 minutes indefinitely. Each restart costs an LLM call (capability probe + first cycle) and occupies a process slot. There is no human-in-the-loop escalation after N attempts — the system assumes the problem may be transient and will eventually resolve.
+**Status: Addressed.** `SupervisorLimits.maxSupervisorRestartAttempts` bounds the number of consecutive failed auto-restarts. When the count exceeds the cap, `ProjectManager.handleSupervisorStop` skips the setTimeout reschedule, logs a `SUPERVISOR GAVE UP` alert to the dashboard, and emits a `supervisor-given-up` event on the bus (`{ attempts, limit, summary, reason, isLlmBreaker }`). The counter still resets on successful cycle, clean stop, manual restart, or project removal, so a cap of 5 means "five consecutive failures without any intervening success" — not a lifetime ceiling.
 
-**Mitigation:** The dashboard logs the attempt number and delay on each restart (`"attempt 4, next restart in 60s"`). Operators monitoring the dashboard can manually pause or remove the project. A future improvement could add a configurable maximum attempt count that escalates to a notification channel.
+**Default is `Infinity`**, preserving historical behavior. Set a finite value in `orchestrator.json` when running against paid APIs where permanently-broken projects would otherwise burn budget on a 10-minute retry loop.
+
+### 21c. Tradeoff: Coarse Give-Up Signal
+
+The cap is a single integer — there is no per-error-type tuning (e.g., "3 attempts on LLM-unreachable, 10 on other failures"). The LLM circuit breaker (§22) still applies independently within an attempt, so a single supervisor can burn its attempt budget on one kind of failure while other failure modes go untested. This is intentional: a richer policy would re-introduce the "infinite retry" failure mode when misconfigured. Operators who want differentiated handling should watch `supervisor-given-up` events and decide case-by-case.
 
 ## 22. LLM Circuit Breaker with Cross-Restart Escalation
 
 ### 22a. Behavior
 
-The supervisor tracks `consecutiveLlmFailures` across LLM calls within a single run. After 5 consecutive failures (configurable via `SupervisorLimits.maxConsecutiveLlmFailures`), the circuit breaker trips and the supervisor stops, calling `onSupervisorStop` with `reason="llm-unreachable"`.
+The supervisor tracks LLM outcomes in a fixed-size rolling window (`FailureWindow`, default size 10 via `SupervisorLimits.llmFailureWindow`). When the number of `"fail"` entries in the window reaches `SupervisorLimits.maxConsecutiveLlmFailures` (default 5), the circuit breaker trips and the supervisor stops, calling `onSupervisorStop` with `reason="llm-unreachable"`. The window is cleared on trip so a re-started supervisor starts fresh rather than inheriting the tripping condition.
 
 `ProjectManager` tracks `llmCircuitBreakerCounts` per project across restarts. Each breaker trip enforces a minimum cooldown: `5min × 2^(n-1)` for the nth consecutive trip (trip 1 = 5min, trip 2 = 10min, capped at 10min). This cooldown is applied on top of the normal auto-restart backoff via `max(normal_backoff, breaker_backoff)`.
 
 The breaker count resets when the supervisor completes a full cycle successfully (`onCycleComplete`), on clean stop, manual restart, project removal, or shutdown.
 
-### 22b. Tradeoff: Intermittent Recovery Hides Sustained Failure
+### 22b. Addressed: Intermittent Recovery No Longer Hides Sustained Failure
 
-`consecutiveLlmFailures` resets to 0 on any single successful LLM call. If the LLM provider is flaky (e.g., succeeds 1 in 5 calls at random intervals), the counter keeps resetting and the breaker may never trip despite the provider being effectively unusable. The system tolerates intermittent instability rather than declaring the provider down.
+**Status: Addressed.** Prior behavior: a single integer counter (`consecutiveLlmFailures`) was reset to 0 on any successful LLM call. A flaky provider succeeding 1 in 5 calls would pin the counter near zero and never trip — the supervisor burned tokens and wall-clock on an effectively unusable provider.
+
+Current behavior: outcomes are tracked in a rolling window. With defaults, the breaker trips when 5 of the last 10 calls failed, regardless of how the successes and failures interleave. Intermediate escalation paths (the 3-failure "pause longer" guard, the retry backoff exponent) also use `failuresInWindow()`, so a flaky provider gets the same slowdown a fully-down provider would.
+
+### 22c. Tradeoff: Window Size is a Single Knob
+
+One window size applies uniformly to timeouts, generic errors, and retry failures. A provider that times out every 8th call — barely recoverable in practice — will trip a window-of-10 breaker at `maxConsecutiveLlmFailures=5` only if ~5 of those 10 also happened to be real failures. Operators who see false positives should raise `llmFailureWindow` (more tolerant, slower to trip); operators on paid APIs who want to fail fast should lower it. Per-error-class thresholds are deliberately ruled out — the failure taxonomy is already noisy (network hiccup vs. provider outage vs. model OOM) and per-class tuning multiplies the configuration surface without a clean way to validate which class a given failure really belongs to. Rate-limit (429) errors remain on a separate counter (`consecutive429s`, §26) because their recovery semantics (provider quotas) are genuinely different from network/model failures.
+
+### 22d. Scope: brain.ts and team-manager.ts Still Use the Old Counter
+
+The window fix applies only to `runAgentSupervisor` in `src/supervisor.ts`. `src/brain.ts` and `src/team-manager.ts` still use the `consecutiveLlmFailures = 0 on success` pattern. Both are short-lived loops (brain is a one-shot objective-driven run, team-manager pauses and resumes on a longer cadence), so the blind spot is less load-bearing there. `FailureWindow` is exported from `src/failure-window.ts` for when/if those loops are migrated; the migration is mechanical but out of scope for the §22b fix.
 
 ## 23. Dashboard Surfacing of Write Failures
 

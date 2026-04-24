@@ -7,11 +7,14 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - run: bun install
+      - run: bun install --frozen-lockfile
+      - name: Check for committed secrets
+        run: bun run check-secrets
       - run: bun run typecheck
       - run: bun test

@@ -8,12 +8,12 @@ describe("warmupModel / isModelWarmed", () => {
   let fetchCalls: FetchCall[]
 
   function installFetch(handler: (url: string, init?: RequestInit) => Promise<Response>) {
-    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = mock(async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString()
       const bodyStr = typeof init?.body === "string" ? init.body : null
       fetchCalls.push({ url, body: bodyStr ? JSON.parse(bodyStr) : null })
       return handler(url, init)
-    }) as typeof globalThis.fetch
+    }) as unknown as typeof globalThis.fetch
   }
 
   beforeEach(() => {

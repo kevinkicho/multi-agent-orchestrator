@@ -42,6 +42,12 @@ function createSupervisor(opts: SupervisorOpts) {
     | { ok: false; reason: "rate-limit" | "circuit-breaker" | "llm-failure" }
   > {
     if (!running) {
+      // Once the circuit breaker trips, further calls must surface that
+      // reason — the test locks this in so a tripped breaker doesn't silently
+      // masquerade as a generic llm-failure on subsequent calls.
+      if (consecutiveLlmFailures >= opts.maxConsecutiveLlmFailures) {
+        return { ok: false, reason: "circuit-breaker" };
+      }
       return { ok: false, reason: "llm-failure" };
     }
 

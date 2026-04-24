@@ -87,7 +87,7 @@ If the Boot Status panel shows a provider as `QUOTA`, `AUTH`, or `DOWN`, fix it 
      +----------------------------------------------------+
 
      +----------------------------------------------------+
-     |      Web Dashboard (http://127.0.0.1:4000)         |
+     |      Web Dashboard (http://127.0.0.1:15828)        |
      |   Real-time logs, permissions, controls per        |
      |   project with sidebar navigation, toast           |
      |   notifications, team hierarchy, event bus         |
@@ -209,7 +209,7 @@ Configuration is loaded from `orchestrator.json` in the project root:
 {
   "autoApprove": false,
   "pollInterval": 2000,
-  "dashboardPort": 4000,
+  "dashboardPort": 15828,
   "brain": {
     "model": "glm-5.1:cloud",
     "ollamaUrl": "http://127.0.0.1:11434"
@@ -230,7 +230,7 @@ Configuration is loaded from `orchestrator.json` in the project root:
 |-------|------|---------|-------------|
 | `autoApprove` | `boolean` | `false` | Auto-approve all agent permission requests |
 | `pollInterval` | `number` | `2000` | Milliseconds between permission polling cycles |
-| `dashboardPort` | `number` | `4000` | Port for the web dashboard |
+| `dashboardPort` | `number` | `15828` | Port for the web dashboard |
 | `brain.model` | `string` | `"glm-5.1:cloud"` | Ollama model name for the supervisor brain |
 | `brain.ollamaUrl` | `string` | `"http://127.0.0.1:11434"` | Ollama API base URL |
 | `supervisor.cyclePauseSeconds` | `number` | `30` | Seconds between supervision cycles |
@@ -301,7 +301,7 @@ bun run src/cli.ts --auto-approve --dashboard-port 5000 --verbose
 
 ## Web Dashboard
 
-The dashboard is served at `http://127.0.0.1:4000` (configurable) and provides:
+The dashboard is served at `http://127.0.0.1:15828` (configurable) and provides:
 
 - **Sidebar navigation** -- Fixed sidebar with section links (Projects, Brain, Performance, Analytics, Prompt Log, Providers, Event Bus, Resources, Intents, Team, Live Events). Collapses to icon-only on narrow screens.
 - **Dynamic project rows** -- Each project appears as a collapsible row with side-by-side worker and supervisor panels

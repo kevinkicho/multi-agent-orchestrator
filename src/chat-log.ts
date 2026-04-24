@@ -61,6 +61,18 @@ function eventAgent(event: DashboardEvent): string | null {
 
 const appendCounts = new Map<string, number>()
 
+// Per-agent write lock. appendChatEvent does a read-modify-write, so without
+// serialization two back-to-back emits for the same agent can interleave and
+// lose events. Locks are per-agent because writes to different agents target
+// different files and never conflict. See review note in chat-log.ts.
+const writeLocks = new Map<string, Promise<void>>()
+function withAgentLock<T>(agent: string, fn: () => Promise<T>): Promise<T> {
+  const prev = writeLocks.get(agent) ?? Promise.resolve()
+  const next = prev.then(fn, fn)
+  writeLocks.set(agent, next.then(() => {}, () => {}))
+  return next
+}
+
 /** Append an event to the per-agent chat log. Returns true if persisted. */
 export async function appendChatEvent(event: DashboardEvent, maxBytes = DEFAULT_MAX_BYTES): Promise<boolean> {
   const agent = eventAgent(event)
@@ -73,23 +85,25 @@ export async function appendChatEvent(event: DashboardEvent, maxBytes = DEFAULT_
   const record: ChatLogRecord = { t: event.t ?? Date.now(), e: event }
   const line = JSON.stringify(record) + "\n"
 
-  try {
-    const existing = await readFileOrEmpty(file)
-    await Bun.write(file, existing + line)
-  } catch (err) {
-    console.error(`[chat-log] Failed to append event for ${agent}: ${err}`)
-    return false
-  }
-
-  // Periodic size check to avoid stat'ing every write
-  const n = (appendCounts.get(agent) ?? 0) + 1
-  appendCounts.set(agent, n)
-  if (n % ROTATION_CHECK_EVERY === 0) {
+  return withAgentLock(agent, async () => {
     try {
-      if (statSync(file).size > maxBytes) await rotate(file, maxBytes)
-    } catch { /* Intentionally silent: best-effort rotation */ }
-  }
-  return true
+      const existing = await readFileOrEmpty(file)
+      await Bun.write(file, existing + line)
+    } catch (err) {
+      console.error(`[chat-log] Failed to append event for ${agent}: ${err}`)
+      return false
+    }
+
+    // Periodic size check to avoid stat'ing every write
+    const n = (appendCounts.get(agent) ?? 0) + 1
+    appendCounts.set(agent, n)
+    if (n % ROTATION_CHECK_EVERY === 0) {
+      try {
+        if (statSync(file).size > maxBytes) await rotate(file, maxBytes)
+      } catch { /* Intentionally silent: best-effort rotation */ }
+    }
+    return true
+  })
 }
 
 async function readFileOrEmpty(file: string): Promise<string> {

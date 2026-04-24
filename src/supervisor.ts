@@ -39,6 +39,18 @@ import {
   buildEmptyNudge, buildNoParseNudge, fuzzyExtractCommands,
   SUPERVISOR_COMMANDS, SUPERVISOR_DEFAULT_CMD,
 } from "./command-recovery"
+import {
+  type SupervisorCommand,
+  parseSupervisorCommands,
+  parseJsonCommands,
+  JSON_MODE_INSTRUCTION,
+} from "./supervisor-parser"
+import {
+  pickNotesForPrompt,
+  buildSupervisorPrompt,
+  REVIEW_PROMPT,
+} from "./supervisor-prompts"
+import { FailureWindow } from "./failure-window"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -86,12 +98,27 @@ export type ProjectRole = {
 export type SupervisorLimits = {
   maxRestartsPerCycle?: number
   maxConsecutiveFailedCycles?: number
+  /** Trip the LLM circuit breaker when the number of failed calls within the
+   *  rolling window (`llmFailureWindow`) reaches this value. Despite the
+   *  historical name, this is **not** a consecutive-count threshold anymore —
+   *  a flaky provider returning 1-in-5 successes used to pin the counter at
+   *  zero and never trip. See KNOWN_LIMITATIONS §22b. Default: 5. */
   maxConsecutiveLlmFailures?: number
+  /** Size of the rolling window used to evaluate LLM failure density. Default:
+   *  10. With `maxConsecutiveLlmFailures=5`, the breaker trips at a 50%
+   *  failure rate over the last 10 calls. */
+  llmFailureWindow?: number
   restartBackoffBaseMs?: number
   maxConversationMessages?: number
   cyclePauseSeconds?: number
   maxRoundsPerCycle?: number
   stuckThresholdMs?: number
+  /** Max auto-restart attempts after a supervisor stops with failure. When the
+   *  count exceeds this value, ProjectManager emits a `supervisor-given-up`
+   *  event and stops rescheduling. Count resets on successful cycle, clean
+   *  stop, manual restart, or project removal. Default: Infinity (never give
+   *  up — preserves historical behavior; see KNOWN_LIMITATIONS §21). */
+  maxSupervisorRestartAttempts?: number
 }
 
 export type AgentSupervisorConfig = {
@@ -242,395 +269,11 @@ export type ParallelSupervisorsConfig = {
 }
 
 // ---------------------------------------------------------------------------
-// System prompt — Socratic dialogue mode
+// System prompt + command parsing
 // ---------------------------------------------------------------------------
-
-/** Pick which behavioral notes to inject into the supervisor's system prompt.
- *  Promoted principles come first, then the most recent non-promoted notes
- *  fill the remaining slots. Archived notes are never returned by this path
- *  because `pruneAndPromoteBehavioralNotes` removes them from the active
- *  list before this runs. */
-function pickNotesForPrompt(notes: BehavioralNote[], limit: number): BehavioralNote[] {
-  if (notes.length === 0 || limit <= 0) return []
-  const active = notes.filter(n => !n.archivedAt)
-  const promoted = active.filter(n => n.promotedAt)
-  const recent = active.filter(n => !n.promotedAt).slice(-limit)
-  return [...promoted, ...recent].slice(0, limit)
-}
-
-function buildSocraticPrompt(agentName: string, directory: string, reviewEnabled: boolean, hasReviewer: boolean, behavioralNotes: BehavioralNote[]): string {
-  const reviewAction = reviewEnabled
-    ? `- @review — ${hasReviewer ? "Send work to a dedicated reviewer" : "Ask the worker to self-review recent changes"}\n`
-    : ""
-
-  const behavioralSection = behavioralNotes.length > 0
-    ? `\n## Lessons from Previous Cycles\n${behavioralNotes.map(n => {
-        const badge = n.promotedAt ? " [principle]" : ""
-        return `-${badge} ${n.text}`
-      }).join("\n")}\n`
-    : ""
-
-  return `You are a thinking partner and supervisor for an AI coding agent ("the worker") on a software project.
-
-Worker: ${agentName}
-Project: ${directory}
-${behavioralSection}
-## How to work
-
-Think freely. Reason out loud. Ask yourself questions: "What is the real problem here?", "What assumptions am I making?", "Is this the right approach, or am I missing something?" Your natural-language reasoning is preserved between rounds — use it to build understanding across the conversation.
-
-When you're ready to take an action, use one of these markers on its own line:
-
-### Talking to the worker
-- @worker: <message> — Talk to the worker. Ask questions, give tasks, provide feedback, suggest alternatives. Multi-line: everything until the next @ marker is sent.
-- @check — Read the worker's recent messages to see what they've been doing.
-${reviewAction}
-### Agent lifecycle
-- @abort — Cancel the worker's current task.
-- @restart — Restart the worker's session (use when truly stuck/unresponsive).
-
-### Memory & coordination
-- @note: <text> — Save a project note for future cycles.
-- @lesson: <text> — Save a behavioral lesson about how this worker operates best.
-- @directive: <text> — Evolve the project direction as understanding deepens.
-- @broadcast: <text> — Send a message to all other supervisors.
-- @intent: <description> [files: f1, f2] — Declare planned work to avoid conflicts with other agents.
-- @share: <text> [files: f1, f2] — Share a discovery or lesson with other agents. Use [files:] to tag relevant files so agents working on similar files see it. Prefix with LESSON: for best practices, or OBSERVATION: for general notes.
-
-### Progress signals
-After each cycle, you'll see a [PROGRESS] block summarizing what changed (files, tests, behavioral notes) and a trend indicator (improving, declining, stable, stalled). You may also see a [DIRECTION] suggestion — these are rule-based recommendations based on patterns across recent cycles (e.g., "3 cycles with no changes — consider pivoting"). Use these signals to inform your @directive decisions. You are not required to follow [DIRECTION] suggestions, but they represent patterns that experienced supervisors have found useful.
-
-### Shared knowledge
-At the start of each cycle, you may see a "### Shared Knowledge from Other Agents" section with discoveries, lessons, and progress summaries from other agents working on related files. This is filtered by file-path relevance to your current work. Use @share: to publish your own discoveries to other agents, especially things they'd benefit from knowing (e.g., "LESSON: rate limiting needs exponential backoff", "@share: [files: src/auth.ts] found race condition in token refresh").
-
-### Cycle control
-- @done: <summary> — End this cycle. Summary must be specific and use these markdown section headers so future cycles can navigate it:
-  \`\`\`
-  ## Active Task
-  ## Goal
-  ## Completed Actions
-  ## Active State
-  ## Resolved Questions
-  ## Pending Asks
-  ## Remaining Work
-  \`\`\`
-  Write "(none)" inside a section that has nothing to report. A plain prose summary is accepted as a fallback but structured form is strongly preferred.
-- @stop: <summary> — Permanently stop supervising this worker.
-
-## Your approach
-
-**Think before acting.** Before sending work to the worker, reason about:
-- What's the current state? What has the worker already done?
-- What's the highest-value next step? Why this over alternatives?
-- Are there risks, edge cases, or assumptions worth questioning?
-
-**Engage with the worker's reasoning.** When the worker responds, don't just check-mark it and move on. Push back if something seems off: "You mentioned X but I don't see how that handles Y..." Build on good ideas: "That's a solid approach for the core case — what about when Z happens?"
-
-**Evolve your understanding.** Your first take on a problem may not be right. As you see the worker's output and the code's actual state, update your mental model. Use @directive to capture how your understanding of the project direction has shifted.
-
-**Be a Socratic partner, not a task dispatcher.** The best outcomes come from genuine dialogue — probing questions, building on each other's ideas, challenging assumptions. The worker is a capable reasoning agent, not a command executor.
-
-## Practical guidelines
-- Start each cycle by checking in: @check to see recent work, then think about what you learn.
-- Give the worker context and reasoning, not just bare instructions. "We need to fix X because Y, and I think the approach should be Z because..." is better than "Fix X."
-- If the worker is stuck, don't just retry — think about WHY it's stuck and try a different angle.
-- If stuck/unresponsive: @abort first, then rephrase. If still dead: @restart. Save a @lesson about what caused it.
-- Don't send 5+ messages to an unresponsive worker — escalate.
-- NEVER tell the worker to start background processes with "&". Use single commands: "node server.js & sleep 2 && npx playwright test; kill %1"
-- Prioritize: bugs > missing features > code quality > polish
-- @done summaries must be specific. Prefer the seven-section structured format above; prose like "Fixed auth bypass in /api/login. Worker implementing rate limiting. 12/15 tests passing." is only a fallback. NEVER just "Done." or "Cycle completed."
-- You manage ONLY this worker — give it your full attention.
-`
-}
-
-/** Legacy prompt builder — kept for reference/fallback */
-function buildSupervisorPrompt(agentName: string, directory: string, reviewEnabled: boolean, hasReviewer: boolean, behavioralNotes: BehavioralNote[]): string {
-  return buildSocraticPrompt(agentName, directory, reviewEnabled, hasReviewer, behavioralNotes)
-}
-
-// ---------------------------------------------------------------------------
-// Command types — shared by both Socratic and legacy parsers
-// ---------------------------------------------------------------------------
-
-type SupervisorCommand =
-  | { type: "prompt"; message: string }
-  | { type: "wait" }
-  | { type: "messages" }
-  | { type: "review" }
-  | { type: "restart" }
-  | { type: "abort" }
-  | { type: "note"; text: string }
-  | { type: "note_behavior"; text: string }
-  | { type: "directive"; text: string }
-  | { type: "notify"; message: string }
-  | { type: "intent"; description: string; files: string[] }
-  | { type: "share"; text: string; files: string[]; kind: "discovery" | "lesson" | "observation" }
-  | { type: "cycle_done"; summary: string }
-  | { type: "stop"; summary: string }
-
-// ---------------------------------------------------------------------------
-// Socratic response parser — extracts actions from natural language + @ markers
-// ---------------------------------------------------------------------------
-
-/** All recognized @ markers (order matters — longer prefixes first to avoid partial matches) */
-const SOCRATIC_MARKERS = [
-  { prefix: "@worker:", type: "prompt" as const, hasBody: true },
-  { prefix: "@check", type: "messages" as const, hasBody: false },
-  { prefix: "@review", type: "review" as const, hasBody: false },
-  { prefix: "@restart", type: "restart" as const, hasBody: false },
-  { prefix: "@abort", type: "abort" as const, hasBody: false },
-  { prefix: "@lesson:", type: "note_behavior" as const, hasBody: true },
-  { prefix: "@note:", type: "note" as const, hasBody: true },
-  { prefix: "@directive:", type: "directive" as const, hasBody: true },
-  { prefix: "@broadcast:", type: "broadcast" as const, hasBody: true },
-  { prefix: "@intent:", type: "intent" as const, hasBody: true },
-  { prefix: "@share:", type: "share" as const, hasBody: true },
-  { prefix: "@done:", type: "cycle_done" as const, hasBody: true },
-  { prefix: "@stop:", type: "stop" as const, hasBody: true },
-] as const
-
-function matchMarker(line: string): { marker: typeof SOCRATIC_MARKERS[number]; rest: string } | null {
-  const trimmed = line.trim()
-  for (const m of SOCRATIC_MARKERS) {
-    if (m.hasBody) {
-      if (trimmed.startsWith(m.prefix)) {
-        return { marker: m, rest: trimmed.slice(m.prefix.length).trim() }
-      }
-    } else {
-      // Exact match (possibly with trailing whitespace/punctuation)
-      if (trimmed === m.prefix || trimmed.startsWith(m.prefix + " ") || trimmed === m.prefix + ".") {
-        return { marker: m, rest: "" }
-      }
-    }
-  }
-  return null
-}
-
-function parseSocraticResponse(response: string): { commands: SupervisorCommand[]; thinking: string } {
-  const commands: SupervisorCommand[] = []
-  const thinkingLines: string[] = []
-
-  // Strip LLM think tags
-  const cleaned = response.replace(/<\/?think>/gi, "\n")
-  const lines = cleaned.split("\n")
-
-  let currentMarker: { marker: typeof SOCRATIC_MARKERS[number]; bodyLines: string[] } | null = null
-
-  function flushCurrent() {
-    if (!currentMarker) return
-    const body = currentMarker.bodyLines.join("\n").trim()
-    const m = currentMarker.marker
-
-    switch (m.type) {
-      case "prompt":
-        if (body) commands.push({ type: "prompt", message: body })
-        // Implicit wait after every @worker message
-        commands.push({ type: "wait" })
-        break
-      case "messages":
-        commands.push({ type: "messages" })
-        break
-      case "review":
-        commands.push({ type: "review" })
-        break
-      case "restart":
-        commands.push({ type: "restart" })
-        break
-      case "abort":
-        commands.push({ type: "abort" })
-        break
-      case "note":
-        if (body) commands.push({ type: "note", text: body })
-        break
-      case "note_behavior":
-        if (body) commands.push({ type: "note_behavior", text: body })
-        break
-      case "directive":
-        if (body) commands.push({ type: "directive", text: body })
-        break
-      case "broadcast":
-        if (body) commands.push({ type: "notify", message: body })
-        break
-      case "intent": {
-        const filesMatch = body.match(/\[files?:\s*([^\]]+)\]/)
-        const files = filesMatch
-          ? filesMatch[1]?.split(",").map(f => f.trim()).filter(Boolean) ?? []
-          : []
-        const description = body.replace(/\[files?:\s*[^\]]+\]/, "").trim()
-        if (description) commands.push({ type: "intent", description, files })
-        break
-      }
-      case "share": {
-        const shareFilesMatch = body.match(/\[files?:\s*([^\]]+)\]/)
-        const shareFiles = shareFilesMatch
-          ? shareFilesMatch[1]?.split(",").map(f => f.trim()).filter(Boolean) ?? []
-          : []
-        const shareText = body.replace(/\[files?:\s*[^\]]+\]/, "").trim()
-        // Default kind to "discovery" unless text starts with "LESSON:" or "OBSERVATION:"
-        let kind: "discovery" | "lesson" | "observation" = "discovery"
-        if (shareText.startsWith("LESSON:") || shareText.startsWith("lesson:")) kind = "lesson"
-        else if (shareText.startsWith("OBSERVATION:") || shareText.startsWith("observation:")) kind = "observation"
-        if (shareText) commands.push({ type: "share", text: shareText, files: shareFiles, kind })
-        break
-      }
-      case "cycle_done":
-        commands.push({ type: "cycle_done", summary: body || "Cycle completed." })
-        break
-      case "stop":
-        commands.push({ type: "stop", summary: body || "Supervisor stopped." })
-        break
-    }
-    currentMarker = null
-  }
-
-  for (const line of lines) {
-    const match = matchMarker(line)
-    if (match) {
-      // Flush any pending marker
-      flushCurrent()
-      // Start new marker
-      currentMarker = { marker: match.marker, bodyLines: match.rest ? [match.rest] : [] }
-      // No-body markers can be flushed immediately
-      if (!match.marker.hasBody) {
-        flushCurrent()
-      }
-    } else if (currentMarker && currentMarker.marker.hasBody) {
-      // Continuation line for a multi-line marker body
-      currentMarker.bodyLines.push(line)
-    } else {
-      // Free thinking — preserved as context
-      thinkingLines.push(line)
-    }
-  }
-
-  // Flush any trailing marker
-  flushCurrent()
-
-  return { commands, thinking: thinkingLines.join("\n").trim() }
-}
-
-// ---------------------------------------------------------------------------
-// Legacy command parsing — fallback for older command format
-// ---------------------------------------------------------------------------
-
-const LEGACY_COMMAND_PREFIXES = [
-  "PROMPT ", "WAIT", "MESSAGES", "REVIEW", "RESTART", "ABORT",
-  "NOTE_BEHAVIOR ", "NOTE ", "DIRECTIVE ", "NOTIFY ", "INTENT ",
-  "CYCLE_DONE", "STOP",
-]
-
-function isCommandLine(trimmed: string): boolean {
-  return LEGACY_COMMAND_PREFIXES.some(p => trimmed === p.trim() || trimmed.startsWith(p))
-}
-
-function parseLegacyCommands(response: string): SupervisorCommand[] {
-  const commands: SupervisorCommand[] = []
-  const cleaned = response.replace(/<\/?think>/gi, "\n")
-
-  const codeBlockMatch = cleaned.match(/```commands?\n([\s\S]*?)```/)
-  const lines = codeBlockMatch
-    ? codeBlockMatch[1]?.split("\n") ?? cleaned.split("\n")
-    : cleaned.split("\n")
-
-  let lastPrompt: { type: "prompt"; message: string } | null = null
-
-  for (const line of lines) {
-    const trimmed = line.trim()
-    if (!trimmed) continue
-
-    if (trimmed.startsWith("PROMPT ")) {
-      lastPrompt = { type: "prompt", message: trimmed.slice(7) }
-      commands.push(lastPrompt)
-    } else if (trimmed === "WAIT") {
-      lastPrompt = null
-      commands.push({ type: "wait" })
-    } else if (trimmed === "MESSAGES") {
-      lastPrompt = null
-      commands.push({ type: "messages" })
-    } else if (trimmed === "REVIEW") {
-      lastPrompt = null
-      commands.push({ type: "review" })
-    } else if (trimmed === "RESTART") {
-      lastPrompt = null
-      commands.push({ type: "restart" })
-    } else if (trimmed === "ABORT") {
-      lastPrompt = null
-      commands.push({ type: "abort" })
-    } else if (trimmed.startsWith("NOTE_BEHAVIOR ")) {
-      lastPrompt = null
-      commands.push({ type: "note_behavior", text: trimmed.slice(14) })
-    } else if (trimmed.startsWith("NOTE ")) {
-      lastPrompt = null
-      commands.push({ type: "note", text: trimmed.slice(5) })
-    } else if (trimmed.startsWith("DIRECTIVE ")) {
-      lastPrompt = null
-      commands.push({ type: "directive", text: trimmed.slice(10) })
-    } else if (trimmed.startsWith("NOTIFY ")) {
-      lastPrompt = null
-      commands.push({ type: "notify", message: trimmed.slice(7) })
-    } else if (trimmed.startsWith("INTENT ")) {
-      lastPrompt = null
-      const rest = trimmed.slice(7)
-      const filesMatch = rest.match(/\[files?:\s*([^\]]+)\]/)
-      const files = filesMatch
-        ? filesMatch[1]?.split(",").map(f => f.trim()).filter(Boolean) ?? []
-        : []
-      const description = rest.replace(/\[files?:\s*[^\]]+\]/, "").trim()
-      commands.push({ type: "intent", description, files })
-    } else if (trimmed.startsWith("CYCLE_DONE")) {
-      lastPrompt = null
-      commands.push({ type: "cycle_done", summary: trimmed.slice(10).trim() || "Cycle completed." })
-    } else if (trimmed.startsWith("STOP")) {
-      lastPrompt = null
-      commands.push({ type: "stop", summary: trimmed.slice(4).trim() || "Supervisor stopped." })
-    } else if (lastPrompt) {
-      lastPrompt.message += "\n" + trimmed
-    }
-  }
-
-  return commands
-}
-
-/** Unified parser: try Socratic @ markers first, fall back to legacy UPPERCASE commands */
-function parseSupervisorCommands(response: string): SupervisorCommand[] {
-  // Try Socratic parsing first
-  const socratic = parseSocraticResponse(response)
-  if (socratic.commands.length > 0) return socratic.commands
-
-  // Fall back to legacy command format
-  return parseLegacyCommands(response)
-}
-
-/**
- * Parse JSON-mode responses: LLM returns { commands: ["CMD arg", ...], thinking?: "..." }
- * Falls back to text parsing if JSON is malformed.
- */
-function parseJsonCommands(response: string): SupervisorCommand[] {
-  try {
-    const parsed = JSON.parse(response) as { commands?: string[]; actions?: string[]; thinking?: string }
-    const items = parsed.actions ?? parsed.commands
-    if (Array.isArray(items)) {
-      // Convert JSON array to newline-separated text and parse through unified parser
-      const asText = items.join("\n")
-      return parseSupervisorCommands(asText)
-    }
-  } catch {
-    // Not valid JSON — fall through to text parsing
-  }
-  return parseSupervisorCommands(response)
-}
-
-/** JSON-mode instruction appended to system prompt when structuredOutput is enabled */
-const JSON_MODE_INSTRUCTION = `
-
-IMPORTANT: You MUST respond with a JSON object. Format:
-{"actions": ["@check", "@worker: your message here"], "thinking": "your reasoning"}
-
-Example:
-{"actions": ["@check"], "thinking": "Let me see what the worker has been doing before deciding next steps"}
-
-Every action goes as a string in the "actions" array, using the @ marker format documented above.
-Do NOT use a code block — respond with pure JSON only.`
+// Prompt builders live in ./supervisor-prompts. Command parsers and the
+// SupervisorCommand union live in ./supervisor-parser. Both are imported
+// above — this file only contains the cycle orchestration that uses them.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -744,18 +387,7 @@ async function waitForAgent(
   return { reason: "timeout", silentSeconds: Math.round(silenceMs / 1000) }
 }
 
-
-const REVIEW_PROMPT = `Review your most recent changes critically. Examine the code you just wrote or modified:
-
-1. **Correctness**: Are there bugs, logic errors, or incorrect assumptions?
-2. **Edge cases**: What inputs or scenarios might break the code?
-3. **Error handling**: Are errors caught and handled appropriately?
-4. **Security**: Are there injection, XSS, or data exposure risks?
-5. **Tests**: Are the changes adequately tested? If not, what tests are missing?
-6. **Performance**: Are there obvious inefficiencies?
-
-Be specific — include file paths, line numbers, and code snippets for every issue you find.
-Do not be polite or vague. If everything genuinely looks good, say so and explain why.`
+// REVIEW_PROMPT moved to ./supervisor-prompts
 
 // ---------------------------------------------------------------------------
 // Per-agent supervisor loop (Phase 1 + Phase 2)
@@ -791,8 +423,17 @@ export async function runAgentSupervisor(
   const MAX_RESTARTS_PER_CYCLE = limits.maxRestartsPerCycle ?? 3
   const MAX_CONSECUTIVE_FAILED_CYCLES = limits.maxConsecutiveFailedCycles ?? 3
   const MAX_CONSECUTIVE_LLM_FAILURES = limits.maxConsecutiveLlmFailures ?? 5
+  const LLM_FAILURE_WINDOW = Math.max(limits.llmFailureWindow ?? 10, MAX_CONSECUTIVE_LLM_FAILURES)
   const RESTART_BACKOFF_BASE = limits.restartBackoffBaseMs ?? 30_000
-  let consecutiveLlmFailures = 0 // tracks persistent Ollama failures across cycles
+
+  // Rolling window of recent LLM call outcomes. Trip on failure density so a
+  // flaky provider that occasionally succeeds can no longer indefinitely
+  // reset the breaker (§22b).
+  const llmWindow = new FailureWindow(LLM_FAILURE_WINDOW)
+  const recordLlmOutcome = (ok: boolean) => llmWindow.record(ok)
+  const failuresInWindow = () => llmWindow.failures()
+  const resetLlmOutcomes = () => llmWindow.clear()
+
   let consecutive429s = 0 // tracks consecutive rate-limit (429) errors — distinct from other failures
   const MAX_CONSECUTIVE_429S = 10 // cap to prevent unbounded escalation
 
@@ -1159,22 +800,23 @@ export async function runAgentSupervisor(
         llmResult = config.resourceManager
           ? await config.resourceManager.withLlmSlot(llmCallFn)
           : await llmCallFn()
-        consecutiveLlmFailures = 0
+        recordLlmOutcome(true)
         // Decay 429 counter on success instead of resetting — allows
         // escalation across cycles while recovering naturally
         consecutive429s = Math.max(0, consecutive429s - 1)
       } catch (err) {
         if (isTimeoutError(err)) {
-          consecutiveLlmFailures++
-          emit(`LLM request timed out after ${Math.round(LLM_CALL_TIMEOUT_MS / 1000)}s (round ${round + 1}, failure #${consecutiveLlmFailures})`)
+          recordLlmOutcome(false)
+          const fails = failuresInWindow()
+          emit(`LLM request timed out after ${Math.round(LLM_CALL_TIMEOUT_MS / 1000)}s (round ${round + 1}, ${fails}/${LLM_FAILURE_WINDOW} failures in window)`)
           logPerformance({
             timestamp: Date.now(), projectName: directory, agentName, model,
             event: "cycle_error", cycleNumber: cycleCount,
             details: `llm-timeout (${Math.round(LLM_CALL_TIMEOUT_MS / 1000)}s)`,
           })
-          if (consecutiveLlmFailures >= 3) {
-            const pauseMs = Math.min(30_000 * consecutiveLlmFailures, 300_000)
-            emit(`LLM persistently timing out (${consecutiveLlmFailures} timeouts) — pausing ${Math.round(pauseMs / 1000)}s before next cycle`)
+          if (fails >= 3) {
+            const pauseMs = Math.min(30_000 * fails, 300_000)
+            emit(`LLM persistently timing out (${fails}/${LLM_FAILURE_WINDOW} failures) — pausing ${Math.round(pauseMs / 1000)}s before next cycle`)
             // Backoff happens OUTSIDE the semaphore slot — other agents can proceed
             await new Promise(r => setTimeout(r, pauseMs))
           }
@@ -1193,9 +835,10 @@ export async function runAgentSupervisor(
           await new Promise(r => setTimeout(r, cooldownMs))
           llmBreakCycle = true
         } else {
-          consecutiveLlmFailures++
-          const retryDelay = Math.min(5000 * Math.pow(2, consecutiveLlmFailures - 1), 60_000)
-          emit(`LLM request failed (round ${round + 1}, failure #${consecutiveLlmFailures}): ${err}`)
+          recordLlmOutcome(false)
+          const failsBeforeRetry = failuresInWindow()
+          const retryDelay = Math.min(5000 * Math.pow(2, failsBeforeRetry - 1), 60_000)
+          emit(`LLM request failed (round ${round + 1}, ${failsBeforeRetry}/${LLM_FAILURE_WINDOW} failures in window): ${err}`)
           emit(`Retrying in ${retryDelay / 1000}s...`)
           // Backoff OUTSIDE the semaphore slot — release slot so other agents can proceed
           await new Promise(r => setTimeout(r, retryDelay))
@@ -1205,18 +848,19 @@ export async function runAgentSupervisor(
               ? await config.resourceManager.withLlmSlot(llmCallFn)
               : await llmCallFn()
             llmResult = retryResult
-            consecutiveLlmFailures = 0
+            recordLlmOutcome(true)
             consecutive429s = Math.max(0, consecutive429s - 1)
           } catch (retryErr) {
-            consecutiveLlmFailures++
-            emit(`LLM retry failed (failure #${consecutiveLlmFailures}) — skipping to next cycle: ${retryErr}`)
+            recordLlmOutcome(false)
+            const failsAfterRetry = failuresInWindow()
+            emit(`LLM retry failed (${failsAfterRetry}/${LLM_FAILURE_WINDOW} failures in window) — skipping to next cycle: ${retryErr}`)
             logPerformance({
               timestamp: Date.now(), projectName: directory, agentName, model,
               event: "cycle_error", cycleNumber: cycleCount, details: String(retryErr),
             })
-            if (consecutiveLlmFailures >= 3) {
-              const pauseMs = Math.min(30_000 * consecutiveLlmFailures, 300_000)
-              emit(`Ollama persistently unreachable (${consecutiveLlmFailures} failures) — pausing ${pauseMs / 1000}s before next cycle`)
+            if (failsAfterRetry >= 3) {
+              const pauseMs = Math.min(30_000 * failsAfterRetry, 300_000)
+              emit(`LLM persistently unreachable (${failsAfterRetry}/${LLM_FAILURE_WINDOW} failures) — pausing ${pauseMs / 1000}s before next cycle`)
               await new Promise(r => setTimeout(r, pauseMs))
             }
             llmBreakCycle = true
@@ -1224,21 +868,27 @@ export async function runAgentSupervisor(
         }
       }
 
-      // Circuit breaker: if LLM has been persistently failing, stop the supervisor
-      if (consecutiveLlmFailures >= MAX_CONSECUTIVE_LLM_FAILURES) {
-        emit(`CIRCUIT BREAKER: ${agentName} LLM persistently unreachable (${consecutiveLlmFailures} consecutive failures across cycles) — stopping supervisor`)
+      // Circuit breaker: if failure density in the rolling window exceeds the
+      // threshold, stop the supervisor (§22b — replaces the old consecutive
+      // counter so a 1-in-5-success flaky provider can no longer hide).
+      const windowFailures = failuresInWindow()
+      if (windowFailures >= MAX_CONSECUTIVE_LLM_FAILURES) {
+        emit(`CIRCUIT BREAKER: ${agentName} LLM persistently failing (${windowFailures}/${LLM_FAILURE_WINDOW} failures in rolling window) — stopping supervisor`)
         config.dashboardLog?.push({
           type: "supervisor-alert",
           agent: agentName,
-          text: `CIRCUIT BREAKER: LLM provider unreachable after ${consecutiveLlmFailures} attempts. Supervisor stopped. Check your LLM provider or model configuration.`,
+          text: `CIRCUIT BREAKER: LLM provider failing ${windowFailures}/${LLM_FAILURE_WINDOW} of recent attempts. Supervisor stopped. Check your LLM provider or model configuration.`,
         })
         logPerformance({
           timestamp: Date.now(), projectName: directory, agentName, model,
           event: "supervisor_stop", cycleNumber: cycleCount,
-          details: `circuit-breaker-llm (${consecutiveLlmFailures} consecutive failures)`,
+          details: `circuit-breaker-llm (${windowFailures}/${LLM_FAILURE_WINDOW} failures in window)`,
         })
-        config.onThinking?.(`CIRCUIT BREAKER: LLM provider unreachable after ${consecutiveLlmFailures} attempts. Stopping supervisor.`)
-        config.onSupervisorStop?.(agentName, `LLM provider unreachable (${consecutiveLlmFailures} consecutive failures)`, true, "llm-unreachable")
+        config.onThinking?.(`CIRCUIT BREAKER: LLM provider failing ${windowFailures}/${LLM_FAILURE_WINDOW} of recent attempts. Stopping supervisor.`)
+        config.onSupervisorStop?.(agentName, `LLM provider failing ${windowFailures}/${LLM_FAILURE_WINDOW} recent attempts`, true, "llm-unreachable")
+        // Reset window so a re-started supervisor starts fresh rather than
+        // inheriting the tripping condition from this instance.
+        resetLlmOutcomes()
         break
       }
 

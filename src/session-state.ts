@@ -142,8 +142,12 @@ export function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0) // signal 0 = test if process exists
     return true
-  } catch {
-    return false
+  } catch (err) {
+    // EPERM means the process exists but we can't signal it (different UID
+    // or container namespace). Treat it as alive — otherwise crash detection
+    // can falsely claim a live orchestrator has crashed and try to liberate
+    // its port.
+    return (err as NodeJS.ErrnoException)?.code === "EPERM"
   }
 }
 

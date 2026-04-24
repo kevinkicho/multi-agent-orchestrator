@@ -128,6 +128,9 @@ export function getModelStats(log: PerformanceLog): Record<string, {
   }> = {}
 
   for (const entry of log.entries) {
+    // Skip entries with missing model field so they don't collapse into a
+    // "undefined" string bucket that pollutes aggregate stats.
+    if (!entry.model) continue
     if (!stats[entry.model]) {
       stats[entry.model] = {
         model: entry.model,

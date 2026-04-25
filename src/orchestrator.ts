@@ -36,7 +36,11 @@ const NOTABLE_EVENTS = new Set([
   "message.part.updated",
 ])
 
+/**
+ * Configuration options for the Orchestrator class
+ */
 export type OrchestratorConfig = {
+  /** Array of agent configurations */
   agents: AgentConfig[]
   /** How often to poll for permission requests (ms). Default: 2000 */
   pollInterval?: number
@@ -59,6 +63,7 @@ export type OrchestratorConfig = {
 }
 
 export type Orchestrator = {
+  /** Map of agent names to their states */
   agents: Map<string, AgentState>
   /** Send a prompt to a specific agent */
   prompt: (agentName: string, text: string) => Promise<void>

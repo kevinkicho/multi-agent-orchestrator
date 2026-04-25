@@ -10,11 +10,12 @@ export type AgentConfig = {
   /** Optional server password (OPENCODE_SERVER_PASSWORD) */
   password?: string
   /** Optional model override for this agent */
-  model?: { providerID: string; modelID: string }
+  model?: { providerID: string; modelID: string } | null
 }
 
 export type AgentStatus = "disconnected" | "idle" | "busy" | "error"
 
+/** State of an agent instance */
 export type AgentState = {
   config: AgentConfig
   client: OpencodeClient
@@ -30,6 +31,11 @@ export type AgentState = {
 }
 
 export function createAgent(config: AgentConfig): AgentState {
+  /**
+   * Create a new agent state with the given configuration.
+   * @param config - The agent configuration
+   * @returns The initialized agent state
+   */
   const headers: Record<string, string> = {}
   if (config.password) {
     headers["authorization"] = `Bearer ${config.password}`
@@ -53,8 +59,13 @@ export function createAgent(config: AgentConfig): AgentState {
   }
 }
 
-/** Create a new session on the agent and return its ID */
 export async function agentCreateSession(agent: AgentState): Promise<string> {
+  /**
+   * Create a new session on the agent and return its ID.
+   * @param agent - The agent state
+   * @returns The session ID
+   * @throws Error if session creation fails
+   */
   const res = await agent.client.session.create({})
   if (res.error) throw new Error(`Failed to create session on ${agent.config.name}: ${JSON.stringify(res.error)}`)
   const session = res.data!
@@ -64,12 +75,18 @@ export async function agentCreateSession(agent: AgentState): Promise<string> {
   return session.id
 }
 
-/** Send a prompt to the agent's current session (async — returns immediately) */
 export async function agentPrompt(
   agent: AgentState,
   text: string,
   opts?: { model?: { providerID: string; modelID: string }; system?: string },
 ): Promise<void> {
+  /**
+   * Send a prompt to the agent's current session (async — returns immediately).
+   * @param agent - The agent state
+   * @param text - The prompt text to send
+   * @param opts - Optional model or system parameters
+   * @throws Error if the prompt fails
+   */
   if (!agent.sessionID) {
     await agentCreateSession(agent)
   }
@@ -77,7 +94,7 @@ export async function agentPrompt(
   agent.lastActivity = Date.now()
   agent.busyStartTime = Date.now()
 
-  const model = opts?.model ?? agent.config.model
+  const model = opts?.model ?? agent.config.model ?? null
   const res = await agent.client.session.promptAsync({
     sessionID: agent.sessionID!,
     parts: [{ type: "text", text }],
@@ -91,51 +108,73 @@ export async function agentPrompt(
   }
 }
 
-/** Get messages from the agent's current session */
-export async function agentGetMessages(agent: AgentState) {
+export async function agentGetMessages(agent: AgentState): Promise<any[]> {
+  /**
+   * Get messages from the agent's current session.
+   * @param agent - The agent state
+   * @returns Array of messages from the agent's session
+   * @throws Error if fetching messages fails
+   */
   if (!agent.sessionID) return []
   const res = await agent.client.session.messages({ sessionID: agent.sessionID })
   if (res.error) throw new Error(`Failed to get messages from ${agent.config.name}`)
   return res.data ?? []
 }
 
-/** Get the status of all sessions on the agent */
-export async function agentGetSessionStatus(agent: AgentState) {
+export async function agentGetSessionStatus(agent: AgentState): Promise<any> {
+  /**
+   * Get the status of all sessions on the agent.
+   * @param agent - The agent state
+   * @returns Session status data
+   * @throws Error if fetching session status fails
+   */
   const res = await agent.client.session.status({})
   if (res.error) throw new Error(`Failed to get session status from ${agent.config.name}`)
   return res.data
 }
 
-/** List pending permission requests on the agent */
-export async function agentListPermissions(agent: AgentState) {
+export async function agentListPermissions(agent: AgentState): Promise<any[]> {
+  /**
+   * List pending permission requests on the agent.
+   * @param agent - The agent state
+   * @returns Array of pending permission requests
+   * @throws Error if listing permissions fails
+   */
   const res = await agent.client.permission.list({})
   if (res.error) throw new Error(`Failed to list permissions from ${agent.config.name}`)
   return res.data ?? []
 }
 
-/** Reply to a permission request on the agent.
- *
- * `reply` maps directly to the opencode SDK's enum:
- *   - "once"   — allow this request only
- *   - "always" — allow this and all future matching requests
- *   - "reject" — deny the request (pass `message` to explain why)
- */
 export async function agentReplyPermission(
   agent: AgentState,
   requestID: string,
   reply: "once" | "always" | "reject",
   message?: string,
-) {
+): Promise<void> {
+  /**
+   * Reply to a permission request on the agent.
+   * @param agent - The agent state
+   * @param requestID - The ID of the permission request
+   * @param reply - The reply value ("once", "always", or "reject")
+   * @param message - Optional message explaining the reply
+   * @throws Error if replying to permission fails
+   */
   const res = await agent.client.permission.reply({ requestID, reply, message })
   if (res.error) throw new Error(`Failed to reply to permission on ${agent.config.name}`)
 }
 
-/** Auto-answer a question from the agent (select first option or provide text) */
 export async function agentAnswerQuestion(
   agent: AgentState,
   requestID: string,
   answers: string[][],
-) {
+): Promise<void> {
+  /**
+   * Auto-answer a question from the agent (select first option or provide text).
+   * @param agent - The agent state
+   * @param requestID - The ID of the question
+   * @param answers - Array of answer options
+   * @throws Error if answering the question fails
+   */
   const res = await agent.client.question.reply({ requestID, answers })
   if (res.error) throw new Error(`Failed to answer question on ${agent.config.name}`)
 }

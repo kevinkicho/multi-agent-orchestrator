@@ -394,9 +394,12 @@ async function waitForAgent(
 // ---------------------------------------------------------------------------
 
 export async function runAgentSupervisor(
-  orchestrator: Orchestrator,
+  orchestrator: Orchestrator | null,
   config: AgentSupervisorConfig,
 ): Promise<void> {
+  if (!orchestrator) {
+    return
+  }
   const {
     agentName,
     directory,

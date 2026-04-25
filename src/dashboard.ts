@@ -1653,6 +1653,18 @@ export async function startDashboard(
         })
       }
 
+      if (url.pathname === "/api/health") {
+        // Basic health check endpoint
+        return new Response(JSON.stringify({
+          status: "ok",
+          timestamp: new Date().toISOString(),
+          uptime: process.uptime()
+        }), {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        })
+      }
+
       return new Response("Not Found", { status: 404, headers: corsHeaders })
       } catch (err) {
         console.error(`[dashboard] Unhandled error on ${req.method} ${url.pathname}:`, err)

@@ -17,6 +17,9 @@ import {
   BRAIN_COMMANDS, BRAIN_DEFAULT_CMD,
 } from "./command-recovery"
 
+/**
+ * Configuration options for the Brain class
+ */
 export type BrainConfig = {
   /** Ollama API base URL (legacy — used when model has no provider prefix) */
   ollamaUrl: string
@@ -167,7 +170,24 @@ export type ChatCompletionOpts = {
   agentName?: string
 }
 
-export async function chatCompletion(
+export /**
+ * Sends a chat completion request to the LLM provider with the given messages.
+ *
+ * @example
+ * const response = await chatCompletion(
+ *   "http://localhost:11434",
+ *   "llama3.1:8b",
+ *   [{ role: "user", content: "Hello" }],
+ *   { temperature: 0.7, maxTokens: 100, timeoutMs: 5000, role: "chat" }
+ * );
+ *
+ * @param ollamaUrl - Base URL for the Ollama API
+ * @param model - Model identifier to use for completion
+ * @param messages - Array of message objects with role and content
+ * @param options - Optional parameters for the LLM call
+ * @returns Promise resolving to the LLM's response text
+ */
+async function chatCompletion(
   ollamaUrl: string,
   model: string,
   messages: Message[],
@@ -344,6 +364,25 @@ function formatAgentInfo(orchestrator: Orchestrator): string {
   return lines.join("\n")
 }
 
+/**
+ * Executes the brain's main decision-making loop, processing rounds until
+ * the objective is met or max rounds is reached.
+ *
+ * @example
+ * await runBrain(
+ *   orchestrator,
+ *   {
+ *     ollamaUrl: "http://localhost:11434",
+ *     model: "llama3.1:8b",
+ *     objective: "Build a todo app",
+ *     maxRounds: 50
+ *   }
+ * );
+ *
+ * @param orchestrator - The orchestrator managing the agents
+ * @param config - Configuration for the brain's behavior
+ * @returns Promise that resolves when the brain finishes execution
+ */
 export async function runBrain(
   orchestrator: Orchestrator,
   config: BrainConfig,

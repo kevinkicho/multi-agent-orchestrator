@@ -792,3 +792,256 @@ The test suite covers:
 ## License
 
 MIT
+
+## Troubleshooting
+
+### Provider Setup Issues
+
+#### Authentication Failures
+If you see AUTH errors in the Boot Status panel:
+
+1. Verify your API keys are correctly set in `.env`
+2. For OpenAI: Ensure `OPENCODE_OPENAI_API_KEY` is set
+3. For Anthropic: Ensure `OPENCODE_ANTHROPIC_API_KEY` is set
+4. For Google: Ensure `OPENCODE_GO_API_KEY` is set
+5. After updating `.env`, restart the orchestrator
+
+#### Provider Not Reachable
+If you see DOWN errors:
+
+1. Check your internet connection
+2. Verify the provider's service status
+3. Ensure any required proxy settings are configured
+4. Check firewall rules aren't blocking API endpoints
+
+#### Quota Exceeded
+If you see QUOTA errors:
+
+1. Check your provider account for usage and billing
+2. Consider adding additional providers for load balancing
+3. Implement rate limiting in your workflow
+4. Wait for quota reset or upgrade your plan
+
+#### Model Not Found
+If models aren't appearing in the dashboard:
+
+1. Verify the provider API key has access to the models
+2. Some providers require explicit model enablement in their dashboard
+3. Check if the model names are correctly formatted
+4. Try refreshing the model list in the provider settings
+
+### Common Worker Issues
+
+#### Silent Fallback Behavior
+When a provider is misconfigured, workers may silently fall back to default providers:
+
+1. Always verify Boot Status shows all enabled providers as HEALTHY
+2. Check worker logs for provider routing information
+3. Test with a simple task before launching complex workflows
+
+#### Configuration Drift
+If workers behave unexpectedly:
+
+1. Verify `orchestrator-providers.json` matches dashboard settings
+2. Check per-worker `opencode.json` files in `.orchestrator-workspaces/`
+3. Ensure `.env` changes are applied (requires restart)
+4. Look for conflicting environment variables
+
+### Debugging Tips
+
+1. Enable verbose logging by setting `DEBUG=true` in `.env`
+2. Check the prompt ledger at `.orchestrator-ledger.json` for request/response details
+3. Monitor the supervisor logs for decision-making insights
+4. Use the dashboard's real-time inspection to view agent communications
+
+
+## Provider Configuration
+
+Configuration for LLM providers is managed through `orchestrator-providers.json` in the root directory. This file defines which providers are available, their API keys, and configured models.
+
+### File Structure
+
+The configuration file follows this structure:
+
+```jsonc
+{
+  "providers": [
+    {
+      "id": "string",
+      "name": "string",
+      "enabled": "boolean",
+      "apiKey": "string | null",
+      "configuredModels": ["string"],
+      "defaultModel": "string | null"
+    }
+  ]
+}
+```
+
+### Field Descriptions
+
+| Field | Type | Description |
+|-------|------|-------------|
+| id | string | Unique identifier for the provider (e.g., "openai", "anthropic", "google", "ollama") |
+| name | string | Human-readable name displayed in the dashboard |
+| enabled | boolean | Whether the provider is active and available for use |
+| apiKey | string | Reference to environment variable containing the API key (null for Ollama) |
+| configuredModels | string[] | Array of model identifiers available for this provider |
+| defaultModel | string | Default model to use when none specified (optional) |
+
+### Provider-Specific Notes
+
+#### Ollama
+- Does not require an API key
+- Models are discovered automatically via `/api/tags` endpoint
+- Configured models should match those available in your Ollama instance
+
+#### Cloud Providers (OpenAI, Anthropic, Google)
+- Require valid API keys stored in environment variables
+- Model availability depends on your subscription and access
+- Refer to provider documentation for valid model identifiers
+
+### Environment Variable Mapping
+
+Provider API keys are resolved from environment variables:
+
+| Provider | Environment Variable |
+|----------|----------------------|
+| openai | `OPENCODE_OPENAI_API_KEY` |
+| anthropic | `OPENCODE_ANTHROPIC_API_KEY` |
+| google | `OPENCODE_GO_API_KEY` |
+
+### Example Configuration
+
+```json
+{
+  "providers": [
+    {
+      "id": "ollama",
+      "name": "Ollama Local",
+      "enabled": true,
+      "apiKey": null,
+      "configuredModels": ["codellama", "llama2"],
+      "defaultModel": "codellama"
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "enabled": true,
+      "apiKey": "${OPENCODE_OPENAI_API_KEY}",
+      "configuredModels": ["gpt-4", "gpt-3.5-turbo"],
+      "defaultModel": "gpt-4"
+    }
+  ]
+}
+```
+
+### Usage Notes
+
+1. The orchestrator automatically synchronizes this file with dashboard changes
+2. Manual edits are preserved but may be overridden by dashboard operations
+3. API keys are never stored in plain text - they reference environment variables
+4. Changes require orchestrator restart to take effect
+5. The `defaultModel` field is optional and falls back to the first configured model
+
+## Dashboard Configuration
+
+The web dashboard can be customized through environment variables and configuration files.
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DASHBOARD_PORT` | Port for the dashboard server | `3000` |
+| `DASHBOARD_HOST` | Hostname to bind the dashboard | `0.0.0.0` |
+| `DASHBOARD_DISABLE_AUTH` | Disable API token authentication (not recommended for production) | `false` |
+| `DASHBOARD_CORS_ORIGINS` | Comma-separated list of allowed CORS origins | `*` |
+| `DASHBOARD_THEME` | Color theme (`light` or `dark`) | `system` (follows OS preference) |
+| `DASHBOARD_REFRESH_INTERVAL` | Auto-refresh interval in milliseconds | `5000` |
+| `DASHBOARD_MAX_LOGS` | Maximum number of log entries to retain | `1000` |
+
+### Customization Options
+
+#### Changing the Dashboard Port
+
+To run the dashboard on a different port:
+
+```bash
+DASHBOARD_PORT=8080 bun run start
+```
+
+#### Disabling Authentication (Development Only)
+
+⚠️ **Warning**: Disabling authentication exposes your orchestrator to unauthorized access.
+
+```bash
+DASHBOARD_DISABLE_AUTH=true bun run start
+```
+
+#### Setting CORS Origins
+
+To restrict dashboard access to specific domains:
+
+```bash
+DASHBOARD_CORS_ORIGINS="http://localhost:3000,https://yourdomain.com" bun run start
+```
+
+#### Theme Configuration
+
+Choose between light and dark themes:
+
+```bash
+DASHBOARD_THEME=dark bun run start
+```
+
+#### Adjusting Refresh Rates
+
+Modify how frequently the dashboard updates:
+
+```bash
+DASHBOARD_REFRESH_INTERVAL=2000 bun run start
+```
+
+#### Log Retention Settings
+
+Control how much historical data is preserved:
+
+```bash
+DASHBOARD_MAX_LOGS=5000 bun run start
+```
+
+### File-Based Configuration
+
+Advanced configuration can be set in `dashboard-config.json`:
+
+```jsonc
+{
+  "branding": {
+    "title": "My Orchestrator",
+    "logoUrl": "/path/to/logo.png",
+    "footerText": "Powered by Multi-Agent Orchestrator"
+  },
+  "features": {
+    "realTimeUpdates": true,
+    "fileExplorer": true,
+    "commandPalette": true,
+    "showSystemMetrics": true
+  },
+  "limits": {
+    "maxConcurrentProjects": 10,
+    "maxLogEntriesPerAgent": 1000
+  }
+}
+```
+
+### Security Considerations
+
+1. **Authentication**: The dashboard uses API token authentication by default. Tokens are embedded in the HTML served at `/` and must be sent via the `X-API-Token` header for API requests.
+
+2. **CORS**: Configure `DASHBOARD_CORS_ORIGINS` to restrict which domains can access the dashboard API.
+
+3. **Environment Variables**: Never commit `.env` files to version control. Use `.env.example` as a template.
+
+4. **Network Exposure**: By default, the dashboard binds to `0.0.0.0` to allow access from other devices on your network. For local-only access, set `DASHBOARD_HOST=127.0.0.1`.
+
+5. **Rate Limiting**: Consider placing a reverse proxy (like nginx or Cloudflare) in front of the dashboard for production deployments to add rate limiting and SSL termination.

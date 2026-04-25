@@ -411,6 +411,16 @@ describe("Dashboard API endpoints", () => {
     const { events } = testLog.getEventsSince(0)
     expect(events.length).toBe(500)
   })
+
+  // --- /api/health ---
+  test("GET /api/health returns health status", async () => {
+    const res = await fetch(`${base}/api/health`)
+    expect(res.status).toBe(200)
+    const data = await res.json() as { status: string; timestamp: string; uptime: number }
+    expect(data.status).toBe("ok")
+    expect(data.timestamp).toBeDefined()
+    expect(data.uptime).toBeDefined()
+  })
 })
 
 // ---------------------------------------------------------------------------

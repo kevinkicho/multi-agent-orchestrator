@@ -5,11 +5,11 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "Ollama (local)",
       "options": {
-        "baseURL": "http://localhost:11434/v1"
+        "baseURL": "http://172.24.32.1:11434/v1"
       },
       "models": {
-        "glm-5.1:cloud": {
-          "name": "glm-5.1:cloud"
+        "nemotron-3-super:cloud": {
+          "name": "nemotron-3-super:cloud"
         }
       }
     }
@@ -17,7 +17,7 @@
   "agent": {
     "swarm": {
       "mode": "primary",
-      "description": "Pure text-in/text-out agent for the ollama_swarm orchestrator. No filesystem or shell access.",
+      "description": "Pure text-in/text-out agent for the ollama_swarm blackboard worker. No filesystem or shell access.",
       "tools": {
         "read": false,
         "write": false,
@@ -28,6 +28,30 @@
         "grep": false,
         "glob": false,
         "list": false,
+        "webfetch": false,
+        "task": false,
+        "todoread": false,
+        "todowrite": false
+      },
+      "permission": {
+        "edit": "deny",
+        "bash": "deny",
+        "webfetch": "deny"
+      }
+    },
+    "swarm-read": {
+      "mode": "primary",
+      "description": "Read-only inspection agent for the ollama_swarm discussion presets. Read / grep / glob / list enabled; edit / write / bash hard-denied.",
+      "tools": {
+        "read": true,
+        "grep": true,
+        "glob": true,
+        "list": true,
+        "write": false,
+        "edit": false,
+        "multiedit": false,
+        "patch": false,
+        "bash": false,
         "webfetch": false,
         "task": false,
         "todoread": false,

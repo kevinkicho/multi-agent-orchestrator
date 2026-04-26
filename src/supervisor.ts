@@ -389,6 +389,33 @@ async function waitForAgent(
 
 // REVIEW_PROMPT moved to ./supervisor-prompts
 
+// Persist a structured "interrupted" memory entry on early-exit paths
+// (circuit breakers, abort, etc.). Shaped to match BrainMemoryEntry's
+// Record<string, string[]> agentLearnings field so downstream readers
+// (meta-reflection, brain memory) can rely on the array shape.
+export async function recordInterruption(
+  agentName: string,
+  directive: string,
+  summary: string,
+  lastAction: string,
+  reason: string,
+): Promise<void> {
+  try {
+    await addMemoryEntry(await loadBrainMemory(), {
+      timestamp: Date.now(),
+      objective: `${agentName} supervisor: ${directive}`,
+      summary,
+      agentLearnings: {
+        status: ["interrupted"],
+        lastAction: [lastAction],
+        reason: [reason],
+      },
+    }, agentName)
+  } catch (err) {
+    console.error(`[supervisor] Failed to save interrupted memory entry:`, err)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Per-agent supervisor loop (Phase 1 + Phase 2)
 // ---------------------------------------------------------------------------
@@ -889,6 +916,11 @@ export async function runAgentSupervisor(
         })
         config.onThinking?.(`CIRCUIT BREAKER: LLM provider failing ${windowFailures}/${LLM_FAILURE_WINDOW} of recent attempts. Stopping supervisor.`)
         config.onSupervisorStop?.(agentName, `LLM provider failing ${windowFailures}/${LLM_FAILURE_WINDOW} recent attempts`, true, "llm-unreachable")
+        await recordInterruption(
+          agentName, directive,
+          `Interrupted: LLM provider failing — circuit breaker (${windowFailures}/${LLM_FAILURE_WINDOW})`,
+          "llm-provider-call", "circuit-breaker-llm",
+        )
         // Reset window so a re-started supervisor starts fresh rather than
         // inheriting the tripping condition from this instance.
         resetLlmOutcomes()
@@ -1955,6 +1987,11 @@ Be specific with file paths, line numbers, and code snippets.`
         try { await addBehavioralNote(memory, agentName, `CRITICAL: Agent was persistently non-responsive across ${consecutiveFailedCycles} cycles. Circuit breaker triggered. This agent needs fundamentally different prompts — keep to one simple action, or consider restructuring the directive.`) } catch (err) { console.error(`[supervisor] Failed to save behavioral note:`, err); config.dashboardLog?.push({ type: "supervisor-alert", agent: agentName, text: `WARNING: Failed to save behavioral note (circuit breaker): ${err}` }) }
         // Stop this supervisor — the project manager can restart it or the user can intervene
         config.onSupervisorStop?.(agentName, `Circuit breaker triggered after ${consecutiveFailedCycles} consecutive failed cycles — agent is persistently non-responsive`, true)
+        await recordInterruption(
+          agentName, directive,
+          `Interrupted: circuit breaker — ${consecutiveFailedCycles} consecutive failed cycles`,
+          "cycle-execution", "circuit-breaker-failed-cycles",
+        )
         break
       }
     } else if (cycleRestartCount === 0) {

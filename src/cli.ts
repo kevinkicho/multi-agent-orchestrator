@@ -566,7 +566,7 @@ async function main() {
     return projectManager.listProjects().find(p => p.id === idOrName || p.name === idOrName || p.agentName === idOrName)
   }
 
-  async function handleCommand(command: string): Promise<{ ok: boolean; output?: string; error?: string }> {
+  async function handleCommand(command: string, _signal?: AbortSignal): Promise<{ ok: boolean; output?: string; error?: string }> {
     const trimmed = command.trim()
     if (!trimmed) return { ok: false, error: "Empty command" }
 

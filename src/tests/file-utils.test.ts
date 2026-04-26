@@ -1,7 +1,10 @@
 import { describe, test, expect, afterEach } from "bun:test"
 import { resolve } from "path"
-import { existsSync, mkdirSync, rmSync } from "fs"
-import { atomicWrite, readFileOrNull, readJsonFile, writeJsonFile } from "../file-utils"
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "fs"
+import {
+  atomicWrite, readFileOrNull, readJsonFile, writeJsonFile,
+  appendErrorLog, readErrorLog, type ErrorLogEntry,
+} from "../file-utils"
 
 const TEST_DIR = resolve(import.meta.dir, ".test-tmp-" + Date.now())
 
@@ -103,5 +106,76 @@ describe("writeJsonFile", () => {
     await writeJsonFile(path, data)
     const result = await readJsonFile<typeof data | null>(path, null)
     expect(result).toEqual(data)
+  })
+})
+
+describe("appendErrorLog / readErrorLog", () => {
+  // Each test gets its own subdir so the .orchestrator-errors.jsonl files
+  // don't collide and the rollover test starts from an empty log.
+  function freshDir(label: string): string {
+    const dir = resolve(TEST_DIR, `errlog-${label}-${Math.random().toString(36).slice(2, 8)}`)
+    mkdirSync(dir, { recursive: true })
+    return dir
+  }
+
+  test("readErrorLog returns [] when no log file exists", () => {
+    const dir = freshDir("empty")
+    expect(readErrorLog(dir)).toEqual([])
+  })
+
+  test("appendErrorLog creates the file and readErrorLog returns the entry", () => {
+    const dir = freshDir("create")
+    appendErrorLog(dir, { message: "first error", source: "test" })
+    const entries = readErrorLog(dir)
+    expect(entries.length).toBe(1)
+    expect(entries[0]!.message).toBe("first error")
+    expect(entries[0]!.source).toBe("test")
+    expect(typeof entries[0]!.timestamp).toBe("number")
+  })
+
+  test("readErrorLog returns entries in chronological order", () => {
+    const dir = freshDir("order")
+    appendErrorLog(dir, { message: "one" })
+    appendErrorLog(dir, { message: "two" })
+    appendErrorLog(dir, { message: "three" })
+    const entries = readErrorLog(dir)
+    expect(entries.map(e => e.message)).toEqual(["one", "two", "three"])
+  })
+
+  test("readErrorLog skips malformed lines and returns the valid ones", () => {
+    const dir = freshDir("malformed")
+    const filePath = resolve(dir, ".orchestrator-errors.jsonl")
+    const valid1: ErrorLogEntry = { timestamp: 1, message: "good-1" }
+    const valid2: ErrorLogEntry = { timestamp: 2, message: "good-2" }
+    writeFileSync(
+      filePath,
+      JSON.stringify(valid1) + "\n" + "{not json}\n" + JSON.stringify(valid2) + "\n",
+    )
+    const entries = readErrorLog(dir)
+    expect(entries.map(e => e.message)).toEqual(["good-1", "good-2"])
+  })
+
+  test("rolls over at ERROR_LOG_MAX_ENTRIES (500)", () => {
+    const dir = freshDir("rollover")
+    // Write 502 entries — the oldest 2 should be trimmed.
+    for (let i = 0; i < 502; i++) {
+      appendErrorLog(dir, { message: `entry-${i}` })
+    }
+    const entries = readErrorLog(dir)
+    expect(entries.length).toBe(500)
+    // Oldest two trimmed → first surviving message is entry-2.
+    expect(entries[0]!.message).toBe("entry-2")
+    expect(entries[entries.length - 1]!.message).toBe("entry-501")
+  })
+
+  test("rollover does not leave a temp file behind", async () => {
+    const dir = freshDir("rollover-clean")
+    for (let i = 0; i < 501; i++) {
+      appendErrorLog(dir, { message: `e-${i}` })
+    }
+    const tmpFiles = await Array.fromAsync(
+      new Bun.Glob(".orchestrator-errors.jsonl.tmp.*").scan(dir),
+    )
+    expect(tmpFiles.length).toBe(0)
   })
 })

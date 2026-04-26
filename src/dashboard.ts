@@ -17,10 +17,39 @@ import {
   gitRemoteDefaultBranch,
   gitRemoteUrl,
 } from "./git-utils"
+import { readErrorLog } from "./file-utils"
 
 /** Decode and sanitize a URL path segment — strips path traversal and control characters */
 function sanitizeParam(raw: string): string {
   return decodeURIComponent(raw).replace(/[\/\\\.]{2,}/g, "").replace(/[\x00-\x1f]/g, "")
+}
+
+/** Run an async factory with a deadline, threading an AbortSignal in so the
+ *  factory (and anything it awaits) can actually cancel its work when the
+ *  deadline expires — not just stop waiting on the result.
+ *
+ *  Returns the factory's value on success, or a `{ _timeout: true }` sentinel
+ *  when the deadline fires so the caller can respond 504. */
+function withTimeout<T>(
+  ms: number,
+  fn: (signal: AbortSignal) => Promise<T>,
+): Promise<T | { _timeout: true }> {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const timeoutPromise = new Promise<{ _timeout: true }>((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort()
+      resolve({ _timeout: true })
+    }, ms)
+  })
+  const work = (async () => {
+    try {
+      return await fn(controller.signal)
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  })()
+  return Promise.race([work, timeoutPromise])
 }
 
 /** Base shape shared by every dashboard event. `t` is stamped server-side by
@@ -104,7 +133,7 @@ export async function startDashboard(
   port: number,
   opts?: {
     onSoftStop?: () => void;
-    onCommand?: (command: string) => Promise<{ ok: boolean; output?: string; error?: string }>;
+    onCommand?: (command: string, signal?: AbortSignal) => Promise<{ ok: boolean; output?: string; error?: string }>;
     projectManager?: ProjectManager;
     getTeamManager?: () => TeamManager | null;
     eventBus?: import("./event-bus").EventBus;
@@ -385,7 +414,10 @@ export async function startDashboard(
             return Response.json({ ok: false, error: "Empty command" }, { status: 400, headers: corsHeaders })
           }
           if (opts?.onCommand) {
-            const result = await opts.onCommand(cmd)
+            const result = await withTimeout(30_000, (signal) => opts.onCommand!(cmd, signal))
+            if (result && typeof result === "object" && "_timeout" in result) {
+              return Response.json({ ok: false, error: "Command timed out" }, { status: 504, headers: corsHeaders })
+            }
             return Response.json(result, { headers: corsHeaders })
           }
           return Response.json({ ok: false, error: "Command handler not available" }, { status: 500, headers: corsHeaders })
@@ -1651,6 +1683,14 @@ export async function startDashboard(
         return new Response(DASHBOARD_JS, {
           headers: { ...corsHeaders, "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-cache" },
         })
+      }
+
+      if (url.pathname === "/api/errors" && req.method === "GET") {
+        // Surface the orchestrator's own error log (KNOWN_LIMITATIONS §23).
+        // Per-project surfacing is future work — would need a project ID in
+        // the path and a ProjectManager.getProject(id).directory accessor.
+        const errors = readErrorLog(process.cwd())
+        return Response.json(errors, { headers: corsHeaders })
       }
 
       if (url.pathname === "/api/health") {

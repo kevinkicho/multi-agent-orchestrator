@@ -240,10 +240,32 @@ export function formatRelevantKnowledge(
   })
 
   // Take top N by relevance score, minimum score 1 (must be at least slightly relevant)
-  const relevant = scored
+  const fileFiltered = scored
     .filter(s => s.score >= 1)
     .sort((a, b) => b.score - a.score)
-    .slice(0, maxNotes)
+
+  // Recency fallback for UNTAGGED notes only: include up to 3 most-recent
+  // notes that have no file tags, so a valuable note authored without
+  // [files:] context isn't silently dropped by the score filter. Tagged-but-
+  // unrelated notes are still excluded — they had their chance to match.
+  // See KNOWN_LIMITATIONS §25b.
+  const untaggedRecent = otherNotes
+    .filter(n => n.files.length === 0)
+    .slice(0, 3)
+    .map(note => ({
+      note,
+      score: scored.find(s => s.note === note)?.score ?? 0,
+    }))
+
+  const seen = new Set<SharedNote>()
+  const relevant: typeof scored = []
+  for (const entry of [...fileFiltered, ...untaggedRecent]) {
+    if (seen.has(entry.note)) continue
+    seen.add(entry.note)
+    relevant.push(entry)
+  }
+  relevant.sort((a, b) => b.score - a.score)
+  relevant.splice(maxNotes)
 
   if (relevant.length > 0) {
     parts.push("### Shared Knowledge from Other Agents")

@@ -220,18 +220,39 @@ describe("filesOverlap", () => {
     expect(result).toContain("Auth test patterns")
   })
 
-  test("completely unrelated files are not relevant (without recency)", () => {
+  test("old untagged note is rescued by the recency fallback (KNOWN_LIMITATIONS §25b)", () => {
+    // An OLD untagged note would score 0 under the file/recency/kind heuristic
+    // (no file overlap possible without tags, no recency bonus, low kind).
+    // The fallback in formatRelevantKnowledge rescues it so a valuable
+    // observation authored without [files:] context isn't silently dropped.
     const store: SharedKnowledgeStore = {
       notes: [makeNote({
-        text: "Database lesson",
-        files: ["src/db.ts"],
-        publishedAt: Date.now() - 7_200_000, // 2 hours ago
+        text: "Untagged insight",
+        files: [],
+        publishedAt: Date.now() - 7_200_000, // 2 hours old → no recency bonus
         kind: "observation",
       })],
       progress: [],
     }
     const result = formatRelevantKnowledge(store, "agent-b", ["src/auth.ts"])
-    // No file overlap, old age, low kind = score 0, should not appear
-    expect(result).not.toContain("Database lesson")
+    expect(result).toContain("Untagged insight")
+  })
+
+  test("only the 3 most recent untagged notes are rescued (older ones drop)", () => {
+    const oldBase = Date.now() - 7_200_000 // all old enough to score 0
+    const store: SharedKnowledgeStore = {
+      notes: [
+        makeNote({ text: "Untagged newest", files: [], publishedAt: oldBase, kind: "observation" }),
+        makeNote({ text: "Untagged second", files: [], publishedAt: oldBase - 1000, kind: "observation" }),
+        makeNote({ text: "Untagged third", files: [], publishedAt: oldBase - 2000, kind: "observation" }),
+        makeNote({ text: "Untagged oldest", files: [], publishedAt: oldBase - 3000, kind: "observation" }),
+      ],
+      progress: [],
+    }
+    const result = formatRelevantKnowledge(store, "agent-b", ["src/auth.ts"])
+    expect(result).toContain("Untagged newest")
+    expect(result).toContain("Untagged second")
+    expect(result).toContain("Untagged third")
+    expect(result).not.toContain("Untagged oldest")
   })
 })

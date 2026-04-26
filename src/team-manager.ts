@@ -19,6 +19,7 @@ import {
   buildEmptyNudge, buildNoParseNudge, fuzzyExtractCommands,
   MANAGER_COMMANDS, MANAGER_DEFAULT_CMD,
 } from "./command-recovery"
+import { FailureWindow } from "./failure-window"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -579,7 +580,9 @@ export class TeamManager {
 
     const nudge = createNudgeState()
     const checkInBreaker = createCircuitBreaker(4) // stop check-in after 4 consecutive failures
-    let consecutiveLlmFailures = 0
+    const MANAGER_LLM_FAILURE_WINDOW = 10
+    const MANAGER_LLM_FAILURE_THRESHOLD = 3
+    const llmWindow = new FailureWindow(MANAGER_LLM_FAILURE_WINDOW)
 
     for (let round = 0; round < maxRounds; round++) {
       if (config.signal?.aborted) break
@@ -597,27 +600,29 @@ export class TeamManager {
       }
       try {
         response = await chatCompletion(config.ollamaUrl, config.model, this.managerMessages, { role: "team-manager" })
-        consecutiveLlmFailures = 0
+        llmWindow.record(true)
         // Ledger: record manager inbound response
         recordPrompt({
           source: "manager", target: "manager", direction: "inbound",
           model: config.model, content: response,
         }).catch(() => {})
       } catch (err) {
-        consecutiveLlmFailures++
-        emit(`Manager LLM failed (failure #${consecutiveLlmFailures}): ${err}`)
-        if (consecutiveLlmFailures >= 3) {
-          emit(`Manager LLM persistently failing — ending check-in early`)
+        llmWindow.record(false)
+        const fails = llmWindow.failures()
+        emit(`Manager LLM failed (${fails}/${MANAGER_LLM_FAILURE_WINDOW} in window): ${err}`)
+        if (fails >= MANAGER_LLM_FAILURE_THRESHOLD) {
+          emit(`Manager LLM failure density too high — ending check-in early`)
           break
         }
         // Retry with backoff instead of immediately bailing
-        const retryDelay = Math.min(5000 * Math.pow(2, consecutiveLlmFailures - 1), 30_000)
+        const retryDelay = Math.min(5000 * Math.pow(2, fails - 1), 30_000)
         emit(`Retrying in ${retryDelay / 1000}s...`)
         await new Promise(r => setTimeout(r, retryDelay))
         try {
           response = await chatCompletion(config.ollamaUrl, config.model, this.managerMessages, { role: "team-manager" })
-          consecutiveLlmFailures = 0
+          llmWindow.record(true)
         } catch (retryErr) {
+          llmWindow.record(false)
           emit(`Manager LLM retry failed: ${retryErr}`)
           continue
         }

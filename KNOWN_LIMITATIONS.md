@@ -29,7 +29,7 @@ Only **Open** and **Partially addressed** items appear here, sorted high → low
 | [7](#7-dashboard-api-limitations) | Request timeouts / rate limiting on dashboard | **High** | S | `src/dashboard.ts` | Wrap mutating route handlers with a 30s timeout helper; 413-reject requests that already overflow `Content-Length` (already done) but also add a simple token-bucket per session. |
 | [8](#8-memory-not-saved-on-early-exit) | Memory not saved on circuit-break / max-rounds / abort | **High** | M | `src/supervisor.ts`, `src/brain-memory.ts` | Write a structured `{status:"interrupted", lastAction, reason}` entry to brain-memory on the early-exit paths. Feeds §36's outcome signal with real data. |
 | [22d](#22d-scope-braints-still-uses-the-old-counter) | Migrate brain.ts to `FailureWindow` (team-manager done) | Medium | S | `src/brain.ts`, `src/failure-window.ts` | Mechanical change — replace `CircuitBreakerState` consecutive-failure pattern with a `FailureWindow` instance per the team-manager pattern landed in `9ff91df`. |
-| [39](#39-multi-agent-coordination-protocol--no-claimrelease-on-parallel-pickups) | Multi-agent coordination protocol (claim/release) | **High** | M | `src/shared-knowledge.ts`, `src/event-bus.ts`, `src/brain.ts`, `src/team-manager.ts`, `src/dashboard.ts` | Add a contract-net-style claim/release record to the blackboard with TTL so concurrent agents can't all pick up the same `KNOWN_LIMITATIONS.md` § and produce divergent fixes (the failure mode in batch `254245d`). |
+| [39](#39-multi-agent-coordination-protocol--no-claimrelease-on-parallel-pickups) | Multi-agent coordination protocol (claim/release) | **High** | M | `src/claims.ts` (new), `src/event-bus.ts`, `src/brain.ts`, `src/supervisor.ts`, `src/team-manager.ts`, `src/brain-manager.ts`, `src/dashboard.ts` | New `.orchestrator-claims.json` + `src/claims.ts` module with the canonical defaults pinned in §39 (30-min TTL, 5-min heartbeat, 5-s bid window). Ship §39a/§39b/§39c alongside or directly after — the protocol is unsafe in 8 h+ runs without all three. |
 | [14](#14-crash-recovery-loses-mid-cycle-state) | Mid-cycle crash loses failure counters | Medium | M | `src/supervisor.ts`, `src/session-state.ts` | Checkpoint critical counters (`consecutiveFailedCycles`, `cycleRestartCount`, failure window snapshot) every N rounds so a crash recovery doesn't restart with zero backoff state. |
 | [23](#23-dashboard-surfacing-of-write-failures) | Persistent write-failure log | Medium | S | `src/supervisor.ts`, `src/brain.ts`, `src/file-utils.ts` | Append failures to `.orchestrator-errors.jsonl` (capped at 500), surface from the dashboard. A supervisor running on stale memory after a silent write failure is one of the sharpest foot-guns left. |
 | [25b](#25b-tradeoff-relevance-scoring-is-heuristic-not-semantic) | Shared-knowledge false negatives on untagged notes | Medium | S | `src/shared-knowledge.ts` | Always include the N most recent notes unconditionally alongside file-filtered ones — prevents a genuinely relevant note without `[files:]` tags from silently getting dropped. |
@@ -766,15 +766,111 @@ Dashboard mutating endpoints now require a `Content-Length` header (rejects chun
 **What a fix looks like:**
 1. Brain announces `task:available §X files=[...] effort=M priority=H` as a bus event.
 2. Idle supervisors bid (with recent-context overlap and remaining token budget).
-3. Brain awards exactly one and writes `claim:§X by agent-N expires=Date.now()+30min` to a new section of `shared-knowledge.ts` (or a sibling `.orchestrator-claims.json` to keep the shared-knowledge schema small).
+3. Brain awards exactly one and writes `claim:§X by agent-N expires=Date.now()+30min` to `.orchestrator-claims.json`.
 4. Other agents scanning the queue skip §s with active claims.
 5. On completion (or expiry) the claim is released — completed claims promote into a "done" log; expired claims unblock the §.
 
-Heartbeat from the holder extends the TTL while work is in flight; if the holder crashes, the TTL expires and the § returns to the pool.
+Heartbeat from the holder extends the TTL while work is in flight; if the holder crashes, the TTL expires and the § returns to the pool. See §39a/§39b/§39c for the complementary concerns that must ship alongside the core protocol.
 
-**Tradeoff:** Coordination state is more state to keep consistent across crash/restart. Claims need durable persistence (they're not just in-memory like the event-bus ring buffer per §1) so a Brain restart doesn't lose track of who's working on what. TTLs are the safety net — pick a TTL that comfortably exceeds typical agent work cycles so you don't spuriously re-award mid-flight, and still short enough that a dead holder unblocks the queue within a reasonable window.
+**Canonical defaults (for autonomous runs ≥8 hours):** these parameters are pinned so that a future agent picking up §39 implements *this* version rather than re-litigating the design. Change only with explicit justification in a status update.
 
-**Ruled out:** (1) Pure first-write-wins on a directory marker file. Cheap to implement, but encourages races and gives no signal back to the announcing layer (Brain doesn't learn who claimed). (2) Pessimistic locks held across the entire agent lifetime. Too coarse — if the agent crashes the lock is held forever; TTL + heartbeat is strictly better. (3) Skipping the announce step and letting agents self-claim freely. That's the current model and it's the failure mode being fixed. (4) Pushing all assignment up to the Brain at spawn time (no blackboard claims at all) — simpler but loses the substrate value: the dashboard can no longer surface "who is working on what right now," and agents can no longer pick up urgent unclaimed work mid-session without a Brain restart.
+| Parameter | Value | Rationale |
+|---|---|---|
+| Claim TTL | **30 minutes** | Covers typical S/M § work without spurious re-pool. The TTL is the crash-recovery safety net, not the work budget — heartbeats keep it alive while the holder is genuinely working. Shorter TTLs invite duplicate-work bugs (the very thing being fixed) on transient LLM hiccups. |
+| Heartbeat interval | **5 minutes**, fired automatically at supervisor cycle start | The supervisor cycle already runs every 30 s by default, so 5-min heartbeats happen "for free" with up to 6 renewal chances per TTL. |
+| Bid window | **5 seconds, fixed**, no short-circuiting | On an 8 h run, ~50 assignments × 5 s = 4 min of bid-window latency (0.8 % of runtime). Cheap insurance against unfair winner-takes-all-by-200ms behavior compounding over the long run. |
+| Task ID format | `limitations:<§>` for queue items, `ad-hoc:<slug>` otherwise | Explicit IDs are debuggable in overnight log review. §-renumbering is not a concern — KNOWN_LIMITATIONS.md is append-only, so existing IDs stay stable. |
+| Bid audit log | **Keep**, capped at 200 entries (~40 KB) | Long runs need answers to "why did the Brain pick that agent?" without LLM-replay; storage is negligible. |
+| Sweep interval | **60 seconds**, run from `brain-manager.ts` per §37's existing cadence | Cheap (one read + filter + conditional write), and reusing §37's loop avoids spawning yet another timer. |
+| Storage location | `.orchestrator-claims.json` at orchestrator cwd, gitignored alongside other `.orchestrator-*.json` | Atomic writes via existing `writeJsonFile`. Keeps the shared-knowledge schema small instead of overloading it. |
+
+**Schema sketch (canonical):**
+
+```ts
+type ClaimStatus = "claimed" | "completed" | "expired" | "released"
+
+interface TaskClaim {
+  taskId: string         // "limitations:22d" or "ad-hoc:<slug>"
+  agentName: string
+  claimedAt: number
+  expiresAt: number      // refreshed by heartbeat
+  lastHeartbeat: number
+  status: ClaimStatus
+  files: string[]        // declared touch list, used for conflict detection
+  priority: "high" | "medium" | "low"
+  effort: "S" | "M" | "L"
+  resolvedAt?: number    // filled when status moves out of "claimed"
+  resolution?: string
+}
+
+interface BidRecord {
+  taskId: string
+  bidder: string
+  bidAt: number
+  contextOverlap: number          // 0..1, deterministic from recent file activity
+  tokenBudgetRemaining: number    // estimated tokens this agent has left
+  awarded: boolean
+  awardedTo?: string
+}
+
+interface ClaimsStore {
+  active: TaskClaim[]
+  completed: TaskClaim[]  // FIFO ring buffer, ~200 entries
+  bids: BidRecord[]       // FIFO ring buffer, ~200 entries
+}
+```
+
+**Tradeoff:** Coordination state is more state to keep consistent across crash/restart. Claims need durable persistence (they're not just in-memory like the event-bus ring buffer per §1) so a Brain restart doesn't lose track of who's working on what. TTLs are the safety net — the 30-min default comfortably exceeds typical agent work cycles so we don't spuriously re-award mid-flight, while still unblocking a crashed holder within ~35 min worst-case (5 min stale heartbeat + 30 min TTL).
+
+**Cost on an 8 h run:** ~40 KB persistent state, ~50 awards × 5 s = 4 min total bid-window latency (0.8 % of runtime), zero added LLM calls (bid evaluation is a deterministic function of `contextOverlap` and `tokenBudgetRemaining`, not a prompt), one 60-s sweep tick reusing §37's loop. The claim surface is overhead-amortized — it does not add per-cycle cost to the supervisor inner loop.
+
+**Ruled out:** (1) Pure first-write-wins on a directory marker file. Cheap to implement, but encourages races and gives no signal back to the announcing layer (Brain doesn't learn who claimed). (2) Pessimistic locks held across the entire agent lifetime. Too coarse — if the agent crashes the lock is held forever; TTL + heartbeat is strictly better. (3) Skipping the announce step and letting agents self-claim freely. That's the current model and it's the failure mode being fixed. (4) Pushing all assignment up to the Brain at spawn time (no blackboard claims at all) — simpler but loses the substrate value: the dashboard can no longer surface "who is working on what right now," and agents can no longer pick up urgent unclaimed work mid-session without a Brain restart. (5) Folding claims into the existing `shared-knowledge.ts` store. Considered to reduce file count, but conflates two concerns (shared learning vs. live coordination state) with very different read/write rates and audit needs. Separate file keeps the shared-knowledge schema stable and makes the claims log independently inspectable.
+
+### 39a. Complementary: Brain restart recovery
+
+**Status: Open (depends on §39).**
+
+**What:** On an 8 h+ autonomous run, the Brain process will likely restart at some point (crash, OOM, deliberate operator restart). Without explicit handling, a naive restart would re-announce every active claim's underlying task and create a thundering herd of duplicate awards — the precise scenario §39 exists to prevent, just on a different trigger.
+
+**What a fix looks like:** On Brain init, after `loadActiveClaims()`:
+1. **Do not re-announce** any task with an active, unexpired claim — trust the supervisor that holds it.
+2. **Do not re-award** anything during the bid-window grace period (~5 s); supervisors that survived the restart will heartbeat shortly and reclaim their slots.
+3. Run `sweepExpiredClaims()` once at startup so any holder that died with the Brain doesn't permanently lock its §.
+4. Re-emit `task-claimed` bus events for every active claim so the dashboard reflects current state without operator action.
+
+Estimated effort: S (≤15 lines in the Brain init path).
+
+**Tradeoff:** A small grace window after Brain restart during which no new awards happen. On the order of a single bid-window's worth of latency (5 s), well under the 8 h-run noise floor.
+
+### 39b. Complementary: Stuck-claim detection via §37 brain-manager
+
+**Status: Open (depends on §37 and §39).**
+
+**What:** A wedged supervisor will heartbeat indefinitely (the cycle loop is alive, the work isn't), holding its § hostage for the entire 8 h run. Heartbeat liveness is necessary but not sufficient — we also need outcome liveness.
+
+**What a fix looks like:** §37's existing stuck-project detector already fires `manager-alert` when an agent has `stuckThreshold` (default 3) consecutive non-success cycle outcomes. Wire that alert path to additionally call `releaseClaim(taskId, agentName, "stuck-project-detection")` when the alerting agent currently holds a claim. The released § returns to the announcement pool and another agent can take it.
+
+Estimated effort: S (~5 lines added to the `manager-alert` handler in `brain-manager.ts`).
+
+**Tradeoff:** False-positive releases if a §-fix is genuinely slow (legitimately L-effort work that looks like 3 stalled cycles). Mitigation: the current §37 default of 3 consecutive non-success outcomes is conservative; if false-positives become a problem, raise the threshold for claim-release specifically (e.g., 5 cycles) without touching the general alert threshold.
+
+**Ruled out:** Building a separate stuck-detector for claims. §37 already has the signal; reusing it is simpler than maintaining two parallel heuristics.
+
+### 39c. Complementary: Supervisor restart re-claim check
+
+**Status: Open (depends on §39).**
+
+**What:** The project-manager auto-restarts crashed supervisors. If a supervisor's claim TTL expired during the downtime and another agent took over the §, the restarted supervisor must not blindly resume work on the abandoned claim — it would race the new holder and produce exactly the §22d duplicate-work bug that §39 was built to prevent.
+
+**What a fix looks like:** At supervisor cycle-start, before sending a heartbeat:
+1. Call `isTaskClaimed(taskId)` against the store.
+2. If the claim is still mine → `heartbeat()` and proceed normally.
+3. If the claim is now held by a different agent → log the pre-emption to the dashboard, reset this supervisor's directive (clear any task-bound state), and return to the idle/bidding pool.
+4. If no claim exists for this taskId → either the TTL expired or the work was completed elsewhere; same as case (3).
+
+Estimated effort: S (~10 lines in the supervisor cycle-start path).
+
+**Tradeoff:** One extra read per cycle (negligible — ~5 ms file read against a small JSON). Adds a clear "I was pre-empted" event to the dashboard, which is informational rather than load-bearing.
 
 ---
 

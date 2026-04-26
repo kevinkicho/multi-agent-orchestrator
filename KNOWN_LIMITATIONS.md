@@ -28,7 +28,8 @@ Only **Open** and **Partially addressed** items appear here, sorted high → low
 | [38](#38-llm-usage-ledger-only-covers-the-orchestration-layer) | Worker LLM usage telemetry | **High** | M | `workers`, `src/llm-usage.ts` | Have worker processes append usage lines to a JSONL that the orchestrator tails — or add a small hook in opencode. Closes the biggest observability gap on paid APIs. |
 | [7](#7-dashboard-api-limitations) | Request timeouts / rate limiting on dashboard | **High** | S | `src/dashboard.ts` | Wrap mutating route handlers with a 30s timeout helper; 413-reject requests that already overflow `Content-Length` (already done) but also add a simple token-bucket per session. |
 | [8](#8-memory-not-saved-on-early-exit) | Memory not saved on circuit-break / max-rounds / abort | **High** | M | `src/supervisor.ts`, `src/brain-memory.ts` | Write a structured `{status:"interrupted", lastAction, reason}` entry to brain-memory on the early-exit paths. Feeds §36's outcome signal with real data. |
-| [22d](#22d-scope-braints-and-team-managerts-still-use-the-old-counter) | Migrate brain.ts and team-manager.ts to `FailureWindow` | **High** | S | `src/brain.ts`, `src/team-manager.ts`, `src/failure-window.ts` | Mechanical change — replace `consecutiveLlmFailures` counter with a `FailureWindow` instance; update thresholds to call `failuresInWindow()`. The helper is already exported. |
+| [22d](#22d-scope-braints-still-uses-the-old-counter) | Migrate brain.ts to `FailureWindow` (team-manager done) | Medium | S | `src/brain.ts`, `src/failure-window.ts` | Mechanical change — replace `CircuitBreakerState` consecutive-failure pattern with a `FailureWindow` instance per the team-manager pattern landed in `9ff91df`. |
+| [39](#39-multi-agent-coordination-protocol--no-claimrelease-on-parallel-pickups) | Multi-agent coordination protocol (claim/release) | **High** | M | `src/shared-knowledge.ts`, `src/event-bus.ts`, `src/brain.ts`, `src/team-manager.ts`, `src/dashboard.ts` | Add a contract-net-style claim/release record to the blackboard with TTL so concurrent agents can't all pick up the same `KNOWN_LIMITATIONS.md` § and produce divergent fixes (the failure mode in batch `254245d`). |
 | [14](#14-crash-recovery-loses-mid-cycle-state) | Mid-cycle crash loses failure counters | Medium | M | `src/supervisor.ts`, `src/session-state.ts` | Checkpoint critical counters (`consecutiveFailedCycles`, `cycleRestartCount`, failure window snapshot) every N rounds so a crash recovery doesn't restart with zero backoff state. |
 | [23](#23-dashboard-surfacing-of-write-failures) | Persistent write-failure log | Medium | S | `src/supervisor.ts`, `src/brain.ts`, `src/file-utils.ts` | Append failures to `.orchestrator-errors.jsonl` (capped at 500), surface from the dashboard. A supervisor running on stale memory after a silent write failure is one of the sharpest foot-guns left. |
 | [25b](#25b-tradeoff-relevance-scoring-is-heuristic-not-semantic) | Shared-knowledge false negatives on untagged notes | Medium | S | `src/shared-knowledge.ts` | Always include the N most recent notes unconditionally alongside file-filtered ones — prevents a genuinely relevant note without `[files:]` tags from silently getting dropped. |
@@ -36,6 +37,8 @@ Only **Open** and **Partially addressed** items appear here, sorted high → low
 | [34](#34-prunepromote-thresholds-are-static) | Adaptive prune/promote thresholds | Medium | L | `src/brain-memory.ts`, `src/meta-reflection.ts` | **Blocked on data.** Run a multi-week session; collect promotion/unpromotion stats; only then tune. Doing this without real observations is the bike-shed failure mode. |
 | [33](#33-behavioral-note-fire-matching-is-heuristic) | Fire-matching heuristic accuracy | Medium | L | `src/fire-tracker.ts` | **Blocked on data.** Same rationale as §34. Consider embedding-based matching once it's clear where the heuristic misses. |
 | [36](#36-cycle-outcomes-are-coarse-and-heuristic) | Coarse cycle outcome bucketing | Medium | L | `src/brain-memory.ts`, `src/supervisor.ts` | **Blocked on data.** Three-bucket taxonomy may need expansion or weighting, but we need real run-log evidence first. |
+| [40](#40-no-councilquorum-mode-for-high-stakes-decisions) | Council/quorum mode for high-stakes decisions | Medium | M | `src/brain.ts`, `src/project-manager.ts`, `src/brain-memory.ts` | Fan a single judgment prompt out to N independent LLM calls (no shared context), aggregate by majority vote. Wire merge-approval and note-unpromotion first. |
+| [41](#41-stigmergy-via-behavioral-notes-is-too-slow-for-concurrent-agents) | Real-time stigmergy channel for concurrent agents | Medium | M | `src/event-bus.ts`, `src/supervisor.ts`, `src/shared-knowledge.ts` | Publish `@lesson:`/`@signal:` markers onto a short-TTL bus channel alongside durable note storage so concurrently-running supervisors see fresh signals within the round, not the next cycle. |
 
 ### Workflow tips
 
@@ -488,9 +491,13 @@ Current behavior: outcomes are tracked in a rolling window. With defaults, the b
 
 One window size applies uniformly to timeouts, generic errors, and retry failures. A provider that times out every 8th call — barely recoverable in practice — will trip a window-of-10 breaker at `maxConsecutiveLlmFailures=5` only if ~5 of those 10 also happened to be real failures. Operators who see false positives should raise `llmFailureWindow` (more tolerant, slower to trip); operators on paid APIs who want to fail fast should lower it. Per-error-class thresholds are deliberately ruled out — the failure taxonomy is already noisy (network hiccup vs. provider outage vs. model OOM) and per-class tuning multiplies the configuration surface without a clean way to validate which class a given failure really belongs to. Rate-limit (429) errors remain on a separate counter (`consecutive429s`, §26) because their recovery semantics (provider quotas) are genuinely different from network/model failures.
 
-### 22d. Scope: brain.ts and team-manager.ts Still Use the Old Counter
+### 22d. Scope: brain.ts Still Uses the Old Counter
 
-The window fix applies only to `runAgentSupervisor` in `src/supervisor.ts`. `src/brain.ts` and `src/team-manager.ts` still use the `consecutiveLlmFailures = 0 on success` pattern. Both are short-lived loops (brain is a one-shot objective-driven run, team-manager pauses and resumes on a longer cadence), so the blind spot is less load-bearing there. `FailureWindow` is exported from `src/failure-window.ts` for when/if those loops are migrated; the migration is mechanical but out of scope for the §22b fix.
+**Status: Partially addressed.** `src/team-manager.ts` was migrated to the canonical `FailureWindow` in commit `9ff91df` — its check-in loop now records both successes and failures into a window of 10 and ends the check-in early when failures hit 3, instead of resetting the counter on every success. The earlier agent-batch attempt at this migration (commit `254245d`) introduced a *local* `FailureWindow` class with an incompatible API (`recordFailure()` / `density()` / `shouldEscalate(threshold)`) that diverged from the canonical helper; that local class was deleted as part of the cleanup.
+
+**Remaining:** `src/brain.ts` still uses the consecutive-failure counter via `command-recovery`'s `CircuitBreakerState` (a different abstraction from `FailureWindow`). Brain runs are short-lived and one-shot, so the blind spot is less load-bearing there, but for symmetry with supervisor and team-manager the migration is worth doing once a brain-mode flaky-provider observation justifies it.
+
+**What (original issue):** The window fix applies only to `runAgentSupervisor` in `src/supervisor.ts`. `src/brain.ts` and `src/team-manager.ts` still use the `consecutiveLlmFailures = 0 on success` pattern. Both are short-lived loops (brain is a one-shot objective-driven run, team-manager pauses and resumes on a longer cadence), so the blind spot is less load-bearing there. `FailureWindow` is exported from `src/failure-window.ts` for when/if those loops are migrated; the migration is mechanical but out of scope for the §22b fix.
 
 ## 23. Dashboard Surfacing of Write Failures
 
@@ -745,5 +752,60 @@ Dashboard mutating endpoints now require a `Content-Length` header (rejects chun
 **Why:** This is the "how much is the meta-layer actually consuming" view. It intentionally stays a separate file from `prompt-ledger.ts` — the prompt ledger carries content and is capped at 2 000 entries, which makes it unsuitable as a long-horizon usage log.
 
 **Tradeoff:** The ledger does not capture **worker** LLM calls. Workers run as separate `opencode`/`claude` processes and hit their provider directly; nothing passes through `providers.llmCall` from that side. So the graph shows orchestration overhead (supervisor loops, brain, observer, manager) — not total spend. For a true "combined over time" view that includes workers, the worker process would have to either proxy through the orchestrator or emit its own usage events, both of which are larger changes than this slice.
+
+---
+
+## 39. Multi-agent coordination protocol — no claim/release on parallel pickups
+
+**Status: Open.**
+
+**What:** Multiple supervisors can independently pick up the same `KNOWN_LIMITATIONS.md` § when running concurrently because there is no claim/release protocol on the shared blackboard. The agent batch landed in commit `254245d` shipped three incompatible `FailureWindow` API shapes because one agent picked up §22d locally in `team-manager.ts`, another wrote tests for an imagined API in `brain.test.ts` and `brain-manager.test.ts`, and the canonical helper at `src/failure-window.ts` went untouched — none of them saw each other's claim. The same hazard applies to any §-pickup workflow that uses `KNOWN_LIMITATIONS.md` as a queue (which is the documented intent of the **Pick-up queue** above).
+
+**Why:** The current model is hierarchical at *spawn time* (Brain decides who runs) but blackboard-self-pickup at *task selection* (the queue is exposed and agents choose). That hybrid has no synchronization point — each agent reads the queue at slightly different times and races. Hayes-Roth's classic blackboard architecture explicitly has a *control component* that decides which knowledge source to activate next; without that role, parallel pickup is exactly the failure mode we hit.
+
+**What a fix looks like:**
+1. Brain announces `task:available §X files=[...] effort=M priority=H` as a bus event.
+2. Idle supervisors bid (with recent-context overlap and remaining token budget).
+3. Brain awards exactly one and writes `claim:§X by agent-N expires=Date.now()+30min` to a new section of `shared-knowledge.ts` (or a sibling `.orchestrator-claims.json` to keep the shared-knowledge schema small).
+4. Other agents scanning the queue skip §s with active claims.
+5. On completion (or expiry) the claim is released — completed claims promote into a "done" log; expired claims unblock the §.
+
+Heartbeat from the holder extends the TTL while work is in flight; if the holder crashes, the TTL expires and the § returns to the pool.
+
+**Tradeoff:** Coordination state is more state to keep consistent across crash/restart. Claims need durable persistence (they're not just in-memory like the event-bus ring buffer per §1) so a Brain restart doesn't lose track of who's working on what. TTLs are the safety net — pick a TTL that comfortably exceeds typical agent work cycles so you don't spuriously re-award mid-flight, and still short enough that a dead holder unblocks the queue within a reasonable window.
+
+**Ruled out:** (1) Pure first-write-wins on a directory marker file. Cheap to implement, but encourages races and gives no signal back to the announcing layer (Brain doesn't learn who claimed). (2) Pessimistic locks held across the entire agent lifetime. Too coarse — if the agent crashes the lock is held forever; TTL + heartbeat is strictly better. (3) Skipping the announce step and letting agents self-claim freely. That's the current model and it's the failure mode being fixed. (4) Pushing all assignment up to the Brain at spawn time (no blackboard claims at all) — simpler but loses the substrate value: the dashboard can no longer surface "who is working on what right now," and agents can no longer pick up urgent unclaimed work mid-session without a Brain restart.
+
+---
+
+## 40. No council/quorum mode for high-stakes decisions
+
+**Status: Open.**
+
+**What:** All judgment calls (whether to merge an agent branch, whether a cycle constitutes progress, whether a behavioral note is worth promoting or un-promoting) flow through a single LLM call from a single agent. There is no mechanism to get N independent opinions on the same decision and aggregate them.
+
+**Why:** Single-agent judgment is fine for cheap reversible decisions — the supervisor's per-cycle review fits this, since a wrong call costs one cycle and the next cycle can correct it. It is shakier for **irreversible or far-reach** decisions (merge to main, archive a behavioral note that influenced many past cycles, abandon a directive) where one agent's hallucination becomes durable state.
+
+**What a fix looks like:** A `council(question, context, n=3) → { votes: Verdict[]; majority: Verdict; rationale: string[] }` helper in `src/brain.ts` that fans the same prompt out to N independent LLM calls (no shared message history between calls — independence is the entire point), then aggregates by majority vote with rationale collation. Wire two specific call sites first as proving ground: PR-merge approval (in `project-manager.ts`) and behavioral-note un-promotion (in `brain-memory.ts`'s `pruneAndPromoteBehavioralNotes`). Other call sites can opt in as evidence justifies.
+
+**Tradeoff:** Cost. Council mode triples the LLM spend on whatever path uses it. Restrict to genuinely high-stakes call sites or budget will balloon — this is why `n=3` is the default and call sites are explicit, not implicit. Also: voters must be *truly independent* — same model with fresh context, no shared sub-prompt cache, no inter-vote message visibility — or you get groupthink and the majority is just the model's prior dressed up as a quorum.
+
+**Ruled out:** (1) Sequential review (reviewer reads previous reviewer's verdict). Cheaper, but cheats the independence requirement; first reviewer anchors the rest. (2) Heterogeneous models (one Anthropic, one OpenAI, one Ollama) for the council. Better diversity in theory; rejected for now because providers are configured per-project and forcing multi-provider on every council call complicates the provider/credential model significantly. Worth revisiting once the council mechanism is in use and we can measure single-provider groupthink rates. (3) Auto-applying the council to every supervisor decision. Wrong scope — supervisors run hundreds of decisions per session and all of them being 3x cost is untenable; reserve council for the rare durable-state decisions.
+
+---
+
+## 41. Stigmergy via behavioral notes is too slow for concurrent agents
+
+**Status: Open.**
+
+**What:** Behavioral notes (`@lesson:` markers, fire-counts, promote/archive lifecycle in `brain-memory.ts`) function as pheromone trails that influence future agents, but propagation is per-cycle: a lesson published by agent-A right now does not reach concurrently-running agent-B until agent-B's next cycle starts and reloads memory. For lessons about "the workspace state agent-A just observed" or "I just touched src/X.ts, watch for conflicts," that delay is too long — agent-B may have already proceeded on stale assumptions before the next memory reload.
+
+**Why:** The current design treats notes as durable cross-session learning, not real-time coordination. That is appropriate for the noted purpose ("how does this agent work best?") but inadequate for fast-moving coordination signals where the value of the signal decays in seconds, not cycles. The substrate is conflated — one channel doing two jobs.
+
+**What a fix looks like:** A short-lived fresh-lessons channel on the event bus alongside the durable note store. When `@lesson:` (or a new `@signal:` marker for explicitly ephemeral coordination notes) fires, the supervisor publishes the content into both brain memory (durable) and onto the bus (ephemeral, ~5 minute TTL). Other supervisors subscribe and inject any unconsumed signals into their next prompt round — not their next cycle. A small dedup keyed on signal content prevents the same signal from being injected twice if it's also picked up via the durable path on the next cycle reload.
+
+**Tradeoff:** Two paths to memory means two failure modes. If the bus drops a signal the durable note still survives; if the store fails the bus signal is fire-and-forget. The convention to keep clean: **ephemeral state changes on the bus, durable lessons in the store.** Mixing them has been a source of design drift in similar systems and needs explicit guidance in the supervisor prompts so the LLM knows which marker to use. Also: the bus channel is per-process (per §1), so cross-process coordination still requires the durable path — bus speeds up *this orchestrator instance's* concurrent agents, not multi-instance setups.
+
+**Ruled out:** (1) Just polling the durable note store more frequently. Brain-memory reads are not free; tightening the polling interval would burn IO and still not be real-time. (2) Replacing the durable store with the bus entirely. Loses cross-session learning, which is a core feature of brain memory; the two purposes are genuinely different. (3) Embedding-based note matching to surface relevant notes faster (this is §33's territory). Better matching helps relevance but does not help latency — a note authored 30 seconds ago still needs 30 seconds of polling to surface even with perfect matching.
 
 **Ruled out:** (1) Instrumenting workers by requiring them to forward token counts through a side-channel. Would couple the orchestrator to worker-process internals that we deliberately keep opaque. (2) Using the prompt ledger as the usage source — mixing content-bearing entries with high-frequency telemetry would blow the 2 000-entry cap on the ledger. (3) Routing worker calls through the orchestrator's provider layer — would add an extra network hop on the hottest path for marginal observability gain.
